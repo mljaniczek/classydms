@@ -121,6 +121,13 @@ pretrain_denoising <- pretrain_autoencoder
 #' @param loss_diagnostics If TRUE, also print median, p95, max batch loss.
 #' @param stem_stride_rt,stem_stride_cv Encoder stem strides.
 #' @param device "cpu" or "cuda".
+#' @param num_threads If non-NULL, sets the number of CPU threads
+#'   used by torch for forward/backward passes via
+#'   [torch::torch_set_num_threads()]. Apple Silicon machines benefit
+#'   most from setting this to the number of performance cores (e.g. 4
+#'   on an M-series Pro chip with 4P+10E layout), since the efficiency
+#'   cores contribute less per thread. Default `NULL` leaves torch's
+#'   automatic choice in place.
 #' @param save_path If non-NULL, writes encoder, autoencoder, and manifest
 #'   to disk after every epoch (so a mid-run crash leaves recoverable
 #'   artifacts).
@@ -152,10 +159,14 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                        stem_stride_rt = 4L,
                                        stem_stride_cv = 1L,
                                        device = if (torch::cuda_is_available()) "cuda" else "cpu",
+                                       num_threads = NULL,
                                        save_path = NULL,
                                        resume_from = NULL,
                                        seed = 42L,
                                        verbose = TRUE) {
+  if (!is.null(num_threads)) {
+    torch::torch_set_num_threads(as.integer(num_threads))
+  }
   set.seed(seed); torch::torch_manual_seed(seed)
 
   total_samples <- as.numeric(steps_per_epoch) * epochs * batch_size
@@ -169,6 +180,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
           " MB per batch, clean+noisy)")
   message("  Noise: ", if (add_noise) "enabled (denoising AE)"
           else "disabled (reconstruction AE)")
+  message("  CPU threads (torch): ", torch::torch_get_num_threads())
   message("  size_jitter: ", size_jitter)
   if (val_n > 0L) message("  Validation set: ", val_n, " fixed synthetic samples")
   if (!is.null(save_path) && checkpoint_every > 0)
