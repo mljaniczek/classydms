@@ -24,6 +24,7 @@ pretrain_denoising_online(
   stem_stride_cv = 1L,
   device = if (torch::cuda_is_available()) "cuda" else "cpu",
   num_threads = NULL,
+  num_workers = 1L,
   save_path = NULL,
   resume_from = NULL,
   seed = 42L,
@@ -68,6 +69,16 @@ most from setting this to the number of performance cores (e.g. 4
 on an M-series Pro chip with 4P+10E layout), since the efficiency
 cores contribute less per thread. Default \code{NULL} leaves torch's
 automatic choice in place.}
+
+\item{num_workers}{Number of parallel workers for R-side synthetic
+data generation (default \code{1L} = serial). On Unix/macOS, values > 1
+use \code{parallel::mclapply} to generate the per-batch synthetic
+samples in parallel via fork. Most useful on GPU/MPS backends
+where the GPU is otherwise waiting on R between batches. A
+reasonable choice on a chip with N performance cores is
+\code{num_workers = N - 2} (leaving a couple cores for the GPU's
+communication threads, BLAS, and the OS). On Windows this
+argument is ignored and generation falls back to serial.}
 
 \item{save_path}{If non-NULL, writes encoder, autoencoder, and manifest
 to disk after every epoch (so a mid-run crash leaves recoverable

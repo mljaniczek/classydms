@@ -128,6 +128,15 @@ pretrain_denoising <- pretrain_autoencoder
 #'   on an M-series Pro chip with 4P+10E layout), since the efficiency
 #'   cores contribute less per thread. Default `NULL` leaves torch's
 #'   automatic choice in place.
+#' @param num_workers Number of parallel workers for R-side synthetic
+#'   data generation (default `1L` = serial). On Unix/macOS, values > 1
+#'   use `parallel::mclapply` to generate the per-batch synthetic
+#'   samples in parallel via fork. Most useful on GPU/MPS backends
+#'   where the GPU is otherwise waiting on R between batches. A
+#'   reasonable choice on a chip with N performance cores is
+#'   `num_workers = N - 2` (leaving a couple cores for the GPU's
+#'   communication threads, BLAS, and the OS). On Windows this
+#'   argument is ignored and generation falls back to serial.
 #' @param save_path If non-NULL, writes encoder, autoencoder, and manifest
 #'   to disk after every epoch (so a mid-run crash leaves recoverable
 #'   artifacts).
@@ -160,12 +169,26 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                        stem_stride_cv = 1L,
                                        device = if (torch::cuda_is_available()) "cuda" else "cpu",
                                        num_threads = NULL,
+                                       num_workers = 1L,
                                        save_path = NULL,
                                        resume_from = NULL,
                                        seed = 42L,
                                        verbose = TRUE) {
   if (!is.null(num_threads)) {
     torch::torch_set_num_threads(as.integer(num_threads))
+  }
+  # Validate num_workers and downgrade to serial on Windows.
+  num_workers <- as.integer(num_workers)
+  if (.Platform$OS.type != "unix" && num_workers > 1L) {
+    message("num_workers > 1 requested but fork-based parallelism ",
+            "is Unix/macOS only. Falling back to serial.")
+    num_workers <- 1L
+  }
+  use_parallel <- num_workers > 1L
+  if (use_parallel && !requireNamespace("parallel", quietly = TRUE)) {
+    message("Package 'parallel' not available; falling back to serial.")
+    use_parallel <- FALSE
+    num_workers <- 1L
   }
   set.seed(seed); torch::torch_manual_seed(seed)
 
@@ -181,6 +204,8 @@ pretrain_denoising_online <- function(peak_params, H, W,
   message("  Noise: ", if (add_noise) "enabled (denoising AE)"
           else "disabled (reconstruction AE)")
   message("  CPU threads (torch): ", torch::torch_get_num_threads())
+  message("  R-side data workers: ", num_workers,
+          if (use_parallel) " (parallel via mclapply)" else " (serial)")
   message("  size_jitter: ", size_jitter)
   if (val_n > 0L) message("  Validation set: ", val_n, " fixed synthetic samples")
   if (!is.null(save_path) && checkpoint_every > 0)
@@ -241,15 +266,35 @@ pretrain_denoising_online <- function(peak_params, H, W,
   opt <- torch::optim_adam(model$parameters, lr = lr, weight_decay = weight_decay)
   loss_fn <- torch::nn_mse_loss()
 
+  # generate_batch: builds clean + noisy synthetic batches. When
+  # use_parallel = TRUE, the per-sample loop is parallelized via
+  # parallel::mclapply (fork-based on Unix/macOS). The mc.set.seed
+  # default uses L'Ecuyer-CMRG streams so workers produce independent
+  # synthetic samples without colliding RNG states.
+  generate_one_pair <- function(i) {
+    pair <- generate_one_synthetic(peak_params, H, W,
+                                    add_noise = add_noise,
+                                    size_jitter = size_jitter)
+    list(
+      clean = pmin(normalize_sample(pair$clean), norm_clamp),
+      noisy = pmin(normalize_sample(pair$noisy), norm_clamp)
+    )
+  }
+
   generate_batch <- function(n = batch_size) {
+    pairs <- if (use_parallel) {
+      parallel::mclapply(seq_len(n), generate_one_pair,
+                          mc.cores = num_workers,
+                          mc.set.seed = TRUE)
+    } else {
+      lapply(seq_len(n), generate_one_pair)
+    }
+
     clean_arr <- array(0, dim = c(n, 1L, H, W))
     noisy_arr <- array(0, dim = c(n, 1L, H, W))
     for (i in seq_len(n)) {
-      pair <- generate_one_synthetic(peak_params, H, W,
-                                      add_noise = add_noise,
-                                      size_jitter = size_jitter)
-      clean_arr[i, 1, , ] <- pmin(normalize_sample(pair$clean), norm_clamp)
-      noisy_arr[i, 1, , ] <- pmin(normalize_sample(pair$noisy), norm_clamp)
+      clean_arr[i, 1, , ] <- pairs[[i]]$clean
+      noisy_arr[i, 1, , ] <- pairs[[i]]$noisy
     }
     list(
       clean = torch::torch_tensor(clean_arr, dtype = torch::torch_float()),
