@@ -121,7 +121,16 @@ pretrain_denoising <- pretrain_autoencoder
 #' @param loss_diagnostics If TRUE, also print median, p95, max batch loss.
 #' @param stem_stride_rt,stem_stride_cv Encoder stem strides.
 #' @param device "cpu" or "cuda".
-#' @param save_path If non-NULL, writes encoder, autoencoder, and manifest.
+#' @param save_path If non-NULL, writes encoder, autoencoder, and manifest
+#'   to disk after every epoch (so a mid-run crash leaves recoverable
+#'   artifacts).
+#' @param resume_from If non-NULL, path to a previously-saved encoder
+#'   (`*.pt`). The function looks for the corresponding `_autoencoder.pt`
+#'   and `_manifest.Rdata` next to it and resumes training from
+#'   `last_epoch_completed + 1`, inheriting prior loss history. Useful
+#'   for picking up after a crash without losing the work done so far.
+#'   The other hyperparameters (`H`, `W`, `epochs`, etc.) must match
+#'   the original run.
 #' @param seed RNG seed.
 #' @param verbose Whether to print epoch progress.
 #' @return List with `encoder`, `autoencoder`, `loss_history`,
@@ -144,6 +153,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                        stem_stride_cv = 1L,
                                        device = if (torch::cuda_is_available()) "cuda" else "cpu",
                                        save_path = NULL,
+                                       resume_from = NULL,
                                        seed = 42L,
                                        verbose = TRUE) {
   set.seed(seed); torch::torch_manual_seed(seed)
@@ -168,6 +178,54 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                       stem_stride_rt = stem_stride_rt,
                                       stem_stride_cv = stem_stride_cv)
   model$to(device = device)
+
+  # ---- Resume from saved state if requested ----
+  start_epoch <- 1L
+  prior_loss_history <- NULL
+  prior_val_loss_history <- NULL
+  prior_batch_loss_stats <- NULL
+
+  if (!is.null(resume_from)) {
+    ae_path <- sub("\\.pt$", "_autoencoder.pt", resume_from)
+    manifest_path <- sub("\\.pt$", "_manifest.Rdata", resume_from)
+    if (!file.exists(ae_path)) {
+      stop("resume_from: autoencoder file not found at ", ae_path,
+           " (need *_autoencoder.pt next to the encoder *.pt to resume)")
+    }
+    message("Resuming from: ", ae_path)
+    model <- torch::torch_load(ae_path)
+    model$to(device = device)
+
+    if (file.exists(manifest_path)) {
+      e <- new.env()
+      load(manifest_path, envir = e)
+      tm <- e$training_manifest
+      if (!is.null(tm$last_epoch_completed)) {
+        start_epoch <- as.integer(tm$last_epoch_completed) + 1L
+        prior_loss_history     <- tm$loss_history
+        prior_val_loss_history <- tm$val_loss_history
+        prior_batch_loss_stats <- tm$batch_loss_stats
+        message("  Manifest shows last_epoch_completed = ",
+                tm$last_epoch_completed,
+                "; continuing from epoch ", start_epoch)
+        if (start_epoch > epochs) {
+          message("  Already at or past requested epochs; nothing to do.")
+          return(list(encoder = model$encoder, autoencoder = model,
+                       loss_history = tm$loss_history,
+                       val_loss_history = tm$val_loss_history,
+                       batch_loss_stats = tm$batch_loss_stats,
+                       total_samples = tm$total_samples))
+        }
+      }
+    } else {
+      message("  No manifest found at ", manifest_path,
+              "; restarting epoch counter at 1 with loaded weights.")
+    }
+  }
+
+  # Build optimizer AFTER any resume so it binds to the (possibly loaded)
+  # model's parameters. Note: Adam moment estimates are not restored
+  # from disk; resumed training effectively re-warms Adam from scratch.
   opt <- torch::optim_adam(model$parameters, lr = lr, weight_decay = weight_decay)
   loss_fn <- torch::nn_mse_loss()
 
@@ -232,12 +290,19 @@ pretrain_denoising_online <- function(peak_params, H, W,
     save(training_manifest, file = manifest_path)
   }
 
+  # Initialize loss-history vectors; if resuming, splice in prior values.
   loss_history <- numeric(epochs)
   val_loss_history <- rep(NA_real_, epochs)
   batch_loss_stats <- vector("list", epochs)
+  if (!is.null(prior_loss_history)) {
+    n_prior <- min(length(prior_loss_history), epochs)
+    loss_history[seq_len(n_prior)]     <- prior_loss_history[seq_len(n_prior)]
+    val_loss_history[seq_len(n_prior)] <- prior_val_loss_history[seq_len(n_prior)]
+    batch_loss_stats[seq_len(n_prior)] <- prior_batch_loss_stats[seq_len(n_prior)]
+  }
   training_start <- Sys.time()
 
-  for (ep in seq_len(epochs)) {
+  for (ep in seq(start_epoch, epochs)) {
     model$train()
     ep_start <- Sys.time()
     batch_losses <- numeric(steps_per_epoch)
@@ -300,6 +365,13 @@ pretrain_denoising_online <- function(peak_params, H, W,
       torch::torch_save(model$encoder, ckpt_path)
       if (verbose) message("  -> Checkpoint saved: ", ckpt_path)
     }
+
+    # Memory hygiene: explicitly free per-epoch tensors and nudge R to
+    # collect. Helps prevent slow memory growth across long runs and
+    # reduces the chance of OS-level memory-pressure kills, especially
+    # on machines with limited RAM (e.g., laptops).
+    rm(batch, noisy, clean, recon, loss, batch_losses)
+    gc(verbose = FALSE, full = FALSE)
   }
 
   if (!is.null(save_path)) {
