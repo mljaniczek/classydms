@@ -25,6 +25,8 @@ navbar:
           href: articles/pretraining.html
         - text: Interpretability and biomarker localization
           href: articles/interpretability.html
+        - text: Compute, memory, and timing reference
+          href: articles/performance.html
 
 reference:
   - title: "Loading data"
