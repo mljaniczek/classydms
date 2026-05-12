@@ -1,0 +1,257 @@
+---
+title: "Interpretability and biomarker localization"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Interpretability and biomarker localization}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE,
+                      fig.width = 7, fig.height = 4.5)
+```
+
+This article walks through the interpretability stage of the `classydms` pipeline: once you have a pre-trained encoder and labeled samples, how do you (a) train a classifier whose decisions you can inspect, and (b) trace those decisions back to specific retention time × compensation voltage coordinates that correspond to candidate biomarker compounds?
+
+This article assumes you have already:
+
+- Preprocessed your data into `Z_padded` (list of padded `Z` matrices) and `y` (binary labels) — see `vignette("getting-started", package = "classydms")`.
+- Trained or downloaded a pre-trained `encoder` — see `vignette("pretraining", package = "classydms")`.
+
+## The three-level interpretability cascade
+
+`classydms` operationalizes biomarker discovery as a three-step cascade, going from black-box classifier to compound-level candidate biomarkers:
+
+1. **Channel importance** — fit a sparse linear classifier on the encoder's 64-dim output. Non-zero coefficients identify which learned channels are predictive of disease.
+2. **Spatial saliency** — for those important channels, compute where (in RT × CV space) they activate across disease vs control samples. Aggregate to a single 2-D map.
+3. **Compound identification** — map saliency hotspots from padded image coordinates back to physical (retention time, compensation voltage) coordinates, then cross-reference with co-analyzed standards or compound libraries to name the candidate biomarker.
+
+```{r setup}
+library(classydms)
+library(ggplot2)   # for plots in this vignette (in Suggests)
+library(dplyr)
+```
+
+## Level 1 — Channel importance via elastic net
+
+```{r elnet}
+elnet <- cv_encoder_elastic_net(
+  encoder = encoder,
+  Z_list  = Z_padded,
+  y       = y,
+  k       = 5L,
+  alpha   = 0.5,    # 0 = ridge, 1 = LASSO, 0.5 = elastic net
+  seed    = 42L
+)
+elnet$auc           # cross-validated AUC
+elnet$coefs         # length-64 named vector
+elnet$features      # N x 64 GAP-pooled feature matrix
+elnet$probs         # length-N out-of-fold predicted probabilities
+```
+
+### Why elastic net on encoder features?
+
+After global average pooling, each sample is represented by a 64-dimensional feature vector. With ~200 labeled samples, fitting a classifier with ~130 free parameters (logistic regression on 64 features + intercept) is well-conditioned. The elastic net penalty adds two extras: shrinkage (avoids overconfident weights given limited data) and built-in feature selection (channels that aren't useful are zeroed out exactly).
+
+This is the most interpretable head you can put on a frozen encoder: the coefficient on channel $c$ literally tells you how much a unit increase in that channel's mean activation pushes the predicted log-odds toward disease.
+
+### Reading the coefficients
+
+```{r coef-plot}
+coef_df <- tibble(
+  channel  = seq_len(64),
+  coef     = elnet$coefs,
+  abs_coef = abs(elnet$coefs)
+) %>%
+  mutate(direction = case_when(
+    coef > 0 ~ "higher in disease",
+    coef < 0 ~ "higher in control",
+    TRUE     ~ "zero"
+  ))
+
+n_active <- sum(coef_df$coef != 0)
+message(n_active, " of 64 channels have non-zero coefficients")
+
+coef_df %>%
+  filter(coef != 0) %>%
+  mutate(channel = factor(channel, levels = channel[order(-abs_coef)])) %>%
+  ggplot(aes(x = channel, y = coef, fill = direction)) +
+  geom_col() +
+  scale_fill_manual(values = c("higher in disease" = "steelblue",
+                                "higher in control" = "coral")) +
+  labs(title = "Elastic net coefficients on encoder features",
+       subtitle = paste0(n_active, " of 64 channels predictive"),
+       x = "Encoder channel (sorted by importance)", y = "Coefficient") +
+  theme_minimal()
+```
+
+A few common patterns:
+
+- **A handful of channels with strong, clearly-bimodal coefficients.** The classifier has found a parsimonious signal. Move on to Level 2.
+- **All 64 channels active with small coefficients.** Either signal is genuinely distributed, or the encoder has not learned a sparse representation. Worth checking encoder feature variance: very-low-variance channels can attract numerically large coefficients without any real biological meaning. See the diagnostic in `vignette("getting-started")`.
+- **No channels active.** The encoder features simply don't separate disease from control. Either the encoder needs more pretraining or the task is genuinely hard at your sample size.
+
+## Level 2 — Spatial saliency maps
+
+The elastic net classifier head is linear in the global-average-pooled features. This means we can compute a per-sample spatial saliency map analytically, without backpropagation:
+
+\[
+S_i(h, w) \;=\; \sum_{c=1}^{64} \hat{\beta}_c \cdot F_i^{(c)}(h, w)
+\]
+
+where $F_i^{(c)}$ is the encoder's spatial feature map for channel $c$ on sample $i$, and $\hat{\beta}_c$ is the elastic net coefficient for that channel. Bilinearly upsampled to input resolution, $S_i$ is a 2-D map where positive (red) regions push toward "disease" prediction and negative (blue) regions push toward "control."
+
+This is mathematically equivalent to Class Activation Mapping (CAM) with elastic net coefficients as the head weights, and similar in spirit to Grad-CAM without requiring backpropagation.
+
+### Per-sample saliency
+
+```{r per-sample}
+sal <- compute_saliency_map(encoder,
+                              Z = Z_padded[[1]],
+                              coefs = elnet$coefs)
+str(sal)
+# sal$raw_cam:       small spatial map at encoder output resolution
+# sal$upsampled_cam: bilinearly upsampled to padded image dimensions
+```
+
+### Aggregated saliency (across disease vs control)
+
+Single-sample saliency is noisy. To find robust biomarker hotspots, aggregate across all disease samples (and separately across all controls), then take the difference. The difference map normalizes for any spectral patterns common to both classes, isolating the discriminative signal.
+
+```{r aggregate}
+disease_idx <- which(y == 2)
+control_idx <- which(y == 1)
+
+orig_dims <- lapply(samples_trimmed, function(s) c(H = nrow(s$Z), W = ncol(s$Z)))
+
+sal_disease <- aggregate_saliency_masked(encoder, Z_padded, elnet$coefs,
+                                          sample_indices = disease_idx,
+                                          orig_dims = orig_dims)
+sal_control <- aggregate_saliency_masked(encoder, Z_padded, elnet$coefs,
+                                          sample_indices = control_idx,
+                                          orig_dims = orig_dims)
+sal_diff <- sal_disease - sal_control
+```
+
+### Why mask the padded regions?
+
+Each sample's `Z` was zero-padded to a common size during preprocessing. The padded zeros are not real measurements, but the encoder's stem and pooling layers still produce non-zero activations near the data/pad boundary. If you average saliency naively across samples whose original dimensions differ, those boundary activations dominate the aggregate map and you see horizontal/vertical "stripes" rather than compound-shaped hotspots.
+
+`aggregate_saliency_masked()` solves this by tracking, for each pixel, how many samples actually had data there (i.e., how many had `original_H ≥ row` and `original_W ≥ col`), and dividing by that count. Padded-only pixels are excluded.
+
+### Visualizing the three maps side by side
+
+```{r plot-three}
+to_long <- function(M, label) {
+  expand.grid(rt_idx = seq_len(nrow(M)), cv_idx = seq_len(ncol(M))) %>%
+    mutate(value = as.numeric(M), class = label)
+}
+
+sal_long <- bind_rows(
+  to_long(sal_disease, "disease (avg)"),
+  to_long(sal_control, "control (avg)"),
+  to_long(sal_diff,    "disease - control")
+) %>%
+  mutate(class = factor(class, levels = c("disease (avg)",
+                                            "control (avg)",
+                                            "disease - control")))
+
+ggplot(sal_long, aes(x = cv_idx, y = rt_idx, fill = value)) +
+  geom_raster() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                        midpoint = 0) +
+  scale_y_reverse() +
+  facet_wrap(~ class, ncol = 3) +
+  labs(title = "Aggregated spatial saliency",
+       subtitle = "Red = drives disease; Blue = drives control",
+       x = "CV index", y = "RT index") +
+  theme_minimal()
+```
+
+The **disease − control** panel is the one that matters for biomarker discovery. Hotspots there are spatial regions whose encoder activation is systematically higher in disease samples (weighted by the elastic net's view of importance).
+
+## Level 3 — From saliency hotspots to (RT, CV) coordinates
+
+The aggregated saliency maps live in padded image coordinates. To name candidate biomarkers, you need to convert these to the physical retention time (seconds) and compensation voltage (volts) of the original instrument. The `samples_trimmed` objects retain `time` and `cv` vectors for exactly this purpose.
+
+```{r physical}
+# Use any one sample's time/cv as the reference axes (they're shared
+# across the cohort after global trimming + center-padding)
+time_axis <- samples_trimmed[[1]]$time
+cv_axis   <- samples_trimmed[[1]]$cv
+H_real    <- length(time_axis)
+W_real    <- length(cv_axis)
+
+# Crop the saliency to the actual data region (top-left of padded image)
+sal_diff_real <- sal_diff[seq_len(H_real), seq_len(W_real)]
+
+sal_phys <- expand.grid(rt = time_axis, cv = cv_axis) %>%
+  mutate(value = as.numeric(sal_diff_real))
+
+# Identify top hotspots (top 1% of |saliency|)
+threshold <- quantile(abs(sal_phys$value), 0.99)
+hotspots <- sal_phys %>%
+  filter(abs(value) >= threshold) %>%
+  arrange(desc(abs(value))) %>%
+  slice_head(n = 20)
+
+hotspots
+```
+
+You now have a list of physical (RT, CV) coordinates ranked by saliency magnitude. The next step — outside the scope of `classydms` — is to cross-reference these coordinates with co-analyzed standards or a compound library covering your instrument's RT/CV grid. Each hotspot becomes a candidate biomarker compound.
+
+### Overlaying saliency on a real sample
+
+A useful figure for talks and papers: take one representative disease sample, plot its real intensity in greyscale, and overlay saliency contours.
+
+```{r overlay}
+example_idx <- disease_idx[1]
+example_real <- as.matrix(samples_trimmed[[example_idx]]$Z)
+real_phys <- expand.grid(rt = time_axis, cv = cv_axis) %>%
+  mutate(intensity = as.numeric(example_real))
+
+ggplot() +
+  geom_raster(data = real_phys,
+              aes(x = cv, y = rt, fill = intensity)) +
+  scale_fill_gradient(low = "white", high = "grey20") +
+  geom_contour(data = sal_phys, aes(x = cv, y = rt, z = value),
+               color = "red", linewidth = 0.4, breaks = threshold) +
+  geom_contour(data = sal_phys, aes(x = cv, y = rt, z = value),
+               color = "blue", linewidth = 0.4, breaks = -threshold) +
+  geom_point(data = hotspots %>% slice_head(n = 5),
+             aes(x = cv, y = rt), color = "gold", size = 2) +
+  scale_y_reverse() +
+  labs(title = "Saliency hotspots overlaid on a representative disease sample",
+       subtitle = "Greyscale = real intensity. Red contours = disease-driving regions; gold = top 5 hotspots",
+       x = "Compensation Voltage (V)",
+       y = "Retention Time (s)") +
+  theme_minimal()
+```
+
+## Reconstruction QC for confidence
+
+Before publishing saliency results, verify that the encoder reconstructs real images faithfully — otherwise the spatial maps you're inspecting may reflect encoder artifacts rather than biology.
+
+```{r recon-qc}
+recon <- reconstruct_real_samples(autoencoder, Z_padded,
+                                   sample_indices = 1:6)
+# (Plot original vs reconstruction side-by-side; see pretraining vignette)
+all_mse <- sapply(recon, function(r) r$mse)
+summary(all_mse)
+```
+
+A cohort-wide reconstruction MSE comparable to the autoencoder's validation MSE during pretraining is good news. Reconstruction MSE much higher than the validation MSE means the encoder has overfit to synthetic-specific quirks; saliency results from such an encoder should be interpreted cautiously and ideally cross-validated against a separately pretrained encoder.
+
+## Common pitfalls
+
+- **Saliency map is a horizontal/vertical stripe.** Likely a padding boundary artifact. Make sure you're calling `aggregate_saliency_masked()` (not a naive average) with correct `orig_dims`.
+- **Top channels have huge coefficients but no spatial activation.** Near-zero-variance encoder channels getting their coefficients inflated by elastic net standardization. Filter `elnet$features` to channels with variance above a small threshold and refit, or set `standardize = FALSE` in the underlying `glmnet` call (would require a custom variant of `cv_encoder_elastic_net`).
+- **AUC > 0.95 on a small cohort.** Suspicious. Most often a cross-fold leakage bug or class imbalance issue rather than real signal. Inspect the OOF predictions in `elnet$probs` for each fold.
+- **Saliency hotspots don't correspond to any known compound.** Possible but rare. More commonly the spatial alignment between samples is off, or the saliency is picking up a batch/acquisition effect rather than biology. Cross-check by re-running the analysis on a held-out cohort.
+
+## Where to go from here
+
+- Re-run with a different `alpha` (closer to 1 for sparser feature selection, closer to 0 for more shrinkage).
+- Compare saliency hotspots across disease settings — channels predictive in multiple diseases may reflect generic stress/inflammation; channels unique to one disease are stronger biomarker candidates.
+- Implement Grad-CAM on the same encoder for comparison; the results should be qualitatively similar to the CAM approach used here.

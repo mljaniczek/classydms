@@ -1,0 +1,51 @@
+Package: classydms
+Type: Package
+Title: GC-DMS Disease Classification via Synthetic Pre-Training
+Version: 0.0.0.9000
+Authors@R: c(
+    person("Margaret", "Janiczek", , "TODO@TODO.edu", role = c("aut", "cre")),
+    person("Lin", "Cai", , "lcai@umass.edu", role = "ctb"),
+    person("Raji", "Balasubramanian", , "rbalasub@umass.edu", role = "ctb")
+  )
+Description: An end-to-end pipeline for disease vs control classification
+    from Gas Chromatography Differential Mobility Spectrometry (GC-DMS)
+    data. Includes preprocessing (Savitzky-Golay smoothing, asymmetric
+    least squares baseline correction, dust thresholding, occupancy-based
+    trimming, normalization, padding), parametric synthetic data
+    generation matched to real peak distributions, self-supervised
+    denoising-autoencoder pre-training of a convolutional encoder,
+    transfer learning via elastic net on the learned features, and
+    spatial saliency mapping for biomarker discovery. Designed to support
+    small-sample clinical GC-DMS studies (n ~ 100-200 subjects) across
+    multiple disease settings.
+License: MIT + file LICENSE
+URL: https://github.com/mljaniczek/classydms, https://mljaniczek.github.io/classydms/
+BugReports: https://github.com/mljaniczek/classydms/issues
+Encoding: UTF-8
+LazyData: true
+Roxygen: list(markdown = TRUE)
+Depends:
+    R (>= 4.1.0)
+Imports:
+    torch,
+    glmnet,
+    signal,
+    Matrix,
+    zoo,
+    pROC,
+    coro,
+    purrr
+Suggests:
+    piggyback,
+    pheatmap,
+    gridExtra,
+    ggplot2,
+    dplyr,
+    tibble,
+    knitr,
+    rmarkdown,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+VignetteBuilder: knitr
+Config/roxygen2/version: 8.0.0
+RoxygenNote: 7.3.2

@@ -1,0 +1,111 @@
+url: https://mljaniczek.github.io/classydms
+
+template:
+  bootstrap: 5
+
+home:
+  title: GC-DMS Disease Classification via Synthetic Pre-Training
+  description: >
+    End-to-end pipeline for disease vs control classification from
+    Gas Chromatography Differential Mobility Spectrometry (GC-DMS) data,
+    with self-supervised synthetic pre-training and interpretable
+    biomarker localization via spatial saliency maps.
+
+navbar:
+  structure:
+    left:  [intro, articles, reference, news]
+    right: [search, github]
+  components:
+    articles:
+      text: Articles
+      menu:
+        - text: Getting started
+          href: articles/getting-started.html
+        - text: Pre-training in depth
+          href: articles/pretraining.html
+        - text: Interpretability and biomarker localization
+          href: articles/interpretability.html
+
+reference:
+  - title: "Loading data"
+    desc: Read raw GC-DMS files and assemble a samples list.
+    contents:
+      - read_dms_file
+      - load_dms_directory
+
+  - title: "Preprocessing"
+    desc: >
+      Smoothing, baseline correction, dust thresholding, trimming,
+      normalization, and padding for GC-DMS intensity matrices.
+    contents:
+      - preprocess_matrix_rt
+      - process_one_sample
+      - baseline_basement
+      - trim_bounds_from_occupancy
+      - trim_sample
+      - pooled_trim_bounds
+      - normalize_sample
+      - compute_pad_targets
+      - pad_to_target
+      - robust_eps
+
+  - title: "Synthetic data generation"
+    desc: >
+      Estimate peak parameter distributions from real data
+      (label-agnostic) and generate synthetic GC-DMS images statistically
+      matched to the real cohort.
+    contents:
+      - estimate_peak_params
+      - generate_one_synthetic
+      - generate_synthetic_dataset
+
+  - title: "Autoencoder architecture"
+    desc: ResNet-style encoder, mirrored decoder, and composed autoencoder.
+    contents:
+      - dms_encoder
+      - dms_decoder
+      - dms_denoising_autoencoder
+      - res_block
+
+  - title: "Pre-training"
+    desc: >
+      Self-supervised training of the encoder on synthetic data, either
+      via the in-memory batch trainer or the online variant for scale-up.
+    contents:
+      - pretrain_autoencoder
+      - pretrain_denoising_online
+
+  - title: "Classification"
+    desc: >
+      Use the pre-trained encoder as a frozen feature extractor for
+      downstream classification on real labeled samples.
+    contents:
+      - build_pretrained_classifier
+      - train_one_fold_pretrained
+      - cv_pretrained_oof
+      - extract_encoder_features
+      - cv_encoder_elastic_net
+
+  - title: "Interpretability and QC"
+    desc: >
+      Reconstruction QC, spatial saliency mapping, and aggregation tools
+      for tracing classifier decisions back to (RT, CV) coordinates.
+    contents:
+      - reconstruct_real_samples
+      - compute_saliency_map
+      - aggregate_saliency_masked
+
+  - title: "Pre-trained model helpers"
+    desc: >
+      Download and cache pre-trained encoders distributed via GitHub
+      Releases.
+    contents:
+      - load_pretrained_encoder
+      - list_pretrained_encoders
+
+development:
+  mode: auto
+
+authors:
+  Margaret Janiczek:
+    href: https://github.com/mljaniczek
