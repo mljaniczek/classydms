@@ -1,0 +1,28 @@
+# Train one classifier fold with a pre-trained encoder
+
+Train one classifier fold with a pre-trained encoder
+
+## Usage
+
+``` r
+train_one_fold_pretrained(
+  ds,
+  train_idx,
+  test_idx,
+  encoder,
+  epochs = 20L,
+  batch_size = 4L,
+  lr = 0.001,
+  weight_decay = 1e-04,
+  dropout_p = 0.3,
+  freeze_backbone = TRUE,
+  unfreeze_last_block = TRUE,
+  augment = TRUE,
+  rt_shift = 25L,
+  cv_shift = 5L,
+  intensity_scale = c(0.9, 1.1),
+  noise_sd = 0,
+  device = if (torch::cuda_is_available()) "cuda" else "cpu",
+  seed = 1L
+)
+```

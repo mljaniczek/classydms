@@ -1,0 +1,276 @@
+# classydms
+
+GC-DMS Disease Classification via Synthetic Pre-Training
+
+`classydms` is an R package that implements an end-to-end pipeline for
+disease vs control classification from Gas Chromatography Differential
+Mobility Spectrometry (GC-DMS) data. It is designed for small-sample
+clinical studies (n ~ 100-200 subjects) and supports applying the same
+workflow across many disease settings.
+
+## Pipeline overview
+
+    Raw GC-DMS file (RT x CV intensity matrix)
+            |
+            v
+    Preprocessing: Savitzky-Golay + AsLS + dust threshold + occupancy trim + log-quantile normalize + zero-pad
+            |
+            v
+    Estimate peak parameter distributions (label-agnostic)
+            |
+            v
+    Generate millions of synthetic GC-DMS images matching the distribution
+            |
+            v
+    Pre-train a ResNet-style encoder via self-supervised denoising autoencoder
+            |
+            v
+    Extract 64-dim feature vector per real sample (frozen encoder + global average pool)
+            |
+            v
+    Elastic net classifier on the 64 features  -->  cross-validated AUC, interpretable coefficients
+            |
+            v
+    Spatial saliency mapping (CAM weighted by elastic net coefficients) --> RT x CV biomarker hotspots
+
+## Installation
+
+``` r
+
+# Install development version from GitHub
+# install.packages("remotes")
+remotes::install_github("mljaniczek/classydms")
+```
+
+The package depends on `torch` (R bindings to LibTorch). If this is your
+first time installing `torch`, run
+[`torch::install_torch()`](https://torch.mlverse.org/docs/reference/install_torch.html)
+after package installation.
+
+## Quick start
+
+``` r
+
+library(classydms)
+
+# 1. Load raw data (samples_keep, y_keep) using your project-specific loader
+# 2. Preprocess
+samples_proc <- lapply(samples_keep, process_one_sample)
+b_list <- lapply(samples_proc, function(s) trim_bounds_from_occupancy(s$Z))
+R0 <- max(sapply(samples_proc, function(s) nrow(s$Z)))
+C0 <- max(sapply(samples_proc, function(s) ncol(s$Z)))
+global_b <- pooled_trim_bounds(b_list, R = R0, C = C0)
+samples_trimmed <- lapply(samples_proc, trim_sample, bounds = global_b)
+
+Z_norm   <- purrr::map(samples_trimmed, ~normalize_sample(.x$Z))
+pad_dims <- compute_pad_targets(Z_norm)
+Z_padded <- purrr::map(Z_norm, ~pad_to_target(.x, pad_dims$H, pad_dims$W))
+
+# 3. Estimate peak parameters from real data (label-agnostic)
+Z_raw     <- purrr::map(samples_trimmed, ~.x$Z)
+Z_pretrim <- purrr::map(samples_trimmed,
+                          ~if (!is.null(.x$Z_pretrim)) .x$Z_pretrim else .x$Z)
+peak_params <- estimate_peak_params(Z_raw, Z_pretrim_list = Z_pretrim,
+                                     top_k = 150, frac_height = 0.5)
+
+# 4. Self-supervised pretraining (recommended: online, for memory efficiency)
+pretrain_result <- pretrain_denoising_online(
+  peak_params,
+  H = pad_dims$H, W = pad_dims$W,
+  steps_per_epoch = 1000L, epochs = 50L, batch_size = 32L,
+  save_path = "encoder.pt"
+)
+
+# 5. Classify with elastic net on encoder features
+elnet <- cv_encoder_elastic_net(pretrain_result$encoder,
+                                 Z_list = Z_padded, y = y_keep,
+                                 k = 5, alpha = 0.5)
+elnet$auc
+elnet$coefs    # which of the 64 channels matter
+
+# 6. Spatial saliency map for biomarker localization
+disease_idx <- which(y_keep == 2)
+orig_dims <- lapply(samples_trimmed, function(s) c(H = nrow(s$Z), W = ncol(s$Z)))
+sal <- aggregate_saliency_masked(pretrain_result$encoder, Z_padded,
+                                   coefs = elnet$coefs,
+                                   sample_indices = disease_idx,
+                                   orig_dims = orig_dims)
+# sal is a 2-D matrix in padded image coordinates; map back to RT/CV using
+# samples_trimmed[[1]]$time and samples_trimmed[[1]]$cv
+```
+
+## Using a pre-trained encoder
+
+To save weeks of compute, you can download an encoder trained on a
+previous disease cohort:
+
+``` r
+
+# List available encoders attached to GitHub Releases
+list_pretrained_encoders()
+
+# Download and use a specific encoder
+encoder <- load_pretrained_encoder("flu_v1")
+
+# Or fetch the full autoencoder for reconstruction QC
+bundle <- load_pretrained_encoder("flu_v1", with_autoencoder = TRUE)
+bundle$manifest$hyperparams      # how it was trained
+bundle$manifest$peak_params      # what synthetic distribution it saw
+```
+
+Encoders are cached locally on first download.
+
+## Documentation
+
+- Vignettes: see `vignette(package = "classydms")` for end-to-end
+  walk-throughs.
+- Function reference:
+  [`?pretrain_denoising_online`](https://mljaniczek.github.io/classydms/reference/pretrain_denoising_online.md),
+  [`?cv_encoder_elastic_net`](https://mljaniczek.github.io/classydms/reference/cv_encoder_elastic_net.md),
+  [`?compute_saliency_map`](https://mljaniczek.github.io/classydms/reference/compute_saliency_map.md),
+  etc.
+- Methods: full preprocessing rationale and pipeline description in the
+  proposal document.
+
+## Citation
+
+If you use `classydms` in your work, please cite (TODO: add citation
+once published).
+
+## License
+
+MIT
+
+# Package index
+
+## Loading data
+
+Read raw GC-DMS files and assemble a samples list.
+
+- [`read_dms_file()`](https://mljaniczek.github.io/classydms/reference/read_dms_file.md)
+  : Read one raw GC-DMS data file
+- [`load_dms_directory()`](https://mljaniczek.github.io/classydms/reference/load_dms_directory.md)
+  : Read all GC-DMS files in a directory and assemble a samples list
+
+## Preprocessing
+
+Smoothing, baseline correction, dust thresholding, trimming,
+normalization, and padding for GC-DMS intensity matrices.
+
+- [`preprocess_matrix_rt()`](https://mljaniczek.github.io/classydms/reference/preprocess_matrix_rt.md)
+  : Savitzky-Golay smoothing + AsLS baseline correction (per CV column)
+
+- [`process_one_sample()`](https://mljaniczek.github.io/classydms/reference/process_one_sample.md)
+  :
+
+  Run preprocessing on one sample (list with `$Z`, optional `$time`,
+  `$cv`)
+
+- [`baseline_basement()`](https://mljaniczek.github.io/classydms/reference/baseline_basement.md)
+  : Dust-threshold a sample below a fixed intensity
+
+- [`trim_bounds_from_occupancy()`](https://mljaniczek.github.io/classydms/reference/trim_bounds_from_occupancy.md)
+  : Compute occupancy-based trim bounds for one sample
+
+- [`trim_sample()`](https://mljaniczek.github.io/classydms/reference/trim_sample.md)
+  : Apply trim bounds to a sample (clamps to actual size if smaller)
+
+- [`pooled_trim_bounds()`](https://mljaniczek.github.io/classydms/reference/pooled_trim_bounds.md)
+  : Pool per-sample trim bounds to a single cohort-wide bounding box
+
+- [`normalize_sample()`](https://mljaniczek.github.io/classydms/reference/normalize_sample.md)
+  : Log-quantile normalize a single sample
+
+- [`compute_pad_targets()`](https://mljaniczek.github.io/classydms/reference/compute_pad_targets.md)
+  : Compute padding targets across a list of matrices
+
+- [`pad_to_target()`](https://mljaniczek.github.io/classydms/reference/pad_to_target.md)
+  : Center-pad a matrix to target dimensions
+
+- [`robust_eps()`](https://mljaniczek.github.io/classydms/reference/robust_eps.md)
+  : Compute a per-sample relative "dust" threshold
+
+## Synthetic data generation
+
+Estimate peak parameter distributions from real data (label-agnostic)
+and generate synthetic GC-DMS images statistically matched to the real
+cohort.
+
+- [`estimate_peak_params()`](https://mljaniczek.github.io/classydms/reference/estimate_peak_params.md)
+  : Estimate peak parameter distributions from real GC-DMS samples
+- [`generate_one_synthetic()`](https://mljaniczek.github.io/classydms/reference/generate_one_synthetic.md)
+  : Generate one synthetic GC-DMS image
+- [`generate_synthetic_dataset()`](https://mljaniczek.github.io/classydms/reference/generate_synthetic_dataset.md)
+  : Generate N synthetic pairs as torch tensors
+
+## Autoencoder architecture
+
+ResNet-style encoder, mirrored decoder, and composed autoencoder.
+
+- [`dms_encoder()`](https://mljaniczek.github.io/classydms/reference/dms_encoder.md)
+  : GC-DMS encoder (ResNet-style, asymmetric stride)
+- [`dms_decoder()`](https://mljaniczek.github.io/classydms/reference/dms_decoder.md)
+  : GC-DMS decoder (mirror of encoder, transposed convolutions)
+- [`dms_denoising_autoencoder()`](https://mljaniczek.github.io/classydms/reference/dms_denoising_autoencoder.md)
+  : Composed denoising autoencoder (encoder + decoder)
+- [`res_block()`](https://mljaniczek.github.io/classydms/reference/res_block.md)
+  : Residual block used by encoder and tiny ResNet variants
+
+## Pre-training
+
+Self-supervised training of the encoder on synthetic data, either via
+the in-memory batch trainer or the online variant for scale-up.
+
+- [`pretrain_autoencoder()`](https://mljaniczek.github.io/classydms/reference/pretrain_autoencoder.md)
+  [`pretrain_denoising()`](https://mljaniczek.github.io/classydms/reference/pretrain_autoencoder.md)
+  : Pre-train the encoder via batch denoising autoencoder
+- [`pretrain_denoising_online()`](https://mljaniczek.github.io/classydms/reference/pretrain_denoising_online.md)
+  : Pre-train the encoder via online denoising autoencoder
+
+## Classification
+
+Use the pre-trained encoder as a frozen feature extractor for downstream
+classification on real labeled samples.
+
+- [`build_pretrained_classifier()`](https://mljaniczek.github.io/classydms/reference/build_pretrained_classifier.md)
+  : Attach a classifier head to a pre-trained encoder
+- [`train_one_fold_pretrained()`](https://mljaniczek.github.io/classydms/reference/train_one_fold_pretrained.md)
+  : Train one classifier fold with a pre-trained encoder
+- [`cv_pretrained_oof()`](https://mljaniczek.github.io/classydms/reference/cv_pretrained_oof.md)
+  : 5-fold CV classification with a pre-trained encoder
+- [`extract_encoder_features()`](https://mljaniczek.github.io/classydms/reference/extract_encoder_features.md)
+  : Extract 64-dim encoder features for all samples (GAP-pooled)
+- [`cv_encoder_elastic_net()`](https://mljaniczek.github.io/classydms/reference/cv_encoder_elastic_net.md)
+  : Elastic net classification on 64-dim encoder features
+
+## Interpretability and QC
+
+Reconstruction QC, spatial saliency mapping, and aggregation tools for
+tracing classifier decisions back to (RT, CV) coordinates.
+
+- [`reconstruct_real_samples()`](https://mljaniczek.github.io/classydms/reference/reconstruct_real_samples.md)
+  : Reconstruct real images through a pre-trained autoencoder
+- [`compute_saliency_map()`](https://mljaniczek.github.io/classydms/reference/compute_saliency_map.md)
+  : Compute a Class Activation Map (CAM) for one sample
+- [`aggregate_saliency_masked()`](https://mljaniczek.github.io/classydms/reference/aggregate_saliency_masked.md)
+  : Aggregate saliency maps across samples, masking padded regions
+
+## Pre-trained model helpers
+
+Download and cache pre-trained encoders distributed via GitHub Releases.
+
+- [`load_pretrained_encoder()`](https://mljaniczek.github.io/classydms/reference/load_pretrained_encoder.md)
+  : Load a pre-trained encoder by name
+- [`list_pretrained_encoders()`](https://mljaniczek.github.io/classydms/reference/list_pretrained_encoders.md)
+  : List available pre-trained encoder files
+
+# Articles
+
+### All vignettes
+
+- [Getting started with
+  classydms](https://mljaniczek.github.io/classydms/articles/getting-started.md):
+- [Interpretability and biomarker
+  localization](https://mljaniczek.github.io/classydms/articles/interpretability.md):
+- [Pre-training in
+  depth](https://mljaniczek.github.io/classydms/articles/pretraining.md):
