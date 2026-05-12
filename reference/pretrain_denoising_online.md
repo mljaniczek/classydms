@@ -27,6 +27,7 @@ pretrain_denoising_online(
   stem_stride_cv = 1L,
   device = if (torch::cuda_is_available()) "cuda" else "cpu",
   save_path = NULL,
+  resume_from = NULL,
   seed = 42L,
   verbose = TRUE
 )
@@ -97,7 +98,17 @@ pretrain_denoising_online(
 
 - save_path:
 
-  If non-NULL, writes encoder, autoencoder, and manifest.
+  If non-NULL, writes encoder, autoencoder, and manifest to disk after
+  every epoch (so a mid-run crash leaves recoverable artifacts).
+
+- resume_from:
+
+  If non-NULL, path to a previously-saved encoder (`*.pt`). The function
+  looks for the corresponding `_autoencoder.pt` and `_manifest.Rdata`
+  next to it and resumes training from `last_epoch_completed + 1`,
+  inheriting prior loss history. Useful for picking up after a crash
+  without losing the work done so far. The other hyperparameters (`H`,
+  `W`, `epochs`, etc.) must match the original run.
 
 - seed:
 

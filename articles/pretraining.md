@@ -303,6 +303,41 @@ for the classification + saliency mapping pipeline, or call
 [`cv_encoder_elastic_net()`](https://mljaniczek.github.io/classydms/reference/cv_encoder_elastic_net.md)
 directly for a quick AUC estimate.
 
+## Resuming after a crash
+
+Long training runs sometimes die mid-way (memory pressure, accidental
+session restart, laptop sleep). The function writes the encoder,
+autoencoder, and manifest after **every** epoch, so even an unexpected
+interruption leaves usable artifacts on disk. To pick up where you left
+off, pass the encoder path to `resume_from`:
+
+``` r
+
+pretrain_result <- pretrain_denoising_online(
+  peak_params,
+  H = pad_dims$H, W = pad_dims$W,
+  steps_per_epoch = 1000L,
+  epochs           = 50L,        # same as the original run
+  batch_size       = 32L,
+  save_path        = "encoder.pt",
+  resume_from      = "encoder.pt",   # NEW: pick up from disk
+  seed             = 42L
+)
+```
+
+The function looks for `encoder_autoencoder.pt` and
+`encoder_manifest.Rdata` next to the encoder file, loads the model
+state, reads `last_epoch_completed` from the manifest, and continues
+from the next epoch with the prior loss history preserved. If the
+manifest says the run is already complete, the function returns
+immediately without retraining.
+
+**Caveat:** Adam optimizer moment estimates are not restored from disk,
+so resumed training effectively re-warms Adam from scratch for a few
+steps. For long runs this is invisible noise. The other hyperparameters
+(`H`, `W`, `epochs`, `steps_per_epoch`, etc.) must match the original
+run — change them and the resume becomes nonsense.
+
 ## Common pitfalls
 
 - **Loss spikes to millions early in training.** The `norm_clamp` and

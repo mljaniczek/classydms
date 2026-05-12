@@ -70,6 +70,7 @@ for scaling to hundreds of thousands or millions of total samples.</p>
 <span>  stem_stride_cv <span class="op">=</span> <span class="fl">1L</span>,</span>
 <span>  device <span class="op">=</span> <span class="kw">if</span> <span class="op">(</span><span class="fu">torch</span><span class="fu">::</span><span class="fu"><a href="https://torch.mlverse.org/docs/reference/cuda_is_available.html" class="external-link">cuda_is_available</a></span><span class="op">(</span><span class="op">)</span><span class="op">)</span> <span class="st">"cuda"</span> <span class="kw">else</span> <span class="st">"cpu"</span>,</span>
 <span>  save_path <span class="op">=</span> <span class="cn">NULL</span>,</span>
+<span>  resume_from <span class="op">=</span> <span class="cn">NULL</span>,</span>
 <span>  seed <span class="op">=</span> <span class="fl">42L</span>,</span>
 <span>  verbose <span class="op">=</span> <span class="cn">TRUE</span></span>
 <span><span class="op">)</span></span></code></pre></div>
@@ -140,7 +141,19 @@ for scaling to hundreds of thousands or millions of total samples.</p>
 
 
 <dt id="arg-save-path">save_path<a class="anchor" aria-label="anchor" href="#arg-save-path"></a></dt>
-<dd><p>If non-NULL, writes encoder, autoencoder, and manifest.</p></dd>
+<dd><p>If non-NULL, writes encoder, autoencoder, and manifest
+to disk after every epoch (so a mid-run crash leaves recoverable
+artifacts).</p></dd>
+
+
+<dt id="arg-resume-from">resume_from<a class="anchor" aria-label="anchor" href="#arg-resume-from"></a></dt>
+<dd><p>If non-NULL, path to a previously-saved encoder
+(<code>*.pt</code>). The function looks for the corresponding <code>_autoencoder.pt</code>
+and <code>_manifest.Rdata</code> next to it and resumes training from
+<code>last_epoch_completed + 1</code>, inheriting prior loss history. Useful
+for picking up after a crash without losing the work done so far.
+The other hyperparameters (<code>H</code>, <code>W</code>, <code>epochs</code>, etc.) must match
+the original run.</p></dd>
 
 
 <dt id="arg-seed">seed<a class="anchor" aria-label="anchor" href="#arg-seed"></a></dt>

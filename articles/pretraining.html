@@ -436,6 +436,39 @@ classification + saliency mapping pipeline, or call
 estimate.</p>
 </div>
 <div class="section level2">
+<h2 id="resuming-after-a-crash">Resuming after a crash<a class="anchor" aria-label="anchor" href="#resuming-after-a-crash"></a>
+</h2>
+<p>Long training runs sometimes die mid-way (memory pressure, accidental
+session restart, laptop sleep). The function writes the encoder,
+autoencoder, and manifest after <strong>every</strong> epoch, so even an
+unexpected interruption leaves usable artifacts on disk. To pick up
+where you left off, pass the encoder path to
+<code>resume_from</code>:</p>
+<div class="sourceCode" id="cb10"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="va">pretrain_result</span> <span class="op">&lt;-</span> <span class="fu"><a href="../reference/pretrain_denoising_online.html">pretrain_denoising_online</a></span><span class="op">(</span></span>
+<span>  <span class="va">peak_params</span>,</span>
+<span>  H <span class="op">=</span> <span class="va">pad_dims</span><span class="op">$</span><span class="va">H</span>, W <span class="op">=</span> <span class="va">pad_dims</span><span class="op">$</span><span class="va">W</span>,</span>
+<span>  steps_per_epoch <span class="op">=</span> <span class="fl">1000L</span>,</span>
+<span>  epochs           <span class="op">=</span> <span class="fl">50L</span>,        <span class="co"># same as the original run</span></span>
+<span>  batch_size       <span class="op">=</span> <span class="fl">32L</span>,</span>
+<span>  save_path        <span class="op">=</span> <span class="st">"encoder.pt"</span>,</span>
+<span>  resume_from      <span class="op">=</span> <span class="st">"encoder.pt"</span>,   <span class="co"># NEW: pick up from disk</span></span>
+<span>  seed             <span class="op">=</span> <span class="fl">42L</span></span>
+<span><span class="op">)</span></span></code></pre></div>
+<p>The function looks for <code>encoder_autoencoder.pt</code> and
+<code>encoder_manifest.Rdata</code> next to the encoder file, loads the
+model state, reads <code>last_epoch_completed</code> from the manifest,
+and continues from the next epoch with the prior loss history preserved.
+If the manifest says the run is already complete, the function returns
+immediately without retraining.</p>
+<p><strong>Caveat:</strong> Adam optimizer moment estimates are not
+restored from disk, so resumed training effectively re-warms Adam from
+scratch for a few steps. For long runs this is invisible noise. The
+other hyperparameters (<code>H</code>, <code>W</code>,
+<code>epochs</code>, <code>steps_per_epoch</code>, etc.) must match the
+original run — change them and the resume becomes nonsense.</p>
+</div>
+<div class="section level2">
 <h2 id="common-pitfalls">Common pitfalls<a class="anchor" aria-label="anchor" href="#common-pitfalls"></a>
 </h2>
 <ul>
