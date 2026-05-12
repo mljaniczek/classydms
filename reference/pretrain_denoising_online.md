@@ -26,6 +26,7 @@ pretrain_denoising_online(
   stem_stride_rt = 4L,
   stem_stride_cv = 1L,
   device = if (torch::cuda_is_available()) "cuda" else "cpu",
+  num_threads = NULL,
   save_path = NULL,
   resume_from = NULL,
   seed = 42L,
@@ -95,6 +96,16 @@ pretrain_denoising_online(
 - device:
 
   "cpu" or "cuda".
+
+- num_threads:
+
+  If non-NULL, sets the number of CPU threads used by torch for
+  forward/backward passes via
+  [`torch::torch_set_num_threads()`](https://torch.mlverse.org/docs/reference/threads.html).
+  Apple Silicon machines benefit most from setting this to the number of
+  performance cores (e.g. 4 on an M-series Pro chip with 4P+10E layout),
+  since the efficiency cores contribute less per thread. Default `NULL`
+  leaves torch's automatic choice in place.
 
 - save_path:
 
