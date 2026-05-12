@@ -48,20 +48,37 @@ All numbers assume padded `H = 1472, W = 96`, `batch_size = 32`, and roughly def
 
 ### Apple Silicon (MPS)
 
-| Chip | GPU cores | 1 epoch | 1M samples | 2M samples |
-|---|---|---|---|---|
-| M1 (base) | 8 | ~25 min | ~13 hours | ~26 hours |
-| M1 Pro | 14-16 | ~12 min | ~6.5 hours | ~13 hours |
-| M1 Max | 24-32 | ~7 min | ~3.5 hours | ~7 hours |
-| M2 (base) | 8-10 | ~18 min | ~9.5 hours | ~19 hours |
-| M2 Pro | 16-19 | ~9 min | ~4.5 hours | ~9 hours |
-| M2 Max | 30-38 | ~5 min | ~2.5 hours | ~5 hours |
-| M3 Pro | 14-18 | ~8 min | ~4.5 hours | ~9 hours |
-| M3 Max | 30-40 | ~5 min | ~2.5 hours | ~5 hours |
-| M4 Pro | 16-20 | ~5 min | ~2.5 hours | ~5 hours |
-| M4 Max | 32-40 | **~3 min** | **~1.7 hours** | **~3.5 hours** |
+**Important caveat measured empirically**: on M-series GPUs, the
+autoencoder forward/backward pass is so fast that the dominant wall-clock
+cost is **R-side synthetic data generation**, not GPU compute. The
+numbers below reflect this. If parallel data generation is added in a
+future version (see `CLAUDE.md` "Potential optimizations"), MPS times
+will drop by another 2-3x and the table below will need updating.
 
-A 1M-sample run on M4 Max fits in a single afternoon. A 2M-sample run fits in a workday.
+| Chip | GPU cores | Per-batch time | 1 epoch (500 steps, batch 64) | 1M samples (32 epochs) |
+|---|---|---|---|---|
+| M1 Pro | 14-16 | ~6 sec | ~50 min | ~27 hours |
+| M1 Max | 24-32 | ~5 sec | ~42 min | ~22 hours |
+| M2 Pro | 16-19 | ~4.5 sec | ~38 min | ~20 hours |
+| M2 Max | 30-38 | ~4 sec | ~33 min | ~18 hours |
+| M3 Pro | 14-18 | ~4 sec | ~33 min | ~18 hours |
+| M3 Max | 30-40 | ~3.7 sec | ~31 min | ~17 hours |
+| M4 Pro | 16-20 | ~3.6 sec | ~30 min | ~16 hours |
+| **M4 Max** | **32-40** | **~3.4 sec** | **~28 min** | **~15 hours** |
+
+A 1M-sample run is an overnight job; a 2M-sample run is closer to
+24-30 hours and benefits from being split across two nights via
+`resume_from`. These numbers assume `batch_size = 64`. Larger batches
+help amortize the per-batch R-side generation cost: doubling batch
+size from 32 to 64 roughly halves the per-sample time. `batch_size =
+128` may give another modest gain on M-Pro/Max chips; diminishing
+returns past that.
+
+**Why the chip matters less than you'd expect**: the GPU portion of
+wall time is 1-1.5 seconds per batch even on an M4 Max, while R-side
+data generation is ~2 seconds. A faster GPU only speeds up the GPU
+half, so going from M1 Pro to M4 Max saves ~1 second per batch, not
+~10x.
 
 ### CPU only
 
