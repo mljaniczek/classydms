@@ -127,7 +127,13 @@ estimate_peak_params <- function(Z_list,
         }
       }
     }
-    bg <- Z[Z > 0 & Z <= eps_i]
+    # Noise estimation: prefer the pre-dust-threshold matrix (Z_width)
+    # when available, because dust thresholding has already zeroed out
+    # exactly the (0, eps_i] pixels we want to characterize. Estimating
+    # noise from the dust-thresholded Z leaves us with an empty `bg` and
+    # forces a fallback. Z_width / Z_pretrim_list retains those pixels.
+    Z_noise <- Z_width
+    bg <- Z_noise[Z_noise > 0 & Z_noise <= eps_i]
     if (length(bg) > 50) {
       all_noise_mean <- c(all_noise_mean, mean(bg))
       all_noise_sd <- c(all_noise_sd, stats::sd(bg))
