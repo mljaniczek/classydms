@@ -24,6 +24,7 @@ for scaling to hundreds of thousands or millions of total samples."></head><body
   <ul class="dropdown-menu" aria-labelledby="dropdown-articles"><li><a class="dropdown-item" href="../articles/getting-started.html">Getting started</a></li>
     <li><a class="dropdown-item" href="../articles/pretraining.html">Pre-training in depth</a></li>
     <li><a class="dropdown-item" href="../articles/interpretability.html">Interpretability and biomarker localization</a></li>
+    <li><a class="dropdown-item" href="../articles/performance.html">Compute, memory, and timing reference</a></li>
   </ul></li>
 <li class="active nav-item"><a class="nav-link" href="../reference/index.html">Reference</a></li>
       </ul><ul class="navbar-nav"><li class="nav-item"><form class="form-inline" role="search">
@@ -70,6 +71,7 @@ for scaling to hundreds of thousands or millions of total samples.</p>
 <span>  stem_stride_cv <span class="op">=</span> <span class="fl">1L</span>,</span>
 <span>  device <span class="op">=</span> <span class="kw">if</span> <span class="op">(</span><span class="fu">torch</span><span class="fu">::</span><span class="fu"><a href="https://torch.mlverse.org/docs/reference/cuda_is_available.html" class="external-link">cuda_is_available</a></span><span class="op">(</span><span class="op">)</span><span class="op">)</span> <span class="st">"cuda"</span> <span class="kw">else</span> <span class="st">"cpu"</span>,</span>
 <span>  num_threads <span class="op">=</span> <span class="cn">NULL</span>,</span>
+<span>  num_workers <span class="op">=</span> <span class="fl">1L</span>,</span>
 <span>  save_path <span class="op">=</span> <span class="cn">NULL</span>,</span>
 <span>  resume_from <span class="op">=</span> <span class="cn">NULL</span>,</span>
 <span>  seed <span class="op">=</span> <span class="fl">42L</span>,</span>
@@ -149,6 +151,18 @@ most from setting this to the number of performance cores (e.g. 4
 on an M-series Pro chip with 4P+10E layout), since the efficiency
 cores contribute less per thread. Default <code>NULL</code> leaves torch's
 automatic choice in place.</p></dd>
+
+
+<dt id="arg-num-workers">num_workers<a class="anchor" aria-label="anchor" href="#arg-num-workers"></a></dt>
+<dd><p>Number of parallel workers for R-side synthetic
+data generation (default <code>1L</code> = serial). On Unix/macOS, values &gt; 1
+use <code><a href="https://rdrr.io/r/parallel/mclapply.html" class="external-link">parallel::mclapply</a></code> to generate the per-batch synthetic
+samples in parallel via fork. Most useful on GPU/MPS backends
+where the GPU is otherwise waiting on R between batches. A
+reasonable choice on a chip with N performance cores is
+<code>num_workers = N - 2</code> (leaving a couple cores for the GPU's
+communication threads, BLAS, and the OS). On Windows this
+argument is ignored and generation falls back to serial.</p></dd>
 
 
 <dt id="arg-save-path">save_path<a class="anchor" aria-label="anchor" href="#arg-save-path"></a></dt>

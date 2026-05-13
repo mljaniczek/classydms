@@ -1,9 +1,11 @@
 <urlset xmlns = 'http://www.sitemaps.org/schemas/sitemap/0.9'>
 <url><loc>https://mljaniczek.github.io/classydms/404.html</loc></url>
+<url><loc>https://mljaniczek.github.io/classydms/CLAUDE.html</loc></url>
 <url><loc>https://mljaniczek.github.io/classydms/LICENSE-text.html</loc></url>
 <url><loc>https://mljaniczek.github.io/classydms/articles/getting-started.html</loc></url>
 <url><loc>https://mljaniczek.github.io/classydms/articles/index.html</loc></url>
 <url><loc>https://mljaniczek.github.io/classydms/articles/interpretability.html</loc></url>
+<url><loc>https://mljaniczek.github.io/classydms/articles/performance.html</loc></url>
 <url><loc>https://mljaniczek.github.io/classydms/articles/pretraining.html</loc></url>
 <url><loc>https://mljaniczek.github.io/classydms/authors.html</loc></url>
 <url><loc>https://mljaniczek.github.io/classydms/index.html</loc></url>
