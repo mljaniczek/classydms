@@ -127,13 +127,37 @@ estimate_peak_params <- function(Z_list,
         }
       }
     }
-    # Noise estimation: prefer the pre-dust-threshold matrix (Z_width)
-    # when available, because dust thresholding has already zeroed out
-    # exactly the (0, eps_i] pixels we want to characterize. Estimating
-    # noise from the dust-thresholded Z leaves us with an empty `bg` and
-    # forces a fallback. Z_width / Z_pretrim_list retains those pixels.
+    # Noise estimation: mask out detected peak regions and use the
+    # remaining pixels as the noise distribution. This is more
+    # principled than the previous intensity-threshold approach, which
+    # didn't distinguish between "dim peak shoulders" and "actual
+    # background noise". With sufficient top_k (e.g. >= 500), the
+    # detected peaks cover most of the real peak signal and the
+    # unmasked region really is non-peak background.
+    #
+    # Mask half-extents: max_radius_* + a small buffer to capture peak
+    # tails the bounded width-measurement walk may have missed.
     Z_noise <- Z_width
-    bg <- Z_noise[Z_noise > 0 & Z_noise <= eps_i]
+    if (nrow(centers) > 0) {
+      mask_half_rt <- max_radius_rt + 2L
+      mask_half_cv <- max_radius_cv + 1L
+      peak_mask <- matrix(FALSE, nrow = nrow(Z_noise), ncol = ncol(Z_noise))
+      for (j in seq_len(nrow(centers))) {
+        r0 <- centers[j, 1]; c0 <- centers[j, 2]
+        r_lo <- max(1L, r0 - mask_half_rt)
+        r_hi <- min(nrow(Z_noise), r0 + mask_half_rt)
+        c_lo <- max(1L, c0 - mask_half_cv)
+        c_hi <- min(ncol(Z_noise), c0 + mask_half_cv)
+        peak_mask[r_lo:r_hi, c_lo:c_hi] <- TRUE
+      }
+      non_peak <- Z_noise[!peak_mask]
+      # Restrict to positive pixels (zeros are background regions of the
+      # canvas that don't reflect instrument noise).
+      bg <- non_peak[non_peak > 0]
+    } else {
+      # Fallback if no peaks were detected for this sample
+      bg <- Z_noise[Z_noise > 0 & Z_noise <= eps_i]
+    }
     if (length(bg) > 50) {
       all_noise_mean <- c(all_noise_mean, mean(bg))
       all_noise_sd <- c(all_noise_sd, stats::sd(bg))
