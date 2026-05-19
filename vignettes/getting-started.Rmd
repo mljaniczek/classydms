@@ -75,37 +75,98 @@ global_b <- pooled_trim_bounds(b_list, R = R0, C = C0,
                                 q_lo = 0.05, q_hi = 0.95)
 samples_trimmed <- lapply(samples_dust, trim_sample, bounds = global_b)
 
-# Per-sample log-quantile normalization + pad to common size
-Z_norm   <- map(samples_trimmed, ~normalize_sample(.x$Z))
+```
+
+## 3. Quality control: flag and exclude junk samples
+
+Before estimating peak parameters or pretraining, run per-sample QC on the trimmed samples. This catches samples with too little signal, suspiciously high or low summary statistics, or unusual morphology relative to the rest of the cohort.
+
+```{r qc}
+# Compute per-sample QC features. compute_cohort_correlation = TRUE adds
+# a multivariate similarity check (slower, but catches morphological
+# outliers that don't trigger univariate IQR).
+qc <- qc_features(samples_trimmed, compute_cohort_correlation = TRUE)
+print(qc)
+
+# Apply default exclusion criteria (low signal, IQR outliers, low
+# cohort correlation). Pass NA or Inf for any threshold to disable.
+qc_flagged <- flag_junk_samples(qc,
+                                 min_prop_nonzero       = 0.10,
+                                 iqr_mult               = 3,
+                                 min_cohort_correlation = 0.30)
+
+# Visualize: each panel shows one QC feature with flagged samples in red.
+# Look for outliers and adjust thresholds if the defaults are too strict
+# or too lenient for your cohort.
+plot_qc(qc_flagged)
+
+# How many samples were flagged?
+message("Flagged: ", sum(qc_flagged$flagged), " of ", nrow(qc_flagged))
+```
+
+If you're satisfied with the QC decisions, exclude flagged samples from all downstream steps:
+
+```{r qc-exclude}
+keep <- !qc_flagged$flagged
+samples_kept <- samples_trimmed[keep]
+y_kept       <- y[keep]
+```
+
+If any of the QC criteria seem too aggressive for your cohort (e.g., you want to keep moderate outliers), re-run `flag_junk_samples()` with adjusted thresholds:
+
+```{r qc-relax, eval = FALSE}
+# More permissive: IQR outlier threshold of 5 instead of 3
+qc_flagged_loose <- flag_junk_samples(qc, iqr_mult = 5)
+```
+
+## 4. Normalize and pad (post-QC)
+
+After QC exclusion, finish preprocessing by log-quantile normalizing and padding to a common size for the encoder.
+
+```{r normalize-pad}
+Z_norm   <- map(samples_kept, ~normalize_sample(.x$Z))
 pad_dims <- compute_pad_targets(Z_norm)
 Z_padded <- map(Z_norm, ~pad_to_target(.x, pad_dims$H, pad_dims$W))
 ```
 
-## 3. Estimate peak parameters from real data (label-agnostic)
+## 5. Estimate peak parameters from real data (label-agnostic)
 
 ```{r peak-params}
-Z_raw     <- map(samples_trimmed, ~.x$Z)
-Z_pretrim <- map(samples_trimmed,
+Z_raw     <- map(samples_kept, ~.x$Z)
+Z_pretrim <- map(samples_kept,
                   ~if (!is.null(.x$Z_pretrim)) .x$Z_pretrim else .x$Z)
 
 peak_params <- estimate_peak_params(Z_raw,
                                      Z_pretrim_list = Z_pretrim,
-                                     top_k = 150,
+                                     top_k = 2500,
                                      frac_height = 0.5)
 ```
 
-## 4. Pretrain the encoder
+`top_k = 2500` (rather than a smaller value like 150) gives `estimate_peak_params` enough capacity to characterize the full intensity distribution including dim peaks. Lower values bias the intensity log-normal toward the brightest peaks and make synthetic samples systematically too bright.
+
+## 6. Pretrain the encoder
 
 For most users, the online variant is recommended because it removes the RAM ceiling and lets the model see hundreds of thousands of synthetic samples:
 
 ```{r pretrain}
 pretrain_result <- pretrain_denoising_online(
-  peak_params, H = pad_dims$H, W = pad_dims$W,
-  steps_per_epoch = 10L, epochs = 10L, batch_size = 32L,
-  save_path = "encoder.pt", seed = 42L)
+  peak_params,
+  H = pad_dims$H, W = pad_dims$W,
+  steps_per_epoch  = 500L,
+  epochs           = 32L,
+  batch_size       = 64L,
+  num_workers      = 8L,            # parallel R-side data generation
+  dust_threshold   = 0.005,         # match real-data dust threshold
+  size_jitter      = 0.15,          # peak size variation; tune via QC
+  device           = "mps",         # "cpu" or "cuda" on non-Apple systems
+  save_path        = "encoder.pt",
+  seed             = 42L
+)
 ```
 
 This writes `encoder.pt`, `encoder_autoencoder.pt`, and `encoder_manifest.Rdata` to the working directory, plus periodic checkpoints. The manifest contains the full hyperparameter configuration and loss curves for reproducibility.
+
+See `vignette("pretraining", package = "classydms")` for the rationale behind these specific hyperparameters and how to tune them for your cohort.
 
 Alternatively, skip pretraining entirely by downloading an encoder a collaborator has already trained:
 
@@ -113,21 +174,75 @@ Alternatively, skip pretraining entirely by downloading an encoder a collaborato
 encoder <- load_pretrained_encoder("flu_v1")
 ```
 
-## 5. Classify with elastic net on encoder features
+## 7. Reconstruction QC: does the autoencoder generalize to real data?
+
+A critical check before classification: feed real samples through the **full autoencoder** (encoder + decoder) and visually compare the reconstructions to the originals. If reconstructions look similar to the originals, the encoder learned features that transfer from synthetic to real. If reconstructions are blank or smeared, the synthetic distribution didn't match real closely enough during pretraining.
+
+```{r reconstruct}
+# Reconstruct a handful of real samples through the trained autoencoder
+recon <- reconstruct_real_samples(
+  autoencoder    = pretrain_result$autoencoder,
+  Z_list         = Z_padded,
+  sample_indices = 1:6
+)
+
+# Side-by-side heatmaps: row 1 = real, row 2 = reconstruction
+par(mfrow = c(2, 6), mar = c(1, 1, 2, 1))
+for (r in recon) {
+  image(t(r$original)[, nrow(r$original):1],
+        col = hcl.colors(100, "YlOrRd", rev = TRUE),
+        axes = FALSE,
+        main = paste0("real #", r$index))
+}
+for (r in recon) {
+  image(t(r$reconstructed)[, nrow(r$reconstructed):1],
+        col = hcl.colors(100, "YlOrRd", rev = TRUE),
+        axes = FALSE,
+        main = sprintf("recon (MSE=%.3f)", r$mse))
+}
+par(mfrow = c(1, 1))
+
+# Aggregate MSE across all samples
+all_recon <- reconstruct_real_samples(pretrain_result$autoencoder,
+                                       Z_padded,
+                                       sample_indices = seq_along(Z_padded))
+mse_per_sample <- sapply(all_recon, function(r) r$mse)
+summary(mse_per_sample)
+```
+
+**What healthy reconstructions look like:**
+
+- Peak *locations* in the reconstruction match peak locations in the original. Bright spots appear in the right (RT, CV) coordinates, even if intensities are dampened.
+- The overall *layout* — where signal is concentrated vs. where it's sparse — is preserved.
+- Mean MSE across all samples is low (typically < 0.05 for normalized data).
+
+**Warning signs:**
+
+- Reconstructions are uniformly blank or near-zero everywhere → encoder collapsed to outputting an average image
+- Reconstructions have peaks in completely wrong locations → encoder didn't learn spatial structure
+- A few specific samples have much higher MSE than the rest → those samples are morphological outliers (often worth flagging in QC)
+
+If reconstructions look poor, **do not proceed to classification** — the encoder features won't be meaningful. Common causes and fixes:
+
+- Synthetic-real distribution gap: re-check with `synthetic_quality_check()` (see `vignette("pretraining")`), adjust `dust_threshold` and `size_jitter`
+- Insufficient training: increase `steps_per_epoch * epochs` and retrain
+- Encoder mode collapse: check that encoder feature variance is meaningful (most channels should vary across samples)
+
+## 8. Classify with elastic net on encoder features
 
 ```{r classify}
 elnet <- cv_encoder_elastic_net(pretrain_result$encoder,
-                                 Z_list = Z_padded, y = y,
+                                 Z_list = Z_padded, y = y_kept,
                                  k = 5, alpha = 0.5)
 elnet$auc
 elnet$coefs
 ```
 
-## 6. Saliency maps
+## 9. Saliency maps
 
 ```{r saliency}
-disease_idx <- which(y == 2)
-orig_dims <- lapply(samples_trimmed,
+disease_idx <- which(y_kept == 2)
+orig_dims <- lapply(samples_kept,
                      function(s) c(H = nrow(s$Z), W = ncol(s$Z)))
 
 sal_disease <- aggregate_saliency_masked(pretrain_result$encoder,
@@ -136,7 +251,7 @@ sal_disease <- aggregate_saliency_masked(pretrain_result$encoder,
                                           orig_dims = orig_dims)
 ```
 
-The result is a 2-D matrix in padded image coordinates. Map back to physical (RT in seconds, CV in volts) using `samples_trimmed[[1]]$time` and `samples_trimmed[[1]]$cv`. Saliency hotspots correspond to (RT, CV) locations whose encoder activation, weighted by elastic net coefficients, most strongly drives the disease prediction. These coordinates are the candidate biomarker compounds.
+The result is a 2-D matrix in padded image coordinates. Map back to physical (RT in seconds, CV in volts) using `samples_kept[[1]]$time` and `samples_kept[[1]]$cv`. Saliency hotspots correspond to (RT, CV) locations whose encoder activation, weighted by elastic net coefficients, most strongly drives the disease prediction. These coordinates are the candidate biomarker compounds.
 
 ## Troubleshooting
 
