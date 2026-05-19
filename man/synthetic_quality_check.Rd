@@ -12,7 +12,7 @@ synthetic_quality_check(
   n_synthetic = 50L,
   size_jitter = 0.6,
   normalize = FALSE,
-  top_k = 150L,
+  top_k = 10000L,
   seed = NULL
 )
 }
@@ -33,8 +33,10 @@ dimensions of the first real sample.}
 and synthetic matrices before comparing. Default FALSE compares
 on the raw (post-baseline-correction, pre-normalization) scale.}
 
-\item{top_k}{Used by \code{\link[=pick_peak_centers]{pick_peak_centers()}} for the n_peaks comparison.
-Should match what was used in \code{\link[=estimate_peak_params]{estimate_peak_params()}}.}
+\item{top_k}{Maximum peaks counted per sample for the n_peaks
+comparison via \code{\link[=pick_peak_centers]{pick_peak_centers()}}. Set high enough to NOT cap
+detected peak counts (e.g., 10000) so the comparison reflects
+actual peak density rather than the cap. Default 10000.}
 
 \item{seed}{Optional RNG seed for reproducibility.}
 }

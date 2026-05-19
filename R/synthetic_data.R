@@ -355,8 +355,10 @@ generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
 #' @param normalize If TRUE, apply [normalize_sample()] to both real
 #'   and synthetic matrices before comparing. Default FALSE compares
 #'   on the raw (post-baseline-correction, pre-normalization) scale.
-#' @param top_k Used by [pick_peak_centers()] for the n_peaks comparison.
-#'   Should match what was used in [estimate_peak_params()].
+#' @param top_k Maximum peaks counted per sample for the n_peaks
+#'   comparison via [pick_peak_centers()]. Set high enough to NOT cap
+#'   detected peak counts (e.g., 10000) so the comparison reflects
+#'   actual peak density rather than the cap. Default 10000.
 #' @param seed Optional RNG seed for reproducibility.
 #' @return A list with:
 #'   \item{summary}{data.frame of comparison metrics, one row per
@@ -373,7 +375,7 @@ synthetic_quality_check <- function(Z_real_list, peak_params,
                                       n_synthetic = 50L,
                                       size_jitter = 0.6,
                                       normalize = FALSE,
-                                      top_k = 150L,
+                                      top_k = 10000L,
                                       seed = NULL) {
   stopifnot(length(Z_real_list) > 0)
   if (is.null(H)) H <- nrow(as.matrix(Z_real_list[[1]]))
