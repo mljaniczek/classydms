@@ -51,6 +51,15 @@ reference:
       - pad_to_target
       - robust_eps
 
+  - title: "Quality control"
+    desc: >
+      Per-sample QC features and exclusion criteria, applied between
+      preprocessing and peak parameter estimation.
+    contents:
+      - qc_features
+      - flag_junk_samples
+      - plot_qc
+
   - title: "Synthetic data generation"
     desc: >
       Estimate peak parameter distributions from real data
