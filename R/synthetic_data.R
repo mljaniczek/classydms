@@ -319,3 +319,176 @@ generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
     noisy = torch::torch_tensor(noisy_arr, dtype = torch::torch_float())
   )
 }
+
+#' Quantitative comparison of synthetic vs real GC-DMS samples
+#'
+#' Generates a batch of synthetic samples from `peak_params` and
+#' compares their distributional summary statistics to those of real
+#' samples. Use this to verify the synthetic generator's output
+#' resembles real spectra before committing to a long pretraining run.
+#'
+#' Five comparisons are reported, each with a Kolmogorov-Smirnov D
+#' statistic and p-value (small p-value indicates the real and
+#' synthetic distributions differ):
+#'
+#' \enumerate{
+#'   \item \strong{pixel_intensity_pooled}: distribution of all positive
+#'     pixel values, pooled across samples. Tests whether the intensity
+#'     dynamic range matches.
+#'   \item \strong{total_signal}: per-sample sum of all pixels. Tests
+#'     overall signal magnitude.
+#'   \item \strong{mean_positive}: per-sample mean of positive pixels.
+#'     Tests typical peak amplitude scale.
+#'   \item \strong{sparsity}: per-sample fraction of zero pixels. Tests
+#'     whether the proportion of background-vs-signal region matches.
+#'   \item \strong{n_peaks}: number of detected peaks per sample (via
+#'     [pick_peak_centers()]). Tests whether the peak density matches.
+#' }
+#'
+#' @param Z_real_list List of real preprocessed Z matrices. Typically
+#'   the same `Z_raw` you would pass to [estimate_peak_params()].
+#' @param peak_params Output of [estimate_peak_params()].
+#' @param H,W Dimensions for synthetic generation. Default uses the
+#'   dimensions of the first real sample.
+#' @param n_synthetic Number of synthetic samples to generate.
+#' @param size_jitter Same as in [generate_one_synthetic()].
+#' @param normalize If TRUE, apply [normalize_sample()] to both real
+#'   and synthetic matrices before comparing. Default FALSE compares
+#'   on the raw (post-baseline-correction, pre-normalization) scale.
+#' @param top_k Used by [pick_peak_centers()] for the n_peaks comparison.
+#'   Should match what was used in [estimate_peak_params()].
+#' @param seed Optional RNG seed for reproducibility.
+#' @return A list with:
+#'   \item{summary}{data.frame of comparison metrics, one row per
+#'     statistic.}
+#'   \item{intensity_real}{pooled positive pixel intensities from real
+#'     samples (numeric vector).}
+#'   \item{intensity_synth}{same for synthetic samples.}
+#'   \item{per_sample}{data.frame of per-sample stats for both groups,
+#'     useful for plotting.}
+#' @seealso [plot_synthetic_quality()] for a visual companion.
+#' @export
+synthetic_quality_check <- function(Z_real_list, peak_params,
+                                      H = NULL, W = NULL,
+                                      n_synthetic = 50L,
+                                      size_jitter = 0.6,
+                                      normalize = FALSE,
+                                      top_k = 150L,
+                                      seed = NULL) {
+  stopifnot(length(Z_real_list) > 0)
+  if (is.null(H)) H <- nrow(as.matrix(Z_real_list[[1]]))
+  if (is.null(W)) W <- ncol(as.matrix(Z_real_list[[1]]))
+  if (!is.null(seed)) set.seed(seed)
+
+  # Generate synthetic samples (noisy version, matching what pretraining sees)
+  Z_synth_list <- vector("list", n_synthetic)
+  for (i in seq_len(n_synthetic)) {
+    pair <- generate_one_synthetic(peak_params, H, W,
+                                    add_noise = TRUE,
+                                    size_jitter = size_jitter)
+    Z_synth_list[[i]] <- pair$noisy
+  }
+
+  # Optional normalization to compare on the encoder-input scale
+  if (normalize) {
+    Z_real_use  <- lapply(Z_real_list,  normalize_sample)
+    Z_synth_use <- lapply(Z_synth_list, normalize_sample)
+  } else {
+    Z_real_use  <- lapply(Z_real_list,  as.matrix)
+    Z_synth_use <- Z_synth_list
+  }
+
+  # Per-sample summary stats
+  summarize_sample <- function(Z) {
+    pos <- Z[Z > 0]
+    data.frame(
+      total_signal  = sum(Z),
+      mean_positive = if (length(pos) > 0) mean(pos) else 0,
+      sparsity      = mean(Z == 0),
+      n_peaks       = nrow(pick_peak_centers(Z, top_k = top_k))
+    )
+  }
+  real_stats  <- do.call(rbind, lapply(Z_real_use,  summarize_sample))
+  synth_stats <- do.call(rbind, lapply(Z_synth_use, summarize_sample))
+  real_stats$group  <- "real"
+  synth_stats$group <- "synthetic"
+  per_sample <- rbind(real_stats, synth_stats)
+
+  # Pooled positive-pixel intensities
+  intensity_real  <- unlist(lapply(Z_real_use,  function(Z) Z[Z > 0]))
+  intensity_synth <- unlist(lapply(Z_synth_use, function(Z) Z[Z > 0]))
+
+  # KS test helper (returns NA's for too-small samples)
+  ks_for <- function(x, y) {
+    if (length(x) < 5 || length(y) < 5) return(list(D = NA_real_, p = NA_real_))
+    res <- suppressWarnings(stats::ks.test(x, y))
+    list(D = as.numeric(res$statistic), p = res$p.value)
+  }
+
+  # Build summary table
+  stat_cols <- c("total_signal", "mean_positive", "sparsity", "n_peaks")
+  rows <- lapply(stat_cols, function(s) {
+    r <- real_stats[[s]]; sy <- synth_stats[[s]]
+    ks <- ks_for(r, sy)
+    data.frame(
+      statistic   = s,
+      real_mean   = mean(r),   real_sd  = stats::sd(r),
+      synth_mean  = mean(sy),  synth_sd = stats::sd(sy),
+      ks_D        = ks$D,      ks_p     = ks$p,
+      stringsAsFactors = FALSE
+    )
+  })
+  # Pooled-pixel-intensity comparison: subsample large vectors to keep
+  # ks.test fast and avoid numerical issues with ties.
+  ip_r <- if (length(intensity_real)  > 1e5) sample(intensity_real,  1e5) else intensity_real
+  ip_s <- if (length(intensity_synth) > 1e5) sample(intensity_synth, 1e5) else intensity_synth
+  ks_int <- ks_for(ip_r, ip_s)
+  rows[[length(rows) + 1L]] <- data.frame(
+    statistic = "pixel_intensity_pooled",
+    real_mean = mean(intensity_real), real_sd = stats::sd(intensity_real),
+    synth_mean = mean(intensity_synth), synth_sd = stats::sd(intensity_synth),
+    ks_D = ks_int$D, ks_p = ks_int$p,
+    stringsAsFactors = FALSE
+  )
+
+  list(
+    summary         = do.call(rbind, rows),
+    intensity_real  = intensity_real,
+    intensity_synth = intensity_synth,
+    per_sample      = per_sample
+  )
+}
+
+#' Plot real vs synthetic per-sample summary statistics
+#'
+#' Faceted ggplot showing the distribution of each per-sample summary
+#' statistic (total signal, mean positive intensity, sparsity, peak
+#' count) for real and synthetic samples side-by-side. Use as a
+#' visual companion to [synthetic_quality_check()].
+#'
+#' @param qc_result Output of [synthetic_quality_check()].
+#' @return A ggplot object.
+#' @export
+plot_synthetic_quality <- function(qc_result) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("Package 'ggplot2' is required for plotting.")
+  }
+  if (!requireNamespace("tidyr", quietly = TRUE)) {
+    stop("Package 'tidyr' is required (for pivoting per-sample stats).")
+  }
+  ps <- qc_result$per_sample
+  long <- tidyr::pivot_longer(ps,
+    cols = c("total_signal", "mean_positive", "sparsity", "n_peaks"),
+    names_to = "statistic", values_to = "value")
+  ggplot2::ggplot(long, ggplot2::aes(x = .data$value,
+                                       fill = .data$group)) +
+    ggplot2::geom_density(alpha = 0.45) +
+    ggplot2::facet_wrap(~ statistic, scales = "free", ncol = 2) +
+    ggplot2::scale_fill_manual(values = c("real"      = "steelblue",
+                                            "synthetic" = "coral")) +
+    ggplot2::labs(
+      title = "Per-sample summary statistics: real vs synthetic",
+      x = NULL, y = "density", fill = NULL
+    ) +
+    ggplot2::theme_minimal()
+}
