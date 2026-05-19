@@ -11,7 +11,8 @@ generate_synthetic_dataset(
   W,
   add_noise = TRUE,
   size_jitter = 0.6,
-  normalize = TRUE
+  normalize = TRUE,
+  dust_threshold = 0
 )
 }
 \arguments{
@@ -27,6 +28,14 @@ generate_synthetic_dataset(
 diversity (default 0.6).}
 
 \item{normalize}{Whether to apply \code{\link[=normalize_sample]{normalize_sample()}} (default TRUE).}
+
+\item{dust_threshold}{If > 0, zero out pixels below this value in both
+the clean and noisy synthetic images BEFORE normalization. This
+matches the dust-thresholding step applied to real data via
+\code{\link[=baseline_basement]{baseline_basement()}} and produces synthetic samples whose sparsity
+profile matches real samples. Default 0 (no dust thresholding,
+backward-compatible). To match real-data preprocessing, set this
+to the same \code{basement_thr} you passed to \code{\link[=baseline_basement]{baseline_basement()}}.}
 }
 \value{
 List with \code{clean} and \code{noisy} 4-D torch tensors.

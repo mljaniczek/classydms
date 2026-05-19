@@ -13,6 +13,7 @@ synthetic_quality_check(
   size_jitter = 0.6,
   normalize = FALSE,
   top_k = 10000L,
+  dust_threshold = 0,
   seed = NULL
 )
 }
@@ -37,6 +38,11 @@ on the raw (post-baseline-correction, pre-normalization) scale.}
 comparison via \code{\link[=pick_peak_centers]{pick_peak_centers()}}. Set high enough to NOT cap
 detected peak counts (e.g., 10000) so the comparison reflects
 actual peak density rather than the cap. Default 10000.}
+
+\item{dust_threshold}{If > 0, apply the same dust threshold to
+synthetic samples that was applied to real data. Pass the same
+value used in \code{\link[=baseline_basement]{baseline_basement()}} so synthetic and real are
+compared on the same preprocessed sparsity profile.}
 
 \item{seed}{Optional RNG seed for reproducibility.}
 }

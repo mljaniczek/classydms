@@ -116,6 +116,14 @@ pretrain_denoising <- pretrain_autoencoder
 #' @param size_jitter Per-peak random log-normal size scale factor SD.
 #' @param grad_clip Maximum L2 norm for gradient clipping (0 disables).
 #' @param norm_clamp Maximum normalized pixel value (safety clamp).
+#' @param dust_threshold If > 0, zero out pixels below this value in
+#'   both the clean and noisy synthetic samples BEFORE normalization.
+#'   Matches the dust thresholding applied to real data via
+#'   [baseline_basement()] so synthetic and real samples have the same
+#'   sparsity profile entering the encoder. Default 0 (off,
+#'   backward-compatible). For consistent training with real-data
+#'   preprocessing, set to the same `basement_thr` used on real data
+#'   (typically 0.005).
 #' @param val_n Number of fixed validation samples (0 disables validation).
 #' @param checkpoint_every Save encoder checkpoint every N epochs.
 #' @param loss_diagnostics If TRUE, also print median, p95, max batch loss.
@@ -162,6 +170,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                        size_jitter = 0.6,
                                        grad_clip = 1.0,
                                        norm_clamp = 10.0,
+                                       dust_threshold = 0,
                                        val_n = 200L,
                                        checkpoint_every = 10L,
                                        loss_diagnostics = TRUE,
@@ -207,6 +216,10 @@ pretrain_denoising_online <- function(peak_params, H, W,
   message("  R-side data workers: ", num_workers,
           if (use_parallel) " (parallel via mclapply)" else " (serial)")
   message("  size_jitter: ", size_jitter)
+  message("  dust_threshold: ", dust_threshold,
+          if (dust_threshold > 0)
+            " (synthetic samples will match real-data sparsity)" else
+            " (no dust thresholding; synthetic will be dense)")
   if (val_n > 0L) message("  Validation set: ", val_n, " fixed synthetic samples")
   if (!is.null(save_path) && checkpoint_every > 0)
     message("  Checkpointing every ", checkpoint_every, " epochs to ", save_path)
@@ -275,6 +288,13 @@ pretrain_denoising_online <- function(peak_params, H, W,
     pair <- generate_one_synthetic(peak_params, H, W,
                                     add_noise = add_noise,
                                     size_jitter = size_jitter)
+    # Dust thresholding matches real-data preprocessing (see
+    # baseline_basement) so synthetic samples have the same sparsity
+    # profile as real samples entering the encoder.
+    if (dust_threshold > 0) {
+      pair$clean[pair$clean < dust_threshold] <- 0
+      pair$noisy[pair$noisy < dust_threshold] <- 0
+    }
     list(
       clean = pmin(normalize_sample(pair$clean), norm_clamp),
       noisy = pmin(normalize_sample(pair$noisy), norm_clamp)

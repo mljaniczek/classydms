@@ -296,17 +296,32 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
 #' @inheritParams generate_one_synthetic
 #' @param N Number of synthetic samples to generate.
 #' @param normalize Whether to apply [normalize_sample()] (default TRUE).
+#' @param dust_threshold If > 0, zero out pixels below this value in both
+#'   the clean and noisy synthetic images BEFORE normalization. This
+#'   matches the dust-thresholding step applied to real data via
+#'   [baseline_basement()] and produces synthetic samples whose sparsity
+#'   profile matches real samples. Default 0 (no dust thresholding,
+#'   backward-compatible). To match real-data preprocessing, set this
+#'   to the same `basement_thr` you passed to [baseline_basement()].
 #' @return List with `clean` and `noisy` 4-D torch tensors.
 #' @export
 generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
                                         size_jitter = 0.6,
-                                        normalize = TRUE) {
+                                        normalize = TRUE,
+                                        dust_threshold = 0) {
   clean_arr <- array(0, dim = c(N, 1L, H, W))
   noisy_arr <- array(0, dim = c(N, 1L, H, W))
   for (i in seq_len(N)) {
     pair <- generate_one_synthetic(params, H, W,
                                     add_noise = add_noise,
                                     size_jitter = size_jitter)
+    # Match real-data preprocessing: zero pixels below dust threshold
+    # before normalization. Real data goes through baseline_basement at
+    # this same point in the pipeline.
+    if (dust_threshold > 0) {
+      pair$clean[pair$clean < dust_threshold] <- 0
+      pair$noisy[pair$noisy < dust_threshold] <- 0
+    }
     if (normalize) {
       pair$clean <- normalize_sample(pair$clean)
       pair$noisy <- normalize_sample(pair$noisy)
@@ -359,6 +374,10 @@ generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
 #'   comparison via [pick_peak_centers()]. Set high enough to NOT cap
 #'   detected peak counts (e.g., 10000) so the comparison reflects
 #'   actual peak density rather than the cap. Default 10000.
+#' @param dust_threshold If > 0, apply the same dust threshold to
+#'   synthetic samples that was applied to real data. Pass the same
+#'   value used in [baseline_basement()] so synthetic and real are
+#'   compared on the same preprocessed sparsity profile.
 #' @param seed Optional RNG seed for reproducibility.
 #' @return A list with:
 #'   \item{summary}{data.frame of comparison metrics, one row per
@@ -376,6 +395,7 @@ synthetic_quality_check <- function(Z_real_list, peak_params,
                                       size_jitter = 0.6,
                                       normalize = FALSE,
                                       top_k = 10000L,
+                                      dust_threshold = 0,
                                       seed = NULL) {
   stopifnot(length(Z_real_list) > 0)
   if (is.null(H)) H <- nrow(as.matrix(Z_real_list[[1]]))
@@ -388,7 +408,9 @@ synthetic_quality_check <- function(Z_real_list, peak_params,
     pair <- generate_one_synthetic(peak_params, H, W,
                                     add_noise = TRUE,
                                     size_jitter = size_jitter)
-    Z_synth_list[[i]] <- pair$noisy
+    z <- pair$noisy
+    if (dust_threshold > 0) z[z < dust_threshold] <- 0
+    Z_synth_list[[i]] <- z
   }
 
   # Optional normalization to compare on the encoder-input scale

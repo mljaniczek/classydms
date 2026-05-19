@@ -17,6 +17,7 @@ pretrain_denoising_online(
   size_jitter = 0.6,
   grad_clip = 1,
   norm_clamp = 10,
+  dust_threshold = 0,
   val_n = 200L,
   checkpoint_every = 10L,
   loss_diagnostics = TRUE,
@@ -51,6 +52,15 @@ pretrain_denoising_online(
 \item{grad_clip}{Maximum L2 norm for gradient clipping (0 disables).}
 
 \item{norm_clamp}{Maximum normalized pixel value (safety clamp).}
+
+\item{dust_threshold}{If > 0, zero out pixels below this value in
+both the clean and noisy synthetic samples BEFORE normalization.
+Matches the dust thresholding applied to real data via
+\code{\link[=baseline_basement]{baseline_basement()}} so synthetic and real samples have the same
+sparsity profile entering the encoder. Default 0 (off,
+backward-compatible). For consistent training with real-data
+preprocessing, set to the same \code{basement_thr} used on real data
+(typically 0.005).}
 
 \item{val_n}{Number of fixed validation samples (0 disables validation).}
 
