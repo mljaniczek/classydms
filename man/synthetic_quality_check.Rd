@@ -14,6 +14,9 @@ synthetic_quality_check(
   normalize = FALSE,
   top_k = 10000L,
   dust_threshold = 0,
+  location_mode = c("empirical", "marginal"),
+  location_jitter_rt = 2,
+  location_jitter_cv = 1,
   seed = NULL
 )
 }
@@ -43,6 +46,13 @@ actual peak density rather than the cap. Default 10000.}
 synthetic samples that was applied to real data. Pass the same
 value used in \code{\link[=baseline_basement]{baseline_basement()}} so synthetic and real are
 compared on the same preprocessed sparsity profile.}
+
+\item{location_mode}{Passed through to \code{\link[=generate_one_synthetic]{generate_one_synthetic()}}.
+Default \code{"empirical"} samples peak locations from the real
+cohort's observed hotspots.}
+
+\item{location_jitter_rt, location_jitter_cv}{Passed through to
+\code{\link[=generate_one_synthetic]{generate_one_synthetic()}}.}
 
 \item{seed}{Optional RNG seed for reproducibility.}
 }

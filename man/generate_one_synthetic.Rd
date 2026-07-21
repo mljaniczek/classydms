@@ -4,7 +4,16 @@
 \alias{generate_one_synthetic}
 \title{Generate one synthetic GC-DMS image}
 \usage{
-generate_one_synthetic(params, H, W, add_noise = TRUE, size_jitter = 0.6)
+generate_one_synthetic(
+  params,
+  H,
+  W,
+  add_noise = TRUE,
+  size_jitter = 0.6,
+  location_mode = c("empirical", "marginal"),
+  location_jitter_rt = 2,
+  location_jitter_cv = 1
+)
 }
 \arguments{
 \item{params}{Output of \code{\link[=estimate_peak_params]{estimate_peak_params()}}.}
@@ -15,6 +24,19 @@ generate_one_synthetic(params, H, W, add_noise = TRUE, size_jitter = 0.6)
 
 \item{size_jitter}{Per-peak random log-normal scale factor SD for size
 diversity (default 0.6).}
+
+\item{location_mode}{How to sample peak (RT, CV) locations. \code{"empirical"}
+(default, recommended) draws each peak's location by picking a random
+observed peak location from the real cohort (from \code{params$rt_loc_raw}
+/ \code{params$cv_loc_raw}) and adding small per-peak jitter. This produces
+synthetic images whose peaks cluster at cohort-typical hotspots
+rather than scattering uniformly. \code{"marginal"} uses independent
+Normal draws on each axis with mean/SD from \code{params$rt_loc$mean}/\code{sd}
+— the previous behavior, kept for backward compatibility.}
+
+\item{location_jitter_rt, location_jitter_cv}{SD of per-peak location
+jitter (in pixels) added on top of the empirical draw. Represents
+instrument reproducibility. Default 2 pixels RT, 1 pixel CV.}
 }
 \value{
 List with \code{clean} and \code{noisy} matrices (\code{clean == noisy} if

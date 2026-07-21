@@ -18,6 +18,10 @@ pretrain_denoising_online(
   grad_clip = 1,
   norm_clamp = 10,
   dust_threshold = 0,
+  location_mode = c("empirical", "marginal"),
+  location_jitter_rt = 2,
+  location_jitter_cv = 1,
+  val_real = NULL,
   val_n = 200L,
   checkpoint_every = 10L,
   loss_diagnostics = TRUE,
@@ -61,6 +65,25 @@ sparsity profile entering the encoder. Default 0 (off,
 backward-compatible). For consistent training with real-data
 preprocessing, set to the same \code{basement_thr} used on real data
 (typically 0.005).}
+
+\item{location_mode}{Passed to \code{\link[=generate_one_synthetic]{generate_one_synthetic()}}. Default
+\code{"empirical"} samples peak locations from the real cohort's
+observed hotspots (\code{params$rt_loc_raw} / \code{cv_loc_raw}), producing
+synthetic samples whose peaks cluster at cohort-typical
+(RT, CV) coordinates rather than scattering across the image.
+\code{"marginal"} is the previous behavior kept for backward compatibility.}
+
+\item{location_jitter_rt, location_jitter_cv}{Passed to
+\code{\link[=generate_one_synthetic]{generate_one_synthetic()}}. SD of per-peak location jitter.}
+
+\item{val_real}{Optional list of real preprocessed, padded Z
+matrices (each of size \verb{H x W}) held out as a real-data
+validation set. When provided, an additional per-epoch metric
+\code{real_val_MSE} is computed as the reconstruction MSE of the
+autoencoder on these real samples (target = input, no noise
+added). Directly measures whether encoder features learned from
+synthetic transfer to real. If \code{NULL} (default), only the
+synthetic validation metric is computed.}
 
 \item{val_n}{Number of fixed validation samples (0 disables validation).}
 

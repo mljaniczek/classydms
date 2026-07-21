@@ -124,6 +124,22 @@ pretrain_denoising <- pretrain_autoencoder
 #'   backward-compatible). For consistent training with real-data
 #'   preprocessing, set to the same `basement_thr` used on real data
 #'   (typically 0.005).
+#' @param location_mode Passed to [generate_one_synthetic()]. Default
+#'   `"empirical"` samples peak locations from the real cohort's
+#'   observed hotspots (`params$rt_loc_raw` / `cv_loc_raw`), producing
+#'   synthetic samples whose peaks cluster at cohort-typical
+#'   (RT, CV) coordinates rather than scattering across the image.
+#'   `"marginal"` is the previous behavior kept for backward compatibility.
+#' @param location_jitter_rt,location_jitter_cv Passed to
+#'   [generate_one_synthetic()]. SD of per-peak location jitter.
+#' @param val_real Optional list of real preprocessed, padded Z
+#'   matrices (each of size `H x W`) held out as a real-data
+#'   validation set. When provided, an additional per-epoch metric
+#'   `real_val_MSE` is computed as the reconstruction MSE of the
+#'   autoencoder on these real samples (target = input, no noise
+#'   added). Directly measures whether encoder features learned from
+#'   synthetic transfer to real. If `NULL` (default), only the
+#'   synthetic validation metric is computed.
 #' @param val_n Number of fixed validation samples (0 disables validation).
 #' @param checkpoint_every Save encoder checkpoint every N epochs.
 #' @param loss_diagnostics If TRUE, also print median, p95, max batch loss.
@@ -171,6 +187,11 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                        grad_clip = 1.0,
                                        norm_clamp = 10.0,
                                        dust_threshold = 0,
+                                       location_mode = c("empirical",
+                                                          "marginal"),
+                                       location_jitter_rt = 2,
+                                       location_jitter_cv = 1,
+                                       val_real = NULL,
                                        val_n = 200L,
                                        checkpoint_every = 10L,
                                        loss_diagnostics = TRUE,
@@ -199,6 +220,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
     use_parallel <- FALSE
     num_workers <- 1L
   }
+  location_mode <- match.arg(location_mode)
   set.seed(seed); torch::torch_manual_seed(seed)
 
   total_samples <- as.numeric(steps_per_epoch) * epochs * batch_size
@@ -220,7 +242,14 @@ pretrain_denoising_online <- function(peak_params, H, W,
           if (dust_threshold > 0)
             " (synthetic samples will match real-data sparsity)" else
             " (no dust thresholding; synthetic will be dense)")
+  message("  location_mode: ", location_mode,
+          if (location_mode == "empirical")
+            paste0(" (jitter RT=", location_jitter_rt,
+                    " px, CV=", location_jitter_cv, " px)")
+          else "")
   if (val_n > 0L) message("  Validation set: ", val_n, " fixed synthetic samples")
+  if (!is.null(val_real))
+    message("  Real validation set: ", length(val_real), " held-out real samples")
   if (!is.null(save_path) && checkpoint_every > 0)
     message("  Checkpointing every ", checkpoint_every, " epochs to ", save_path)
 
@@ -263,6 +292,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
           return(list(encoder = model$encoder, autoencoder = model,
                        loss_history = tm$loss_history,
                        val_loss_history = tm$val_loss_history,
+                       real_val_loss_history = tm$real_val_loss_history,
                        batch_loss_stats = tm$batch_loss_stats,
                        total_samples = tm$total_samples))
         }
@@ -287,7 +317,10 @@ pretrain_denoising_online <- function(peak_params, H, W,
   generate_one_pair <- function(i) {
     pair <- generate_one_synthetic(peak_params, H, W,
                                     add_noise = add_noise,
-                                    size_jitter = size_jitter)
+                                    size_jitter = size_jitter,
+                                    location_mode = location_mode,
+                                    location_jitter_rt = location_jitter_rt,
+                                    location_jitter_cv = location_jitter_cv)
     # Dust thresholding matches real-data preprocessing (see
     # baseline_basement) so synthetic samples have the same sparsity
     # profile as real samples entering the encoder.
@@ -347,7 +380,54 @@ pretrain_denoising_online <- function(peak_params, H, W,
     val_loss_total / length(val_batches)
   }
 
-  save_manifest <- function(loss_h, val_h, stats, last_ep, final = FALSE) {
+  # Real-data validation: build torch batches from val_real once. Per-epoch
+  # eval_val_real() computes MSE of autoencoder reconstruction on real
+  # samples (target = input, no added noise). Non-training test that the
+  # encoder-decoder actually generalizes off synthetic.
+  val_real_batches <- NULL
+  if (!is.null(val_real) && length(val_real) > 0L) {
+    n_val_real <- length(val_real)
+    n_batches_real <- ceiling(n_val_real / batch_size)
+    val_real_batches <- vector("list", n_batches_real)
+    for (b in seq_len(n_batches_real)) {
+      s_lo <- (b - 1L) * batch_size + 1L
+      s_hi <- min(b * batch_size, n_val_real)
+      chunk <- val_real[s_lo:s_hi]
+      n_chunk <- length(chunk)
+      arr <- array(0, dim = c(n_chunk, 1L, H, W))
+      for (i in seq_len(n_chunk)) {
+        Z_i <- as.matrix(chunk[[i]])
+        if (nrow(Z_i) != H || ncol(Z_i) != W) {
+          stop("val_real entry ", s_lo + i - 1L, " has dim ",
+                nrow(Z_i), "x", ncol(Z_i),
+                "; expected ", H, "x", W,
+                " (pad your val_real matrices to match pad_dims).")
+        }
+        arr[i, 1, , ] <- Z_i
+      }
+      val_real_batches[[b]] <- torch::torch_tensor(arr,
+                                    dtype = torch::torch_float())
+    }
+  }
+
+  eval_val_real <- function() {
+    if (is.null(val_real_batches)) return(NA_real_)
+    model$eval()
+    total <- 0; n <- 0L
+    torch::with_no_grad({
+      for (vb in val_real_batches) {
+        x <- vb$to(device = device)
+        # Target = input (reconstruction check, no added noise).
+        total <- total + as.numeric(loss_fn(model(x), x)$item())
+        n <- n + 1L
+      }
+    })
+    model$train()
+    total / max(n, 1L)
+  }
+
+  save_manifest <- function(loss_h, val_h, real_val_h, stats, last_ep,
+                             final = FALSE) {
     if (is.null(save_path)) return(invisible(NULL))
     manifest_path <- sub("\\.pt$", "_manifest.Rdata", save_path)
     training_manifest <- list(
@@ -357,10 +437,16 @@ pretrain_denoising_online <- function(peak_params, H, W,
         batch_size = batch_size, lr = lr, weight_decay = weight_decay,
         add_noise = add_noise, size_jitter = size_jitter,
         grad_clip = grad_clip, norm_clamp = norm_clamp, val_n = val_n,
+        dust_threshold = dust_threshold,
+        location_mode = location_mode,
+        location_jitter_rt = location_jitter_rt,
+        location_jitter_cv = location_jitter_cv,
+        val_real_n = if (is.null(val_real)) 0L else length(val_real),
         checkpoint_every = checkpoint_every,
         stem_stride_rt = stem_stride_rt, stem_stride_cv = stem_stride_cv,
         device = device, seed = seed),
       loss_history = loss_h, val_loss_history = val_h,
+      real_val_loss_history = real_val_h,
       batch_loss_stats = stats, total_samples = total_samples,
       last_epoch_completed = last_ep, complete = final,
       timestamp = Sys.time(), r_version = R.version.string)
@@ -370,6 +456,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
   # Initialize loss-history vectors; if resuming, splice in prior values.
   loss_history <- numeric(epochs)
   val_loss_history <- rep(NA_real_, epochs)
+  real_val_loss_history <- rep(NA_real_, epochs)
   batch_loss_stats <- vector("list", epochs)
   if (!is.null(prior_loss_history)) {
     n_prior <- min(length(prior_loss_history), epochs)
@@ -403,23 +490,28 @@ pretrain_denoising_online <- function(peak_params, H, W,
       p95 = as.numeric(stats::quantile(batch_losses, 0.95)))
     loss_history[ep] <- batch_loss_stats[[ep]]$mean
     val_loss_history[ep] <- eval_val()
+    real_val_loss_history[ep] <- eval_val_real()
     ep_time <- as.numeric(difftime(Sys.time(), ep_start, units = "mins"))
     elapsed_total <- as.numeric(difftime(Sys.time(), training_start, units = "mins"))
     eta_min <- elapsed_total / ep * (epochs - ep)
     if (verbose) {
       val_str <- if (val_n > 0L) paste0(" | val MSE: ",
                                           round(val_loss_history[ep], 4)) else ""
+      real_val_str <- if (!is.null(val_real_batches))
+        paste0(" | real val MSE: ",
+                round(real_val_loss_history[ep], 4)) else ""
       diag_str <- if (loss_diagnostics) paste0(
         " | median: ", round(batch_loss_stats[[ep]]$median, 4),
         " | p95: ",    round(batch_loss_stats[[ep]]$p95,    4),
         " | max: ",    round(batch_loss_stats[[ep]]$max,    4)) else ""
       message("Epoch ", ep, "/", epochs,
               " | train MSE: ", round(batch_loss_stats[[ep]]$mean, 4),
-              val_str, diag_str,
+              val_str, real_val_str, diag_str,
               " | Time: ", round(ep_time, 2), " min",
               " | ETA: ", round(eta_min, 0), " min")
     }
-    save_manifest(loss_history, val_loss_history, batch_loss_stats,
+    save_manifest(loss_history, val_loss_history, real_val_loss_history,
+                   batch_loss_stats,
                    last_ep = ep, final = (ep == epochs))
 
     # After EVERY epoch: overwrite encoder.pt and autoencoder.pt with the
@@ -462,5 +554,6 @@ pretrain_denoising_online <- function(peak_params, H, W,
 
   list(encoder = model$encoder, autoencoder = model,
        loss_history = loss_history, val_loss_history = val_loss_history,
+       real_val_loss_history = real_val_loss_history,
        batch_loss_stats = batch_loss_stats, total_samples = total_samples)
 }

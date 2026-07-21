@@ -240,24 +240,68 @@ estimate_peak_params <- function(Z_list,
 #' @param add_noise If TRUE, add spatially-varying background noise.
 #' @param size_jitter Per-peak random log-normal scale factor SD for size
 #'   diversity (default 0.6).
+#' @param location_mode How to sample peak (RT, CV) locations. `"empirical"`
+#'   (default, recommended) draws each peak's location by picking a random
+#'   observed peak location from the real cohort (from `params$rt_loc_raw`
+#'   / `params$cv_loc_raw`) and adding small per-peak jitter. This produces
+#'   synthetic images whose peaks cluster at cohort-typical hotspots
+#'   rather than scattering uniformly. `"marginal"` uses independent
+#'   Normal draws on each axis with mean/SD from `params$rt_loc$mean`/`sd`
+#'   — the previous behavior, kept for backward compatibility.
+#' @param location_jitter_rt,location_jitter_cv SD of per-peak location
+#'   jitter (in pixels) added on top of the empirical draw. Represents
+#'   instrument reproducibility. Default 2 pixels RT, 1 pixel CV.
 #' @return List with `clean` and `noisy` matrices (`clean == noisy` if
 #'   `add_noise = FALSE`).
 #' @export
 generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
-                                    size_jitter = 0.6) {
+                                    size_jitter = 0.6,
+                                    location_mode = c("empirical", "marginal"),
+                                    location_jitter_rt = 2,
+                                    location_jitter_cv = 1) {
+  location_mode <- match.arg(location_mode)
+
   if (params$n_peaks_detected == 0) {
     stop("generate_one_synthetic: params contain 0 detected peaks.")
   }
+
+  # Empirical location mode requires stored raw observations.
+  if (location_mode == "empirical") {
+    if (is.null(params$rt_loc_raw) || is.null(params$cv_loc_raw) ||
+        length(params$rt_loc_raw) == 0L) {
+      warning("location_mode = 'empirical' requested but params lacks ",
+              "rt_loc_raw / cv_loc_raw; falling back to 'marginal'.")
+      location_mode <- "marginal"
+    }
+  }
+
   n_peaks <- max(1L, round(stats::rnorm(1,
     mean = params$n_peaks$mean,
     sd = max(params$n_peaks$sd, params$n_peaks$mean * 0.3))))
   clean <- matrix(0, nrow = H, ncol = W)
   rows <- seq_len(H); cols <- seq_len(W)
+
+  # Pre-sample peak-location indices for empirical mode (one draw per
+  # peak, with replacement). Adding per-peak jitter reflects instrument
+  # reproducibility around each hotspot.
+  if (location_mode == "empirical") {
+    n_obs <- length(params$rt_loc_raw)
+    loc_idx <- sample.int(n_obs, size = n_peaks, replace = TRUE)
+  }
+
   for (k in seq_len(n_peaks)) {
-    mu_rt <- stats::rnorm(1, mean = params$rt_loc$mean * H,
-                              sd = params$rt_loc$sd * H)
-    mu_cv <- stats::rnorm(1, mean = params$cv_loc$mean * W,
-                              sd = params$cv_loc$sd * W)
+    if (location_mode == "empirical") {
+      j <- loc_idx[k]
+      mu_rt <- params$rt_loc_raw[j] * H +
+                 stats::rnorm(1, mean = 0, sd = location_jitter_rt)
+      mu_cv <- params$cv_loc_raw[j] * W +
+                 stats::rnorm(1, mean = 0, sd = location_jitter_cv)
+    } else {
+      mu_rt <- stats::rnorm(1, mean = params$rt_loc$mean * H,
+                                sd = params$rt_loc$sd * H)
+      mu_cv <- stats::rnorm(1, mean = params$cv_loc$mean * W,
+                                sd = params$cv_loc$sd * W)
+    }
     mu_rt <- max(1, min(H, mu_rt))
     mu_cv <- max(1, min(W, mu_cv))
     sig_rt <- stats::rlnorm(1, meanlog = params$sigma_rt$meanlog,
@@ -308,13 +352,21 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
 generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
                                         size_jitter = 0.6,
                                         normalize = TRUE,
-                                        dust_threshold = 0) {
+                                        dust_threshold = 0,
+                                        location_mode = c("empirical",
+                                                          "marginal"),
+                                        location_jitter_rt = 2,
+                                        location_jitter_cv = 1) {
+  location_mode <- match.arg(location_mode)
   clean_arr <- array(0, dim = c(N, 1L, H, W))
   noisy_arr <- array(0, dim = c(N, 1L, H, W))
   for (i in seq_len(N)) {
     pair <- generate_one_synthetic(params, H, W,
                                     add_noise = add_noise,
-                                    size_jitter = size_jitter)
+                                    size_jitter = size_jitter,
+                                    location_mode = location_mode,
+                                    location_jitter_rt = location_jitter_rt,
+                                    location_jitter_cv = location_jitter_cv)
     # Match real-data preprocessing: zero pixels below dust threshold
     # before normalization. Real data goes through baseline_basement at
     # this same point in the pipeline.
@@ -378,6 +430,11 @@ generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
 #'   synthetic samples that was applied to real data. Pass the same
 #'   value used in [baseline_basement()] so synthetic and real are
 #'   compared on the same preprocessed sparsity profile.
+#' @param location_mode Passed through to [generate_one_synthetic()].
+#'   Default `"empirical"` samples peak locations from the real
+#'   cohort's observed hotspots.
+#' @param location_jitter_rt,location_jitter_cv Passed through to
+#'   [generate_one_synthetic()].
 #' @param seed Optional RNG seed for reproducibility.
 #' @return A list with:
 #'   \item{summary}{data.frame of comparison metrics, one row per
@@ -396,7 +453,12 @@ synthetic_quality_check <- function(Z_real_list, peak_params,
                                       normalize = FALSE,
                                       top_k = 10000L,
                                       dust_threshold = 0,
+                                      location_mode = c("empirical",
+                                                        "marginal"),
+                                      location_jitter_rt = 2,
+                                      location_jitter_cv = 1,
                                       seed = NULL) {
+  location_mode <- match.arg(location_mode)
   stopifnot(length(Z_real_list) > 0)
   if (is.null(H)) H <- nrow(as.matrix(Z_real_list[[1]]))
   if (is.null(W)) W <- ncol(as.matrix(Z_real_list[[1]]))
@@ -407,7 +469,10 @@ synthetic_quality_check <- function(Z_real_list, peak_params,
   for (i in seq_len(n_synthetic)) {
     pair <- generate_one_synthetic(peak_params, H, W,
                                     add_noise = TRUE,
-                                    size_jitter = size_jitter)
+                                    size_jitter = size_jitter,
+                                    location_mode = location_mode,
+                                    location_jitter_rt = location_jitter_rt,
+                                    location_jitter_cv = location_jitter_cv)
     z <- pair$noisy
     if (dust_threshold > 0) z[z < dust_threshold] <- 0
     Z_synth_list[[i]] <- z

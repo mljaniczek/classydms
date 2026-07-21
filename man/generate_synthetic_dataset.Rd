@@ -12,7 +12,10 @@ generate_synthetic_dataset(
   add_noise = TRUE,
   size_jitter = 0.6,
   normalize = TRUE,
-  dust_threshold = 0
+  dust_threshold = 0,
+  location_mode = c("empirical", "marginal"),
+  location_jitter_rt = 2,
+  location_jitter_cv = 1
 )
 }
 \arguments{
@@ -36,6 +39,19 @@ matches the dust-thresholding step applied to real data via
 profile matches real samples. Default 0 (no dust thresholding,
 backward-compatible). To match real-data preprocessing, set this
 to the same \code{basement_thr} you passed to \code{\link[=baseline_basement]{baseline_basement()}}.}
+
+\item{location_mode}{How to sample peak (RT, CV) locations. \code{"empirical"}
+(default, recommended) draws each peak's location by picking a random
+observed peak location from the real cohort (from \code{params$rt_loc_raw}
+/ \code{params$cv_loc_raw}) and adding small per-peak jitter. This produces
+synthetic images whose peaks cluster at cohort-typical hotspots
+rather than scattering uniformly. \code{"marginal"} uses independent
+Normal draws on each axis with mean/SD from \code{params$rt_loc$mean}/\code{sd}
+— the previous behavior, kept for backward compatibility.}
+
+\item{location_jitter_rt, location_jitter_cv}{SD of per-peak location
+jitter (in pixels) added on top of the empirical draw. Represents
+instrument reproducibility. Default 2 pixels RT, 1 pixel CV.}
 }
 \value{
 List with \code{clean} and \code{noisy} 4-D torch tensors.
