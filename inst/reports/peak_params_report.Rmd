@@ -1,0 +1,509 @@
+---
+title: "`r sprintf('Peak-parameters report — %s', params$cohort_name)`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+params:
+  peak_params: NA
+  y: NA
+  batch: NA
+  cohort_name: "cohort"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5, dpi = 96)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+
+pp <- params$peak_params
+y  <- params$y
+batch <- params$batch
+
+# --- Per-peak long table -----------------------------------------------
+peaks <- tibble::tibble(
+  sample_idx = pp$sample_idx_raw,
+  rt_loc     = pp$rt_loc_raw,
+  cv_loc     = pp$cv_loc_raw,
+  sigma_rt   = pp$sigma_rt_raw,
+  sigma_cv   = pp$sigma_cv_raw,
+  intensity  = pp$intensity_raw
+)
+
+# --- Per-sample summary ------------------------------------------------
+sample_names <- if (!is.null(pp$sample_names)) {
+  pp$sample_names
+} else {
+  as.character(seq_len(pp$n_samples))
+}
+if (length(sample_names) < pp$n_samples) {
+  sample_names <- c(sample_names,
+                    as.character(seq(length(sample_names) + 1L,
+                                     pp$n_samples)))
+}
+
+samples_df <- tibble::tibble(
+  sample_idx  = seq_len(pp$n_samples),
+  sample_name = sample_names
+)
+
+# Attach class labels
+has_y <- !is.null(y) && length(y) > 0
+if (has_y) {
+  # Accept either names(y) matching sample_names or a positional vector
+  if (!is.null(names(y))) {
+    lookup <- y[samples_df$sample_name]
+  } else if (length(y) == pp$n_samples) {
+    lookup <- y
+  } else {
+    warning("y provided but neither named-with-sample-names nor length-",
+            pp$n_samples, "; ignoring y for class comparisons.")
+    lookup <- rep(NA, pp$n_samples)
+    has_y <- FALSE
+  }
+  samples_df$class <- factor(lookup)
+}
+
+has_batch <- !is.null(batch) && length(batch) > 0
+if (has_batch) {
+  if (!is.null(names(batch))) {
+    b_lookup <- batch[samples_df$sample_name]
+  } else if (length(batch) == pp$n_samples) {
+    b_lookup <- batch
+  } else {
+    warning("batch provided but neither named-with-sample-names nor length-",
+            pp$n_samples, "; ignoring batch for coloring.")
+    b_lookup <- rep(NA, pp$n_samples)
+    has_batch <- FALSE
+  }
+  samples_df$batch <- factor(b_lookup)
+}
+
+# Per-sample peak count
+n_peaks_per_sample <- as.integer(table(factor(peaks$sample_idx,
+                                              levels = seq_len(pp$n_samples))))
+samples_df$n_peaks <- n_peaks_per_sample
+
+# Per-sample centroid (mean rt_loc, mean cv_loc)
+centroid_df <- peaks |>
+  dplyr::group_by(sample_idx) |>
+  dplyr::summarise(rt_centroid = mean(rt_loc),
+                   cv_centroid = mean(cv_loc),
+                   .groups = "drop")
+samples_df <- dplyr::left_join(samples_df, centroid_df, by = "sample_idx")
+
+# --- p-value collector for BH-FDR at the end ---------------------------
+p_records <- list()
+record_p <- function(label, p, test) {
+  p_records[[length(p_records) + 1L]] <<-
+    tibble::tibble(test = test, comparison = label, p_raw = p)
+}
+
+# Safe wilcox that returns NA when a group is empty / degenerate
+safe_wilcox <- function(x, g) {
+  ok <- is.finite(x) & !is.na(g)
+  x <- x[ok]; g <- g[ok]
+  if (length(unique(g)) < 2L) return(NA_real_)
+  if (length(x) < 3L) return(NA_real_)
+  tryCatch(stats::wilcox.test(x ~ g)$p.value, error = function(e) NA_real_)
+}
+```
+
+# 1. Summary
+
+```{r sec1-summary}
+summary_tbl <- tibble::tibble(
+  Field  = c("Cohort", "N samples", "N peaks detected",
+             "Mean peaks / sample", "Median peaks / sample",
+             "Noise mean (fitted)", "Noise SD (fitted)"),
+  Value  = c(params$cohort_name,
+             format(pp$n_samples),
+             format(pp$n_peaks_detected),
+             sprintf("%.1f", mean(samples_df$n_peaks)),
+             sprintf("%.1f", stats::median(samples_df$n_peaks)),
+             signif(pp$noise$mean, 3),
+             signif(pp$noise$sd, 3))
+)
+knitr::kable(summary_tbl)
+
+if (has_y) {
+  class_tbl <- samples_df |>
+    dplyr::count(class, name = "n") |>
+    dplyr::mutate(pct = sprintf("%.1f%%", 100 * n / sum(n)))
+  cat("\n\n**Class balance:**\n\n")
+  knitr::kable(class_tbl)
+}
+```
+
+# 2. Per-sample peak count
+
+```{r sec2-peakcount}
+p_count <- ggplot(samples_df, aes(x = n_peaks)) +
+  geom_histogram(bins = 30, fill = "grey60", color = "white") +
+  labs(x = "peaks per sample", y = "n samples",
+       title = "Distribution of per-sample peak counts") +
+  theme_minimal()
+if (has_y) {
+  p_count <- ggplot(samples_df, aes(x = n_peaks, fill = class,
+                                    color = class)) +
+    geom_density(alpha = 0.3) +
+    labs(x = "peaks per sample", y = "density",
+         title = "Peak count by class") +
+    theme_minimal()
+}
+print(p_count)
+
+if (has_y) {
+  p_val <- safe_wilcox(samples_df$n_peaks, samples_df$class)
+  record_p("peak count", p_val, "Wilcoxon rank-sum")
+  cat("\n\nWilcoxon rank-sum on peak counts by class: p =",
+      signif(p_val, 3), " (BH-adjusted values in Section 9)\n")
+}
+```
+
+# 3. Peak location hotspots
+
+Hotspot maps use the raw `(rt_loc, cv_loc)` coordinates (fractions of the padded image). Bin counts reflect where peaks land in image space; higher-count bins are cross-sample recurring locations.
+
+```{r sec3-hotspots, fig.height = 5}
+# Coarse grid used both for the hotspot map and the sample-level density
+# features in Section 4. Chosen to give ~40 RT bins and ~15 CV bins.
+GRID_RT <- 40L
+GRID_CV <- 15L
+rt_breaks <- seq(0, 1, length.out = GRID_RT + 1L)
+cv_breaks <- seq(0, 1, length.out = GRID_CV + 1L)
+
+peaks$rt_bin <- cut(peaks$rt_loc, rt_breaks,
+                    include.lowest = TRUE, labels = FALSE)
+peaks$cv_bin <- cut(peaks$cv_loc, cv_breaks,
+                    include.lowest = TRUE, labels = FALSE)
+
+p_hot_all <- ggplot(peaks, aes(x = rt_loc, y = cv_loc)) +
+  geom_bin2d(bins = c(GRID_RT, GRID_CV)) +
+  scale_fill_viridis_c(option = "magma") +
+  labs(x = "RT (fraction of image)", y = "CV (fraction of image)",
+       title = "All peaks (pooled across samples)") +
+  theme_minimal()
+print(p_hot_all)
+```
+
+```{r sec3-hotspots-by-class, eval = has_y, fig.height = 4}
+peaks_c <- dplyr::left_join(peaks,
+                            samples_df |> dplyr::select(sample_idx, class),
+                            by = "sample_idx")
+
+p_by_class <- ggplot(peaks_c, aes(x = rt_loc, y = cv_loc)) +
+  geom_bin2d(bins = c(GRID_RT, GRID_CV)) +
+  scale_fill_viridis_c(option = "magma") +
+  facet_wrap(~ class) +
+  labs(x = "RT (fraction)", y = "CV (fraction)",
+       title = "Peaks by class") +
+  theme_minimal()
+print(p_by_class)
+```
+
+```{r sec3-diff-map, eval = has_y, fig.height = 4}
+# Difference map: normalize each class to relative density, then subtract.
+lv <- levels(samples_df$class)
+if (length(lv) == 2L) {
+  bin_counts <- peaks_c |>
+    dplyr::count(class, rt_bin, cv_bin, name = "n") |>
+    dplyr::group_by(class) |>
+    dplyr::mutate(rel = n / sum(n)) |>
+    dplyr::ungroup()
+
+  wide <- tidyr::pivot_wider(bin_counts |> dplyr::select(-n),
+                             names_from = class, values_from = rel,
+                             values_fill = 0)
+  wide$diff <- wide[[lv[2]]] - wide[[lv[1]]]
+
+  p_diff <- ggplot(wide,
+                   aes(x = rt_bin, y = cv_bin, fill = diff)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                         midpoint = 0,
+                         name = sprintf("%s - %s", lv[2], lv[1])) +
+    labs(x = "RT bin", y = "CV bin",
+         title = sprintf("Class-difference density: %s - %s",
+                         lv[2], lv[1])) +
+    theme_minimal()
+  print(p_diff)
+
+  cat("\n\nRed cells indicate bins with higher relative peak density in ",
+      lv[2], ". Blue cells indicate higher density in ", lv[1],
+      ". Values are class-normalized relative frequencies, so differences ",
+      "cancel to zero across the grid.")
+} else {
+  cat("Class difference map only shown for exactly 2 classes.")
+}
+```
+
+# 4. Sample-level clustering and shift analysis
+
+Two questions:
+
+1. **Do samples cluster by class?** — PCA on a per-sample spatial-density feature vector (peaks binned into `r GRID_RT` × `r GRID_CV` cells), colored by class and (optionally) batch. Wilcoxon on PC1.
+2. **Are some samples globally shifted?** — Each sample has a spatial centroid `(mean rt_loc, mean cv_loc)`. A sample's shift is its centroid minus the cohort-median centroid. Large shifts suggest instrument drift or run-specific offsets that global alignment can undo.
+
+Global alignment applied here: `aligned_(rt,cv) = raw_(rt,cv) - (sample_shift)`. The before/after hotspot maps show whether this concentrates the cross-sample peak population.
+
+```{r sec4-pca, fig.height = 5}
+# Build sample x bin feature matrix
+bin_id <- (peaks$cv_bin - 1L) * GRID_RT + peaks$rt_bin
+feat <- matrix(0L, nrow = pp$n_samples, ncol = GRID_RT * GRID_CV)
+tab <- table(peaks$sample_idx, bin_id)
+feat[cbind(as.integer(rownames(tab)),
+           as.integer(colnames(tab)))] <- 0L  # ensure init
+for (r in seq_len(nrow(tab))) {
+  si <- as.integer(rownames(tab)[r])
+  cols <- as.integer(colnames(tab))
+  feat[si, cols] <- as.integer(tab[r, ])
+}
+# Drop zero-variance columns and standardize
+var_cols <- apply(feat, 2, var)
+keep_cols <- which(var_cols > 0)
+feat_use <- feat[, keep_cols, drop = FALSE]
+if (ncol(feat_use) >= 2L && nrow(feat_use) >= 3L) {
+  pc <- stats::prcomp(feat_use, scale. = TRUE)
+  pca_df <- tibble::tibble(sample_idx = seq_len(pp$n_samples),
+                           PC1 = pc$x[, 1],
+                           PC2 = pc$x[, 2])
+  pca_df <- dplyr::left_join(pca_df, samples_df, by = "sample_idx")
+  var_expl <- pc$sdev^2 / sum(pc$sdev^2)
+
+  aes_map <- aes(x = PC1, y = PC2, label = sample_name)
+  if (has_y)     aes_map$colour <- rlang::sym("class")
+  if (has_batch) aes_map$shape  <- rlang::sym("batch")
+
+  p_pca <- ggplot(pca_df, aes_map) +
+    geom_point(size = 2.5, alpha = 0.85) +
+    labs(x = sprintf("PC1 (%.1f%%)", 100 * var_expl[1]),
+         y = sprintf("PC2 (%.1f%%)", 100 * var_expl[2]),
+         title = "Sample PCA on spatial-density features") +
+    theme_minimal()
+  print(p_pca)
+
+  if (has_y) {
+    p_val <- safe_wilcox(pca_df$PC1, pca_df$class)
+    record_p("PC1 by class", p_val, "Wilcoxon rank-sum")
+    cat("\n\nWilcoxon on PC1 by class: p =", signif(p_val, 3),
+        " (BH-adjusted values in Section 9)\n")
+  }
+} else {
+  cat("Not enough samples or nonzero bins to run PCA.")
+}
+```
+
+```{r sec4-shifts, fig.height = 4}
+cohort_med_rt <- stats::median(samples_df$rt_centroid, na.rm = TRUE)
+cohort_med_cv <- stats::median(samples_df$cv_centroid, na.rm = TRUE)
+samples_df$shift_rt <- samples_df$rt_centroid - cohort_med_rt
+samples_df$shift_cv <- samples_df$cv_centroid - cohort_med_cv
+samples_df$shift_mag <- sqrt(samples_df$shift_rt^2 + samples_df$shift_cv^2)
+
+top_shift <- samples_df |>
+  dplyr::arrange(dplyr::desc(shift_mag)) |>
+  dplyr::select(sample_name, shift_rt, shift_cv, shift_mag) |>
+  utils::head(15)
+cat("**Top 15 samples by shift magnitude** (fractions of image):\n\n")
+knitr::kable(top_shift, digits = 4)
+
+shift_hist <- ggplot(samples_df, aes(x = shift_mag)) +
+  geom_histogram(bins = 30, fill = "grey60", color = "white") +
+  labs(x = "shift magnitude", y = "n samples",
+       title = "Per-sample shift magnitude") +
+  theme_minimal()
+print(shift_hist)
+```
+
+```{r sec4-before-after, fig.height = 4}
+# Apply per-sample shift to each peak
+peaks_shift <- peaks |>
+  dplyr::left_join(samples_df |>
+                     dplyr::select(sample_idx, shift_rt, shift_cv),
+                   by = "sample_idx") |>
+  dplyr::mutate(rt_aligned = rt_loc - shift_rt,
+                cv_aligned = cv_loc - shift_cv)
+
+p_before <- ggplot(peaks_shift, aes(x = rt_loc, y = cv_loc)) +
+  geom_bin2d(bins = c(GRID_RT, GRID_CV)) +
+  scale_fill_viridis_c(option = "magma") +
+  labs(x = "RT (fraction)", y = "CV (fraction)", title = "Before alignment") +
+  theme_minimal()
+p_after <- ggplot(peaks_shift, aes(x = rt_aligned, y = cv_aligned)) +
+  geom_bin2d(bins = c(GRID_RT, GRID_CV)) +
+  scale_fill_viridis_c(option = "magma") +
+  labs(x = "RT (fraction)", y = "CV (fraction)", title = "After global alignment") +
+  theme_minimal()
+if (requireNamespace("gridExtra", quietly = TRUE)) {
+  gridExtra::grid.arrange(p_before, p_after, ncol = 2)
+} else {
+  print(p_before); print(p_after)
+}
+```
+
+<!--
+Follow-up work (deferred): cluster samples on their (shift_rt, shift_cv)
+vectors (e.g. k-means with several k) to detect unlabeled batch
+structure. Track down whether samples with the largest |shift_mag|
+share a processing date or run number that isn't currently captured in
+the batch metadata.
+-->
+
+# 5. Peak widths
+
+```{r sec5-widths, fig.height = 4}
+widths_long <- tibble::tibble(
+  sample_idx = peaks$sample_idx,
+  sigma_rt = peaks$sigma_rt,
+  sigma_cv = peaks$sigma_cv
+) |>
+  tidyr::pivot_longer(cols = c(sigma_rt, sigma_cv),
+                      names_to = "axis", values_to = "sigma")
+
+if (has_y) {
+  widths_long <- dplyr::left_join(widths_long,
+                                  samples_df |> dplyr::select(sample_idx, class),
+                                  by = "sample_idx")
+  p_w <- ggplot(widths_long, aes(x = sigma, color = class, fill = class)) +
+    geom_density(alpha = 0.3) +
+    facet_wrap(~ axis, scales = "free") +
+    labs(x = "sigma (pixels)", y = "density",
+         title = "Peak-width densities by axis and class") +
+    theme_minimal()
+  print(p_w)
+
+  # Per-sample median widths for testing
+  per_samp_w <- widths_long |>
+    dplyr::group_by(sample_idx, axis, class) |>
+    dplyr::summarise(sigma_med = stats::median(sigma), .groups = "drop")
+
+  for (a in c("sigma_rt", "sigma_cv")) {
+    sub <- per_samp_w[per_samp_w$axis == a, ]
+    p_val <- safe_wilcox(sub$sigma_med, sub$class)
+    record_p(paste0(a, " (per-sample median)"), p_val,
+             "Wilcoxon rank-sum")
+    cat("\n\nWilcoxon on per-sample median ", a,
+        " by class: p =", signif(p_val, 3), "\n")
+  }
+} else {
+  p_w <- ggplot(widths_long, aes(x = sigma)) +
+    geom_density(fill = "grey60", alpha = 0.5) +
+    facet_wrap(~ axis, scales = "free") +
+    labs(x = "sigma (pixels)", y = "density",
+         title = "Peak-width densities") +
+    theme_minimal()
+  print(p_w)
+}
+```
+
+# 6. Peak intensities
+
+```{r sec6-intensity, fig.height = 4}
+peaks$log_intensity <- log(pmax(peaks$intensity, .Machine$double.eps))
+
+if (has_y) {
+  peaks_c <- dplyr::left_join(peaks,
+                              samples_df |> dplyr::select(sample_idx, class),
+                              by = "sample_idx")
+  p_i <- ggplot(peaks_c, aes(x = log_intensity, color = class, fill = class)) +
+    geom_density(alpha = 0.3) +
+    labs(x = "log(intensity)", y = "density",
+         title = "Log-intensity densities by class") +
+    theme_minimal()
+  print(p_i)
+
+  per_samp_i <- peaks_c |>
+    dplyr::group_by(sample_idx, class) |>
+    dplyr::summarise(log_i_med = stats::median(log_intensity),
+                     .groups = "drop")
+  p_val <- safe_wilcox(per_samp_i$log_i_med, per_samp_i$class)
+  record_p("per-sample median log(intensity)", p_val,
+           "Wilcoxon rank-sum")
+  cat("\n\nWilcoxon on per-sample median log(intensity) by class: p =",
+      signif(p_val, 3), "\n")
+} else {
+  p_i <- ggplot(peaks, aes(x = log_intensity)) +
+    geom_density(fill = "grey60", alpha = 0.5) +
+    labs(x = "log(intensity)", y = "density",
+         title = "Log-intensity density") +
+    theme_minimal()
+  print(p_i)
+}
+```
+
+# 7. Noise
+
+```{r sec7-noise}
+knitr::kable(tibble::tibble(
+  Field = c("Fitted noise mean",
+            "Fitted noise SD",
+            "Estimated `robust_eps` (0.01 * Q0.95)"),
+  Value = c(
+    signif(pp$noise$mean, 3),
+    signif(pp$noise$sd, 3),
+    if (!is.null(pp$intensity_raw) && length(pp$intensity_raw)) {
+      signif(as.numeric(stats::quantile(pp$intensity_raw, 0.95)) * 0.01, 3)
+    } else {
+      NA
+    }
+  )
+))
+cat("\nCompare noise SD to a candidate hybrid eps of ",
+    signif(3 * pp$noise$sd, 3),
+    " (3 * noise SD). If this is much larger than the empirical eps, ",
+    "consider tightening eps for future peak detection.\n")
+```
+
+# 8. Diagnostic flags
+
+```{r sec8-flags}
+q <- stats::quantile(samples_df$n_peaks, c(0.25, 0.75), na.rm = TRUE)
+iqr <- q[2] - q[1]
+low <- samples_df$n_peaks < q[1] - 1.5 * iqr
+hi  <- samples_df$n_peaks > q[2] + 1.5 * iqr
+
+shift_q <- stats::quantile(samples_df$shift_mag, 0.95, na.rm = TRUE)
+big_shift <- samples_df$shift_mag > shift_q
+
+flags <- samples_df |>
+  dplyr::mutate(
+    low_peak_count  = low,
+    high_peak_count = hi,
+    large_shift     = big_shift
+  ) |>
+  dplyr::filter(low_peak_count | high_peak_count | large_shift) |>
+  dplyr::select(sample_name, n_peaks, shift_mag,
+                low_peak_count, high_peak_count, large_shift)
+if (nrow(flags) == 0L) {
+  cat("No samples flagged on peak-count IQR or top-5% shift criteria.\n")
+} else {
+  knitr::kable(flags, digits = 4)
+}
+```
+
+# 9. Multiple-testing summary
+
+Benjamini-Hochberg-adjusted p-values across every class comparison reported above.
+
+```{r sec9-fdr}
+if (length(p_records) == 0L) {
+  cat("No class comparisons ran (y not provided or single-class).\n")
+} else {
+  p_df <- dplyr::bind_rows(p_records)
+  p_df$p_bh <- stats::p.adjust(p_df$p_raw, method = "BH")
+  knitr::kable(p_df, digits = 4)
+}
+```
+
+# Deferred (Phase 2)
+
+Once alignment findings from Section 4 are interpreted, follow-up work will add:
+
+- `build_peak_catalog()` to cluster shifted peaks across the cohort
+- Anchor-peak analysis (peaks present in ≥ 90% of samples) with per-class comparison and volcano plot
+- Sporadic-peak analysis (peaks present in < 30% of samples) — group-specific signals
+- k-means on per-sample shift vectors to detect unlabeled batch structure
