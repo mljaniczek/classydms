@@ -31,6 +31,12 @@
 #' @param batch Optional named vector (character or factor) of batch
 #'   labels used to color the sample PCA. Names must match
 #'   `peak_params$sample_names`. `NULL` skips batch coloring.
+#' @param class_labels Optional named character vector remapping the
+#'   values of `y` to display labels (e.g. `c("1" = "control",
+#'   "2" = "disease")`). If provided, class comparisons and plot
+#'   legends use the display labels; values in `y` not present in
+#'   `names(class_labels)` are shown unchanged. Ignored when `y` is
+#'   already a factor with meaningful character levels.
 #' @param cohort_name Short label displayed in the report title
 #'   (e.g. `"CHF"` or `"AKI"`).
 #' @param output_file Output HTML filename.
@@ -43,6 +49,7 @@
 render_peak_params_report <- function(peak_params,
                                        y = NULL,
                                        batch = NULL,
+                                       class_labels = NULL,
                                        cohort_name = "cohort",
                                        output_file = "peak_params_report.html",
                                        output_dir  = NULL,
@@ -93,10 +100,11 @@ render_peak_params_report <- function(peak_params,
     output_file = basename(output_file),
     output_dir  = output_dir,
     params = list(
-      peak_params = peak_params,
-      y           = y,
-      batch       = batch,
-      cohort_name = cohort_name
+      peak_params  = peak_params,
+      y            = y,
+      batch        = batch,
+      class_labels = class_labels,
+      cohort_name  = cohort_name
     ),
     envir = new.env(parent = globalenv()),
     quiet = quiet

@@ -9,6 +9,7 @@ params:
   peak_params: NA
   y: NA
   batch: NA
+  class_labels: NA
   cohort_name: "cohort"
 ---
 
@@ -64,7 +65,14 @@ if (has_y) {
     lookup <- rep(NA, pp$n_samples)
     has_y <- FALSE
   }
-  samples_df$class <- factor(lookup)
+  # Optional remap of numeric / string class values to display labels.
+  cls_char <- as.character(lookup)
+  cl <- params$class_labels
+  if (!is.null(cl) && length(cl) > 0 && !is.null(names(cl))) {
+    remap <- cl[cls_char]
+    cls_char <- ifelse(is.na(remap), cls_char, unname(remap))
+  }
+  samples_df$class <- factor(cls_char)
 }
 
 has_batch <- !is.null(batch) && length(batch) > 0
@@ -181,10 +189,10 @@ peaks$rt_bin <- cut(peaks$rt_loc, rt_breaks,
 peaks$cv_bin <- cut(peaks$cv_loc, cv_breaks,
                     include.lowest = TRUE, labels = FALSE)
 
-p_hot_all <- ggplot(peaks, aes(x = rt_loc, y = cv_loc)) +
-  geom_bin2d(bins = c(GRID_RT, GRID_CV)) +
+p_hot_all <- ggplot(peaks, aes(x = cv_loc, y = rt_loc)) +
+  geom_bin2d(bins = c(GRID_CV, GRID_RT)) +
   scale_fill_viridis_c(option = "magma") +
-  labs(x = "RT (fraction of image)", y = "CV (fraction of image)",
+  labs(x = "CV (fraction of image)", y = "RT (fraction of image)",
        title = "All peaks (pooled across samples)") +
   theme_minimal()
 print(p_hot_all)
@@ -195,11 +203,11 @@ peaks_c <- dplyr::left_join(peaks,
                             samples_df |> dplyr::select(sample_idx, class),
                             by = "sample_idx")
 
-p_by_class <- ggplot(peaks_c, aes(x = rt_loc, y = cv_loc)) +
-  geom_bin2d(bins = c(GRID_RT, GRID_CV)) +
+p_by_class <- ggplot(peaks_c, aes(x = cv_loc, y = rt_loc)) +
+  geom_bin2d(bins = c(GRID_CV, GRID_RT)) +
   scale_fill_viridis_c(option = "magma") +
   facet_wrap(~ class) +
-  labs(x = "RT (fraction)", y = "CV (fraction)",
+  labs(x = "CV (fraction)", y = "RT (fraction)",
        title = "Peaks by class") +
   theme_minimal()
 print(p_by_class)
@@ -221,12 +229,12 @@ if (length(lv) == 2L) {
   wide$diff <- wide[[lv[2]]] - wide[[lv[1]]]
 
   p_diff <- ggplot(wide,
-                   aes(x = rt_bin, y = cv_bin, fill = diff)) +
+                   aes(x = cv_bin, y = rt_bin, fill = diff)) +
     geom_tile() +
     scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
                          midpoint = 0,
                          name = sprintf("%s - %s", lv[2], lv[1])) +
-    labs(x = "RT bin", y = "CV bin",
+    labs(x = "CV bin", y = "RT bin",
          title = sprintf("Class-difference density: %s - %s",
                          lv[2], lv[1])) +
     theme_minimal()
@@ -328,15 +336,15 @@ peaks_shift <- peaks |>
   dplyr::mutate(rt_aligned = rt_loc - shift_rt,
                 cv_aligned = cv_loc - shift_cv)
 
-p_before <- ggplot(peaks_shift, aes(x = rt_loc, y = cv_loc)) +
-  geom_bin2d(bins = c(GRID_RT, GRID_CV)) +
+p_before <- ggplot(peaks_shift, aes(x = cv_loc, y = rt_loc)) +
+  geom_bin2d(bins = c(GRID_CV, GRID_RT)) +
   scale_fill_viridis_c(option = "magma") +
-  labs(x = "RT (fraction)", y = "CV (fraction)", title = "Before alignment") +
+  labs(x = "CV (fraction)", y = "RT (fraction)", title = "Before alignment") +
   theme_minimal()
-p_after <- ggplot(peaks_shift, aes(x = rt_aligned, y = cv_aligned)) +
-  geom_bin2d(bins = c(GRID_RT, GRID_CV)) +
+p_after <- ggplot(peaks_shift, aes(x = cv_aligned, y = rt_aligned)) +
+  geom_bin2d(bins = c(GRID_CV, GRID_RT)) +
   scale_fill_viridis_c(option = "magma") +
-  labs(x = "RT (fraction)", y = "CV (fraction)", title = "After global alignment") +
+  labs(x = "CV (fraction)", y = "RT (fraction)", title = "After global alignment") +
   theme_minimal()
 if (requireNamespace("gridExtra", quietly = TRUE)) {
   gridExtra::grid.arrange(p_before, p_after, ncol = 2)
@@ -459,6 +467,37 @@ cat("\nCompare noise SD to a candidate hybrid eps of ",
 ```
 
 # 8. Diagnostic flags
+
+Three per-sample flags are computed to surface samples worth eyeballing:
+
+- **`low_peak_count`** — the sample's total number of detected peaks is
+  below Q1 - 1.5 * IQR relative to the cohort's peak-count distribution
+  (the standard boxplot outlier rule, low side). Usually indicates
+  under-saturated signal, a failed run, or a sample-prep issue that
+  suppressed volatile release.
+
+- **`high_peak_count`** — the sample's peak count is above Q3 + 1.5 * IQR
+  (the same rule, high side). Usually indicates contamination,
+  oversaturation, or a run whose atypical background got mis-classified
+  as peaks.
+
+- **`large_shift`** — the sample's peak-cloud *centroid* is farther from
+  the cohort's median centroid than 95% of samples. Concretely: each
+  sample has a spatial centroid `(mean RT of its peaks, mean CV of its
+  peaks)`, and its shift is `(sample centroid) - (cohort median
+  centroid)`. `shift_mag` is the Euclidean length of that vector. Large
+  shifts usually mean the sample's peaks systematically land at
+  different (RT, CV) coordinates than the rest of the cohort — for
+  example instrument drift for that specific run, a batch offset, or an
+  RT/CV calibration issue. Section 4's before / after alignment plots
+  show whether subtracting the per-sample shift concentrates the cohort
+  peak cloud.
+
+Samples flagged *only* for `large_shift` (with normal peak count) are
+the most interesting: they likely have real signal that just landed in
+a shifted location — global alignment can rescue them. Samples flagged
+for both `low_peak_count` and `large_shift` are more concerning and
+warrant looking at the raw spectrum.
 
 ```{r sec8-flags}
 q <- stats::quantile(samples_df$n_peaks, c(0.25, 0.75), na.rm = TRUE)

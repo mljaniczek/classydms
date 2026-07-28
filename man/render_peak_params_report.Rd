@@ -8,6 +8,7 @@ render_peak_params_report(
   peak_params,
   y = NULL,
   batch = NULL,
+  class_labels = NULL,
   cohort_name = "cohort",
   output_file = "peak_params_report.html",
   output_dir = NULL,
@@ -26,6 +27,12 @@ are skipped and the report is rendered label-agnostic.}
 \item{batch}{Optional named vector (character or factor) of batch
 labels used to color the sample PCA. Names must match
 \code{peak_params$sample_names}. \code{NULL} skips batch coloring.}
+
+\item{class_labels}{Optional named character vector remapping the
+values of \code{y} to display labels (e.g. \code{c("1" = "control", "2" = "disease")}). If provided, class comparisons and plot
+legends use the display labels; values in \code{y} not present in
+\code{names(class_labels)} are shown unchanged. Ignored when \code{y} is
+already a factor with meaningful character levels.}
 
 \item{cohort_name}{Short label displayed in the report title
 (e.g. \code{"CHF"} or \code{"AKI"}).}
