@@ -12,7 +12,8 @@ generate_one_synthetic(
   size_jitter = 0.6,
   location_mode = c("empirical", "marginal"),
   location_jitter_rt = 2,
-  location_jitter_cv = 1
+  location_jitter_cv = 1,
+  attribute_mode = c("joint", "marginal")
 )
 }
 \arguments{
@@ -37,6 +38,18 @@ Normal draws on each axis with mean/SD from \code{params$rt_loc$mean}/\code{sd}
 \item{location_jitter_rt, location_jitter_cv}{SD of per-peak location
 jitter (in pixels) added on top of the empirical draw. Represents
 instrument reproducibility. Default 2 pixels RT, 1 pixel CV.}
+
+\item{attribute_mode}{How to sample per-peak morphology
+(sigma_rt, sigma_cv, intensity). \code{"joint"} (default, recommended)
+draws an index \code{j} into \code{params$rt_loc_raw} and reuses the observed
+\verb{(sigma_rt_raw[j], sigma_cv_raw[j], intensity_raw[j])} triple.
+This preserves the empirical joint distribution: wider peaks are
+drawn with correspondingly higher intensity, matching the physical
+coupling in real GC-DMS data. When \code{location_mode == "empirical"}
+the same \code{j} is used for location and morphology; otherwise an
+independent index is drawn. \code{"marginal"} reverts to independent
+log-normal draws for each attribute (the pre-\code{attribute_mode}
+behavior; wider peaks and higher intensity are uncorrelated).}
 }
 \value{
 List with \code{clean} and \code{noisy} matrices (\code{clean == noisy} if

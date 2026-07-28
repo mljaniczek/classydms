@@ -132,6 +132,12 @@ pretrain_denoising <- pretrain_autoencoder
 #'   `"marginal"` is the previous behavior kept for backward compatibility.
 #' @param location_jitter_rt,location_jitter_cv Passed to
 #'   [generate_one_synthetic()]. SD of per-peak location jitter.
+#' @param attribute_mode Passed to [generate_one_synthetic()]. Default
+#'   `"joint"` couples per-peak sigma_rt / sigma_cv / intensity by
+#'   resampling the observed triple from `params$*_raw`, so wider
+#'   peaks are drawn with correspondingly higher intensity (matching
+#'   the physical coupling in real GC-DMS). `"marginal"` reverts to
+#'   independent log-normal draws.
 #' @param val_real Optional list of real preprocessed, padded Z
 #'   matrices (each of size `H x W`) held out as a real-data
 #'   validation set. When provided, an additional per-epoch metric
@@ -191,6 +197,8 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                                           "marginal"),
                                        location_jitter_rt = 2,
                                        location_jitter_cv = 1,
+                                       attribute_mode = c("joint",
+                                                          "marginal"),
                                        val_real = NULL,
                                        val_n = 200L,
                                        checkpoint_every = 10L,
@@ -220,7 +228,8 @@ pretrain_denoising_online <- function(peak_params, H, W,
     use_parallel <- FALSE
     num_workers <- 1L
   }
-  location_mode <- match.arg(location_mode)
+  location_mode  <- match.arg(location_mode)
+  attribute_mode <- match.arg(attribute_mode)
   set.seed(seed); torch::torch_manual_seed(seed)
 
   total_samples <- as.numeric(steps_per_epoch) * epochs * batch_size
@@ -247,6 +256,10 @@ pretrain_denoising_online <- function(peak_params, H, W,
             paste0(" (jitter RT=", location_jitter_rt,
                     " px, CV=", location_jitter_cv, " px)")
           else "")
+  message("  attribute_mode: ", attribute_mode,
+          if (attribute_mode == "joint")
+            " (per-peak sigma_rt / sigma_cv / intensity resampled as observed triple)"
+          else " (per-peak morphology drawn independently)")
   if (val_n > 0L) message("  Validation set: ", val_n, " fixed synthetic samples")
   if (!is.null(val_real))
     message("  Real validation set: ", length(val_real), " held-out real samples")
@@ -320,7 +333,8 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                     size_jitter = size_jitter,
                                     location_mode = location_mode,
                                     location_jitter_rt = location_jitter_rt,
-                                    location_jitter_cv = location_jitter_cv)
+                                    location_jitter_cv = location_jitter_cv,
+                                    attribute_mode = attribute_mode)
     # Dust thresholding matches real-data preprocessing (see
     # baseline_basement) so synthetic samples have the same sparsity
     # profile as real samples entering the encoder.
@@ -441,6 +455,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
         location_mode = location_mode,
         location_jitter_rt = location_jitter_rt,
         location_jitter_cv = location_jitter_cv,
+        attribute_mode = attribute_mode,
         val_real_n = if (is.null(val_real)) 0L else length(val_real),
         checkpoint_every = checkpoint_every,
         stem_stride_rt = stem_stride_rt, stem_stride_cv = stem_stride_cv,

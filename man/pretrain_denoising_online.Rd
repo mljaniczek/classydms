@@ -21,6 +21,7 @@ pretrain_denoising_online(
   location_mode = c("empirical", "marginal"),
   location_jitter_rt = 2,
   location_jitter_cv = 1,
+  attribute_mode = c("joint", "marginal"),
   val_real = NULL,
   val_n = 200L,
   checkpoint_every = 10L,
@@ -75,6 +76,13 @@ synthetic samples whose peaks cluster at cohort-typical
 
 \item{location_jitter_rt, location_jitter_cv}{Passed to
 \code{\link[=generate_one_synthetic]{generate_one_synthetic()}}. SD of per-peak location jitter.}
+
+\item{attribute_mode}{Passed to \code{\link[=generate_one_synthetic]{generate_one_synthetic()}}. Default
+\code{"joint"} couples per-peak sigma_rt / sigma_cv / intensity by
+resampling the observed triple from \verb{params$*_raw}, so wider
+peaks are drawn with correspondingly higher intensity (matching
+the physical coupling in real GC-DMS). \code{"marginal"} reverts to
+independent log-normal draws.}
 
 \item{val_real}{Optional list of real preprocessed, padded Z
 matrices (each of size \verb{H x W}) held out as a real-data

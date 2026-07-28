@@ -17,6 +17,7 @@ synthetic_quality_check(
   location_mode = c("empirical", "marginal"),
   location_jitter_rt = 2,
   location_jitter_cv = 1,
+  attribute_mode = c("joint", "marginal"),
   seed = NULL
 )
 }
@@ -53,6 +54,10 @@ cohort's observed hotspots.}
 
 \item{location_jitter_rt, location_jitter_cv}{Passed through to
 \code{\link[=generate_one_synthetic]{generate_one_synthetic()}}.}
+
+\item{attribute_mode}{Passed through to \code{\link[=generate_one_synthetic]{generate_one_synthetic()}}.
+Default \code{"joint"} couples per-peak sigma_rt / sigma_cv / intensity
+by resampling the observed triple.}
 
 \item{seed}{Optional RNG seed for reproducibility.}
 }

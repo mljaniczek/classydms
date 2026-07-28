@@ -261,6 +261,17 @@ estimate_peak_params <- function(Z_list,
 #' @param location_jitter_rt,location_jitter_cv SD of per-peak location
 #'   jitter (in pixels) added on top of the empirical draw. Represents
 #'   instrument reproducibility. Default 2 pixels RT, 1 pixel CV.
+#' @param attribute_mode How to sample per-peak morphology
+#'   (sigma_rt, sigma_cv, intensity). `"joint"` (default, recommended)
+#'   draws an index `j` into `params$rt_loc_raw` and reuses the observed
+#'   `(sigma_rt_raw[j], sigma_cv_raw[j], intensity_raw[j])` triple.
+#'   This preserves the empirical joint distribution: wider peaks are
+#'   drawn with correspondingly higher intensity, matching the physical
+#'   coupling in real GC-DMS data. When `location_mode == "empirical"`
+#'   the same `j` is used for location and morphology; otherwise an
+#'   independent index is drawn. `"marginal"` reverts to independent
+#'   log-normal draws for each attribute (the pre-`attribute_mode`
+#'   behavior; wider peaks and higher intensity are uncorrelated).
 #' @return List with `clean` and `noisy` matrices (`clean == noisy` if
 #'   `add_noise = FALSE`).
 #' @export
@@ -268,8 +279,10 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
                                     size_jitter = 0.6,
                                     location_mode = c("empirical", "marginal"),
                                     location_jitter_rt = 2,
-                                    location_jitter_cv = 1) {
-  location_mode <- match.arg(location_mode)
+                                    location_jitter_cv = 1,
+                                    attribute_mode = c("joint", "marginal")) {
+  location_mode  <- match.arg(location_mode)
+  attribute_mode <- match.arg(attribute_mode)
 
   if (params$n_peaks_detected == 0) {
     stop("generate_one_synthetic: params contain 0 detected peaks.")
@@ -284,6 +297,19 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
       location_mode <- "marginal"
     }
   }
+  # Joint attribute mode requires all three per-peak raw vectors.
+  if (attribute_mode == "joint") {
+    need <- c("sigma_rt_raw", "sigma_cv_raw", "intensity_raw")
+    have <- vapply(need, function(nm) {
+      !is.null(params[[nm]]) && length(params[[nm]]) > 0L
+    }, logical(1))
+    if (!all(have)) {
+      warning("attribute_mode = 'joint' requested but params lacks ",
+              paste(need[!have], collapse = " / "),
+              "; falling back to 'marginal'.")
+      attribute_mode <- "marginal"
+    }
+  }
 
   n_peaks <- max(1L, round(stats::rnorm(1,
     mean = params$n_peaks$mean,
@@ -291,13 +317,19 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
   clean <- matrix(0, nrow = H, ncol = W)
   rows <- seq_len(H); cols <- seq_len(W)
 
-  # Pre-sample peak-location indices for empirical mode (one draw per
-  # peak, with replacement). Adding per-peak jitter reflects instrument
-  # reproducibility around each hotspot.
-  if (location_mode == "empirical") {
-    n_obs <- length(params$rt_loc_raw)
-    loc_idx <- sample.int(n_obs, size = n_peaks, replace = TRUE)
-  }
+  # Pre-sample peak-location and attribute indices (with replacement).
+  #   - Empirical location: draw a location index once per peak.
+  #   - Joint attributes: reuse the location index if empirical location
+  #     mode is on (same real peak provides location + morphology), or
+  #     draw an independent attribute index otherwise.
+  n_obs <- if (!is.null(params$rt_loc_raw)) length(params$rt_loc_raw) else 0L
+  loc_idx <- if (location_mode == "empirical") {
+    sample.int(n_obs, size = n_peaks, replace = TRUE)
+  } else NULL
+  attr_idx <- if (attribute_mode == "joint") {
+    if (!is.null(loc_idx)) loc_idx
+    else sample.int(n_obs, size = n_peaks, replace = TRUE)
+  } else NULL
 
   for (k in seq_len(n_peaks)) {
     if (location_mode == "empirical") {
@@ -314,16 +346,23 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
     }
     mu_rt <- max(1, min(H, mu_rt))
     mu_cv <- max(1, min(W, mu_cv))
-    sig_rt <- stats::rlnorm(1, meanlog = params$sigma_rt$meanlog,
-                              sdlog = params$sigma_rt$sdlog)
-    sig_cv <- stats::rlnorm(1, meanlog = params$sigma_cv$meanlog,
-                              sdlog = params$sigma_cv$sdlog)
+    if (attribute_mode == "joint") {
+      ja <- attr_idx[k]
+      sig_rt <- params$sigma_rt_raw[ja]
+      sig_cv <- params$sigma_cv_raw[ja]
+      base_amp <- params$intensity_raw[ja]
+    } else {
+      sig_rt <- stats::rlnorm(1, meanlog = params$sigma_rt$meanlog,
+                                sdlog = params$sigma_rt$sdlog)
+      sig_cv <- stats::rlnorm(1, meanlog = params$sigma_cv$meanlog,
+                                sdlog = params$sigma_cv$sdlog)
+      base_amp <- stats::rlnorm(1, meanlog = params$intensity$meanlog,
+                                   sdlog = params$intensity$sdlog)
+    }
     scale_factor <- exp(stats::rnorm(1, mean = 0, sd = size_jitter))
     sig_rt <- max(sig_rt * scale_factor, 0.8)
     sig_cv <- max(sig_cv * scale_factor, 0.8)
-    amp <- stats::rlnorm(1, meanlog = params$intensity$meanlog,
-                              sdlog = params$intensity$sdlog) *
-      (0.5 + 0.5 * scale_factor)
+    amp <- base_amp * (0.5 + 0.5 * scale_factor)
     g_rt <- exp(-0.5 * ((rows - mu_rt) / sig_rt)^2)
     g_cv <- exp(-0.5 * ((cols - mu_cv) / sig_cv)^2)
     clean <- clean + amp * outer(g_rt, g_cv)
@@ -366,8 +405,11 @@ generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
                                         location_mode = c("empirical",
                                                           "marginal"),
                                         location_jitter_rt = 2,
-                                        location_jitter_cv = 1) {
-  location_mode <- match.arg(location_mode)
+                                        location_jitter_cv = 1,
+                                        attribute_mode = c("joint",
+                                                           "marginal")) {
+  location_mode  <- match.arg(location_mode)
+  attribute_mode <- match.arg(attribute_mode)
   clean_arr <- array(0, dim = c(N, 1L, H, W))
   noisy_arr <- array(0, dim = c(N, 1L, H, W))
   for (i in seq_len(N)) {
@@ -376,7 +418,8 @@ generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
                                     size_jitter = size_jitter,
                                     location_mode = location_mode,
                                     location_jitter_rt = location_jitter_rt,
-                                    location_jitter_cv = location_jitter_cv)
+                                    location_jitter_cv = location_jitter_cv,
+                                    attribute_mode = attribute_mode)
     # Match real-data preprocessing: zero pixels below dust threshold
     # before normalization. Real data goes through baseline_basement at
     # this same point in the pipeline.
@@ -445,6 +488,9 @@ generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
 #'   cohort's observed hotspots.
 #' @param location_jitter_rt,location_jitter_cv Passed through to
 #'   [generate_one_synthetic()].
+#' @param attribute_mode Passed through to [generate_one_synthetic()].
+#'   Default `"joint"` couples per-peak sigma_rt / sigma_cv / intensity
+#'   by resampling the observed triple.
 #' @param seed Optional RNG seed for reproducibility.
 #' @return A list with:
 #'   \item{summary}{data.frame of comparison metrics, one row per
@@ -467,8 +513,11 @@ synthetic_quality_check <- function(Z_real_list, peak_params,
                                                         "marginal"),
                                       location_jitter_rt = 2,
                                       location_jitter_cv = 1,
+                                      attribute_mode = c("joint",
+                                                         "marginal"),
                                       seed = NULL) {
-  location_mode <- match.arg(location_mode)
+  location_mode  <- match.arg(location_mode)
+  attribute_mode <- match.arg(attribute_mode)
   stopifnot(length(Z_real_list) > 0)
   if (is.null(H)) H <- nrow(as.matrix(Z_real_list[[1]]))
   if (is.null(W)) W <- ncol(as.matrix(Z_real_list[[1]]))
@@ -482,7 +531,8 @@ synthetic_quality_check <- function(Z_real_list, peak_params,
                                     size_jitter = size_jitter,
                                     location_mode = location_mode,
                                     location_jitter_rt = location_jitter_rt,
-                                    location_jitter_cv = location_jitter_cv)
+                                    location_jitter_cv = location_jitter_cv,
+                                    attribute_mode = attribute_mode)
     z <- pair$noisy
     if (dust_threshold > 0) z[z < dust_threshold] <- 0
     Z_synth_list[[i]] <- z
