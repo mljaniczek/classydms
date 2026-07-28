@@ -31,7 +31,13 @@ estimate_peak_params(
 \value{
 A list of fitted distributions and raw observation vectors,
 suitable for passing to \code{\link[=generate_one_synthetic]{generate_one_synthetic()}} or
-\code{\link[=generate_synthetic_dataset]{generate_synthetic_dataset()}}.
+\code{\link[=generate_synthetic_dataset]{generate_synthetic_dataset()}}. Fields \code{rt_loc_raw}, \code{cv_loc_raw},
+\code{sigma_rt_raw}, \code{sigma_cv_raw}, and \code{intensity_raw} are parallel
+per-peak vectors; \code{sample_idx_raw} gives the 1-based index of the
+source sample for each peak (parallel to the other \verb{*_raw} vectors),
+and \code{sample_names} is \code{names(Z_list)} for lookup. These enable
+per-sample analyses (e.g. sample-level shift/clustering) without
+changing existing callers.
 }
 \description{
 Pools all samples (cases and controls together; no labels used) and

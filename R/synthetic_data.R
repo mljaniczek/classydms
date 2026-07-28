@@ -24,7 +24,13 @@
 #' @param verbose Whether to print diagnostic messages (default TRUE).
 #' @return A list of fitted distributions and raw observation vectors,
 #'   suitable for passing to [generate_one_synthetic()] or
-#'   [generate_synthetic_dataset()].
+#'   [generate_synthetic_dataset()]. Fields `rt_loc_raw`, `cv_loc_raw`,
+#'   `sigma_rt_raw`, `sigma_cv_raw`, and `intensity_raw` are parallel
+#'   per-peak vectors; `sample_idx_raw` gives the 1-based index of the
+#'   source sample for each peak (parallel to the other `*_raw` vectors),
+#'   and `sample_names` is `names(Z_list)` for lookup. These enable
+#'   per-sample analyses (e.g. sample-level shift/clustering) without
+#'   changing existing callers.
 #' @export
 estimate_peak_params <- function(Z_list,
                                   Z_pretrim_list = NULL,
@@ -40,6 +46,7 @@ estimate_peak_params <- function(Z_list,
   all_rt_loc <- c(); all_cv_loc <- c()
   all_sigma_rt <- c(); all_sigma_cv <- c()
   all_intensity <- c(); all_n_peaks <- c()
+  all_sample_idx <- c()
   all_noise_mean <- c(); all_noise_sd <- c()
   fwhm_to_sigma <- 1 / (2 * sqrt(2 * log(2)))
   n_width_fail <- 0L
@@ -124,6 +131,7 @@ estimate_peak_params <- function(Z_list,
           all_sigma_rt <- c(all_sigma_rt, w_rt * fwhm_to_sigma)
           all_sigma_cv <- c(all_sigma_cv, w_cv * fwhm_to_sigma)
           all_intensity <- c(all_intensity, h0)
+          all_sample_idx <- c(all_sample_idx, i)
         }
       }
     }
@@ -221,7 +229,9 @@ estimate_peak_params <- function(Z_list,
     sigma_cv_raw = all_sigma_cv,
     intensity_raw = all_intensity,
     rt_loc_raw = all_rt_loc,
-    cv_loc_raw = all_cv_loc
+    cv_loc_raw = all_cv_loc,
+    sample_idx_raw = all_sample_idx,
+    sample_names   = names(Z_list)
   )
   if (verbose && result$n_peaks_detected == 0) {
     warning("estimate_peak_params: 0 peaks detected.")
