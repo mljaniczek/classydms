@@ -249,7 +249,12 @@ estimate_peak_params <- function(Z_list,
 #' @param H,W Output image dimensions.
 #' @param add_noise If TRUE, add spatially-varying background noise.
 #' @param size_jitter Per-peak random log-normal scale factor SD for size
-#'   diversity (default 0.6).
+#'   diversity. Default `0.15` (multiplicative variation of roughly
+#'   x1.16 / :1.16), which matches typical GC-DMS peak-size variability
+#'   and is the value used by the getting-started vignette. Larger
+#'   values regularize more but produce peaks noticeably larger or
+#'   smaller than any observed peak, which is not biologically
+#'   plausible; use only if pretraining stability requires it.
 #' @param location_mode How to sample peak (RT, CV) locations. `"empirical"`
 #'   (default, recommended) draws each peak's location by picking a random
 #'   observed peak location from the real cohort (from `params$rt_loc_raw`
@@ -276,7 +281,7 @@ estimate_peak_params <- function(Z_list,
 #'   `add_noise = FALSE`).
 #' @export
 generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
-                                    size_jitter = 0.6,
+                                    size_jitter = 0.15,
                                     location_mode = c("empirical", "marginal"),
                                     location_jitter_rt = 2,
                                     location_jitter_cv = 1,
@@ -399,7 +404,7 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
 #' @return List with `clean` and `noisy` 4-D torch tensors.
 #' @export
 generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
-                                        size_jitter = 0.6,
+                                        size_jitter = 0.15,
                                         normalize = TRUE,
                                         dust_threshold = 0,
                                         location_mode = c("empirical",
@@ -505,7 +510,7 @@ generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
 synthetic_quality_check <- function(Z_real_list, peak_params,
                                       H = NULL, W = NULL,
                                       n_synthetic = 50L,
-                                      size_jitter = 0.6,
+                                      size_jitter = 0.15,
                                       normalize = FALSE,
                                       top_k = 10000L,
                                       dust_threshold = 0,

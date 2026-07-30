@@ -9,7 +9,7 @@ generate_one_synthetic(
   H,
   W,
   add_noise = TRUE,
-  size_jitter = 0.6,
+  size_jitter = 0.15,
   location_mode = c("empirical", "marginal"),
   location_jitter_rt = 2,
   location_jitter_cv = 1,
@@ -24,7 +24,12 @@ generate_one_synthetic(
 \item{add_noise}{If TRUE, add spatially-varying background noise.}
 
 \item{size_jitter}{Per-peak random log-normal scale factor SD for size
-diversity (default 0.6).}
+diversity. Default \code{0.15} (multiplicative variation of roughly
+x1.16 / :1.16), which matches typical GC-DMS peak-size variability
+and is the value used by the getting-started vignette. Larger
+values regularize more but produce peaks noticeably larger or
+smaller than any observed peak, which is not biologically
+plausible; use only if pretraining stability requires it.}
 
 \item{location_mode}{How to sample peak (RT, CV) locations. \code{"empirical"}
 (default, recommended) draws each peak's location by picking a random

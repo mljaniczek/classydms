@@ -10,7 +10,7 @@ synthetic_quality_check(
   H = NULL,
   W = NULL,
   n_synthetic = 50L,
-  size_jitter = 0.6,
+  size_jitter = 0.15,
   normalize = FALSE,
   top_k = 10000L,
   dust_threshold = 0,

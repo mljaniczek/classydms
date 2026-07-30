@@ -10,7 +10,7 @@ generate_synthetic_dataset(
   H,
   W,
   add_noise = TRUE,
-  size_jitter = 0.6,
+  size_jitter = 0.15,
   normalize = TRUE,
   dust_threshold = 0,
   location_mode = c("empirical", "marginal"),
@@ -29,7 +29,12 @@ generate_synthetic_dataset(
 \item{add_noise}{If TRUE, add spatially-varying background noise.}
 
 \item{size_jitter}{Per-peak random log-normal scale factor SD for size
-diversity (default 0.6).}
+diversity. Default \code{0.15} (multiplicative variation of roughly
+x1.16 / :1.16), which matches typical GC-DMS peak-size variability
+and is the value used by the getting-started vignette. Larger
+values regularize more but produce peaks noticeably larger or
+smaller than any observed peak, which is not biologically
+plausible; use only if pretraining stability requires it.}
 
 \item{normalize}{Whether to apply \code{\link[=normalize_sample]{normalize_sample()}} (default TRUE).}
 

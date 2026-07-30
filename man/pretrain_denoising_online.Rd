@@ -14,7 +14,7 @@ pretrain_denoising_online(
   lr = 0.001,
   weight_decay = 1e-04,
   add_noise = TRUE,
-  size_jitter = 0.6,
+  size_jitter = 0.15,
   grad_clip = 1,
   norm_clamp = 10,
   dust_threshold = 0,
