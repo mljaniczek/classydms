@@ -6,3 +6,9 @@
 .xls
 sampledata
 docs
+
+# Rendered tutorial / report artifacts (built on demand; do not commit)
+inst/tutorials/*.html
+inst/tutorials/*_files/
+inst/reports/*.html
+inst/reports/*_files/

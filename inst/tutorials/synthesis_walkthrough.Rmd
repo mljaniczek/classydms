@@ -156,7 +156,7 @@ peaks_obs
 
 toy_params <- list(
   n_peaks_detected = nrow(peaks_obs),
-  n_peaks   = list(mean = 4, sd = 1),
+  n_peaks   = list(mean = 8, sd = 2),
   rt_loc    = list(mean = mean(peaks_obs$rt_loc), sd = sd(peaks_obs$rt_loc)),
   cv_loc    = list(mean = mean(peaks_obs$cv_loc), sd = sd(peaks_obs$cv_loc)),
   sigma_rt  = list(meanlog = mean(log(peaks_obs$sigma_rt)),
@@ -249,7 +249,8 @@ c(sig_rt = sig_rt, sig_cv = sig_cv, base_amp = base_amp)
 Even in joint mode, a small multiplicative perturbation is applied so we don't just produce exact copies of the 7 observed peaks:
 
 ```{r size-jitter}
-size_jitter <- 0.6
+size_jitter <- 0.15
+set.seed(3)   # so scale_factor lands near 1.0 for pedagogy
 scale_factor <- exp(rnorm(1, mean = 0, sd = size_jitter))  # log-Normal(0, size_jitter²)
 sig_rt <- max(sig_rt * scale_factor, 0.8)
 sig_cv <- max(sig_cv * scale_factor, 0.8)
@@ -260,6 +261,8 @@ c(scale_factor = scale_factor, sig_rt = sig_rt, sig_cv = sig_cv, amp = amp)
 - **Log-Normal** because widths and intensity are positive multiplicative quantities.
 - The `0.8` floor on sigmas prevents pathologically thin single-pixel peaks.
 - Amplitude is scaled *half* as aggressively as sigma (`0.5 + 0.5 * scale_factor`) because empirically peak height doesn't grow proportionally with peak width.
+
+> **Note on `size_jitter` magnitude.** The *function default* is `size_jitter = 0.6`, which gives multiplicative variation of roughly ×1.8 or ÷1.8 (one SD in log-space of 0.6). That is intentionally loose — good for regularization when the observed pool is small — but produces synthetic peaks noticeably bigger or smaller than any observed peak, which can look wrong. The `getting-started` vignette tunes it down to **`size_jitter = 0.15`** (SD in log-space of 0.15 → multiplicative ×1.16 or ÷1.16), which matches real GC-DMS peak-size variability much better and is what should be used in production. We follow the vignette here so that `scale_factor ≈ 1` and the sampled peak stays close to the observed morphology.
 
 ## 3.5 Rasterize the 2D Gaussian
 
@@ -303,9 +306,10 @@ loc_idx
 
 ## 4.3 Loop and accumulate
 
-Additive superposition — each new peak's 2D Gaussian is *added* to the running canvas. Overlapping peaks sum.
+Additive superposition — each new peak's 2D Gaussian is *added* to the running canvas. Overlapping peaks sum. We record the running canvas after every peak so we can watch the sample build up.
 
-```{r stack, fig.height = 4.5}
+```{r stack, fig.height = 6}
+set.seed(7)   # a seed that spreads picks across observed peaks
 clean <- matrix(0, nrow = H, ncol = W)
 snapshots <- list()
 
@@ -332,13 +336,25 @@ for (k in seq_len(n_peaks)) {
   snapshots[[k]] <- clean
 }
 
-# Show the accumulation
-ks <- unique(c(1L, ceiling(n_peaks / 3), ceiling(2 * n_peaks / 3), n_peaks))
+# Fix the color scale across ALL panels so intensity accumulation
+# is visible (otherwise ggplot auto-renormalizes each panel and every
+# stage looks the same).
+final_max <- max(clean)
+ks <- if (n_peaks >= 4L) {
+  unique(round(seq(1, n_peaks, length.out = 6L)))
+} else {
+  seq_len(n_peaks)
+}
 plots <- lapply(ks, function(k)
   plot_mat(snapshots[[k]],
-           title = sprintf("After %d of %d peaks", k, n_peaks)))
-do.call(gridExtra::grid.arrange, c(plots, ncol = 2))
+           title = sprintf("After %d of %d peaks", k, n_peaks),
+           limits = c(0, final_max)))
+do.call(gridExtra::grid.arrange, c(plots, ncol = 3))
 ```
+
+**How to read this**: the color scale is fixed across all panels at `[0, max(clean)]`. Bright cells that only appear in later panels mean new peaks landed in previously-quiet regions. Bright cells that get brighter across panels mean peaks are stacking on top of each other (overlapping peaks *add*, so the same location can accumulate intensity from multiple draws).
+
+If you saw this at auto-scale (each panel independently rescaled) every panel would look similar because the ratio between the brightest and dimmest bins stays roughly constant. Fixing the scale is what lets you see the growth.
 
 The final panel is the **clean** synthetic sample. Now we add noise.
 
@@ -359,17 +375,30 @@ noisy <- clean + noise
 - The `abs()` folds the negative half onto the positive half (a *folded Normal* distribution) — real ion counts can't be negative.
 - Noise is i.i.d. per pixel; there is no spatial correlation modeled. Fine as a regularizer for denoising-autoencoder training (this is Vincent et al.'s argument), but a limitation compared to real instrument noise which has row-correlated drift.
 
+### Noise at its own scale — the texture
+
+Because real GC-DMS noise is only ~0.5–1% of typical peak amplitudes (`noise$sd = 0.005` vs peak amps ~0.5–1.5 in this toy example), plotting noise on the same scale as peaks makes it invisible. Give the noise panel its own auto scale first so the per-pixel texture is legible:
+
+```{r noise-alone, fig.height = 3.3}
+plot_mat(noise, title = sprintf(
+  "noise only, own color scale (max = %.4f)", max(noise)))
+```
+
+That's the **folded Normal** at work — each pixel is an independent draw, so there is no spatial structure, just fine speckle. The color-bar max is ~0.02, less than 1% of any peak.
+
+### Clean vs noisy at the shared peak scale
+
 ```{r noise-plots, fig.height = 3.5}
 gridExtra::grid.arrange(
-  plot_mat(noise, title = "noise only",
-           limits = c(0, max(noisy))),
   plot_mat(clean, title = "clean (peaks only)",
            limits = c(0, max(noisy))),
   plot_mat(noisy, title = "noisy = clean + noise (encoder input)",
            limits = c(0, max(noisy))),
-  ncol = 3
+  ncol = 2
 )
 ```
+
+At the peak-intensity scale, `clean` and `noisy` look nearly identical — which is exactly the point. Real GC-DMS noise is small relative to peaks; the **denoising** pretraining task is not "erase a lot of noise," it's a regularization trick that forces the encoder to route information through its bottleneck rather than learn the trivial identity mapping (Vincent et al. 2008). If noise dominated the image visually, real peaks would be unrecoverable, and pretraining would fail for a different reason.
 
 `generate_one_synthetic()` returns `list(clean = clean, noisy = noisy)`. During denoising pretraining the encoder gets `noisy` as input and is asked to reconstruct `clean` — that's the denoising task.
 
@@ -385,7 +414,7 @@ set.seed(42)
 result <- generate_one_synthetic(
   toy_params, H = H, W = W,
   add_noise = TRUE,
-  size_jitter = size_jitter,
+  size_jitter = 0.15,                                   # match production, not function default 0.6
   location_mode = "empirical",
   location_jitter_rt = location_jitter_rt,
   location_jitter_cv = location_jitter_cv,
