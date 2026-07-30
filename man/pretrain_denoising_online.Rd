@@ -22,6 +22,7 @@ pretrain_denoising_online(
   location_jitter_rt = 2,
   location_jitter_cv = 1,
   attribute_mode = c("joint", "marginal"),
+  noise_scale = 1,
   val_real = NULL,
   val_n = 200L,
   checkpoint_every = 10L,
@@ -83,6 +84,14 @@ resampling the observed triple from \verb{params$*_raw}, so wider
 peaks are drawn with correspondingly higher intensity (matching
 the physical coupling in real GC-DMS). \code{"marginal"} reverts to
 independent log-normal draws.}
+
+\item{noise_scale}{Passed to \code{\link[=generate_one_synthetic]{generate_one_synthetic()}}. Multiplier
+on the noise SD used at synthesis time. \code{1.0} (default) uses
+real-cohort noise levels; larger values increase the corruption
+the denoising autoencoder must learn to remove, which typically
+improves encoder feature quality up to some optimum
+(Vincent et al. 2008). Sweep \code{c(1, 3, 5, 10)} and pick the
+largest value that doesn't degrade real-validation MSE.}
 
 \item{val_real}{Optional list of real preprocessed, padded Z
 matrices (each of size \verb{H x W}) held out as a real-data

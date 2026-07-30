@@ -248,6 +248,15 @@ estimate_peak_params <- function(Z_list,
 #' @param params Output of [estimate_peak_params()].
 #' @param H,W Output image dimensions.
 #' @param add_noise If TRUE, add spatially-varying background noise.
+#' @param noise_scale Multiplier applied to `params$noise$sd` at
+#'   generation time. Default `1.0` uses the estimated real-cohort
+#'   noise level. Larger values corrupt the input more aggressively,
+#'   which is a useful regularization knob for the denoising
+#'   autoencoder (Vincent et al. 2008): too little corruption lets
+#'   the encoder pass the input through with minimal compression;
+#'   too much destroys the signal. A typical sweep is
+#'   `noise_scale = c(1, 3, 5, 10)`, looking at real-validation MSE
+#'   for the sweet spot.
 #' @param size_jitter Per-peak random log-normal scale factor SD for size
 #'   diversity. Default `0.15` (multiplicative variation of roughly
 #'   x1.16 / :1.16), which matches typical GC-DMS peak-size variability
@@ -285,7 +294,8 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
                                     location_mode = c("empirical", "marginal"),
                                     location_jitter_rt = 2,
                                     location_jitter_cv = 1,
-                                    attribute_mode = c("joint", "marginal")) {
+                                    attribute_mode = c("joint", "marginal"),
+                                    noise_scale = 1.0) {
   location_mode  <- match.arg(location_mode)
   attribute_mode <- match.arg(attribute_mode)
 
@@ -378,7 +388,7 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
   if (!is.finite(params$noise$mean) || !is.finite(params$noise$sd)) {
     return(list(clean = clean, noisy = clean))
   }
-  noise_sd <- max(1e-8, params$noise$sd)
+  noise_sd <- max(1e-8, params$noise$sd * noise_scale)
   noise <- matrix(abs(stats::rnorm(H * W, mean = params$noise$mean,
                                     sd = noise_sd)),
                   nrow = H, ncol = W)
@@ -412,7 +422,8 @@ generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
                                         location_jitter_rt = 2,
                                         location_jitter_cv = 1,
                                         attribute_mode = c("joint",
-                                                           "marginal")) {
+                                                           "marginal"),
+                                        noise_scale = 1.0) {
   location_mode  <- match.arg(location_mode)
   attribute_mode <- match.arg(attribute_mode)
   clean_arr <- array(0, dim = c(N, 1L, H, W))
@@ -424,7 +435,8 @@ generate_synthetic_dataset <- function(params, N, H, W, add_noise = TRUE,
                                     location_mode = location_mode,
                                     location_jitter_rt = location_jitter_rt,
                                     location_jitter_cv = location_jitter_cv,
-                                    attribute_mode = attribute_mode)
+                                    attribute_mode = attribute_mode,
+                                    noise_scale = noise_scale)
     # Match real-data preprocessing: zero pixels below dust threshold
     # before normalization. Real data goes through baseline_basement at
     # this same point in the pipeline.
@@ -520,6 +532,7 @@ synthetic_quality_check <- function(Z_real_list, peak_params,
                                       location_jitter_cv = 1,
                                       attribute_mode = c("joint",
                                                          "marginal"),
+                                      noise_scale = 1.0,
                                       seed = NULL) {
   location_mode  <- match.arg(location_mode)
   attribute_mode <- match.arg(attribute_mode)
@@ -537,7 +550,8 @@ synthetic_quality_check <- function(Z_real_list, peak_params,
                                     location_mode = location_mode,
                                     location_jitter_rt = location_jitter_rt,
                                     location_jitter_cv = location_jitter_cv,
-                                    attribute_mode = attribute_mode)
+                                    attribute_mode = attribute_mode,
+                                    noise_scale = noise_scale)
     z <- pair$noisy
     if (dust_threshold > 0) z[z < dust_threshold] <- 0
     Z_synth_list[[i]] <- z

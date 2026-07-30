@@ -18,6 +18,7 @@ synthetic_quality_check(
   location_jitter_rt = 2,
   location_jitter_cv = 1,
   attribute_mode = c("joint", "marginal"),
+  noise_scale = 1,
   seed = NULL
 )
 }

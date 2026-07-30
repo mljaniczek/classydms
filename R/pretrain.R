@@ -138,6 +138,13 @@ pretrain_denoising <- pretrain_autoencoder
 #'   peaks are drawn with correspondingly higher intensity (matching
 #'   the physical coupling in real GC-DMS). `"marginal"` reverts to
 #'   independent log-normal draws.
+#' @param noise_scale Passed to [generate_one_synthetic()]. Multiplier
+#'   on the noise SD used at synthesis time. `1.0` (default) uses
+#'   real-cohort noise levels; larger values increase the corruption
+#'   the denoising autoencoder must learn to remove, which typically
+#'   improves encoder feature quality up to some optimum
+#'   (Vincent et al. 2008). Sweep `c(1, 3, 5, 10)` and pick the
+#'   largest value that doesn't degrade real-validation MSE.
 #' @param val_real Optional list of real preprocessed, padded Z
 #'   matrices (each of size `H x W`) held out as a real-data
 #'   validation set. When provided, an additional per-epoch metric
@@ -199,6 +206,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                        location_jitter_cv = 1,
                                        attribute_mode = c("joint",
                                                           "marginal"),
+                                       noise_scale = 1.0,
                                        val_real = NULL,
                                        val_n = 200L,
                                        checkpoint_every = 10L,
@@ -242,7 +250,9 @@ pretrain_denoising_online <- function(peak_params, H, W,
           round(batch_size * H * W * 4 * 2 / 1e6, 1),
           " MB per batch, clean+noisy)")
   message("  Noise: ", if (add_noise) "enabled (denoising AE)"
-          else "disabled (reconstruction AE)")
+          else "disabled (reconstruction AE)",
+          if (add_noise) paste0(" (noise_scale = ", noise_scale, ")")
+          else "")
   message("  CPU threads (torch): ", torch::torch_get_num_threads())
   message("  R-side data workers: ", num_workers,
           if (use_parallel) " (parallel via mclapply)" else " (serial)")
@@ -334,7 +344,8 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                     location_mode = location_mode,
                                     location_jitter_rt = location_jitter_rt,
                                     location_jitter_cv = location_jitter_cv,
-                                    attribute_mode = attribute_mode)
+                                    attribute_mode = attribute_mode,
+                                    noise_scale = noise_scale)
     # Dust thresholding matches real-data preprocessing (see
     # baseline_basement) so synthetic samples have the same sparsity
     # profile as real samples entering the encoder.
@@ -456,6 +467,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
         location_jitter_rt = location_jitter_rt,
         location_jitter_cv = location_jitter_cv,
         attribute_mode = attribute_mode,
+        noise_scale = noise_scale,
         val_real_n = if (is.null(val_real)) 0L else length(val_real),
         checkpoint_every = checkpoint_every,
         stem_stride_rt = stem_stride_rt, stem_stride_cv = stem_stride_cv,

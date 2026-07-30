@@ -16,7 +16,8 @@ generate_synthetic_dataset(
   location_mode = c("empirical", "marginal"),
   location_jitter_rt = 2,
   location_jitter_cv = 1,
-  attribute_mode = c("joint", "marginal")
+  attribute_mode = c("joint", "marginal"),
+  noise_scale = 1
 )
 }
 \arguments{
@@ -70,6 +71,16 @@ the same \code{j} is used for location and morphology; otherwise an
 independent index is drawn. \code{"marginal"} reverts to independent
 log-normal draws for each attribute (the pre-\code{attribute_mode}
 behavior; wider peaks and higher intensity are uncorrelated).}
+
+\item{noise_scale}{Multiplier applied to \code{params$noise$sd} at
+generation time. Default \code{1.0} uses the estimated real-cohort
+noise level. Larger values corrupt the input more aggressively,
+which is a useful regularization knob for the denoising
+autoencoder (Vincent et al. 2008): too little corruption lets
+the encoder pass the input through with minimal compression;
+too much destroys the signal. A typical sweep is
+\code{noise_scale = c(1, 3, 5, 10)}, looking at real-validation MSE
+for the sweet spot.}
 }
 \value{
 List with \code{clean} and \code{noisy} 4-D torch tensors.
