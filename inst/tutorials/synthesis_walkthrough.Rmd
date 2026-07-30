@@ -1,0 +1,418 @@
+---
+title: "Walkthrough: generate_one_synthetic step by step"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 6.5, fig.height = 3.5, dpi = 96)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(tidyr)
+
+# Small dimensions so heatmaps stay readable
+H <- 100L   # RT rows
+W <- 30L    # CV cols
+
+# Consistent heatmap helper — used everywhere below.
+plot_mat <- function(mat, title = "", low = "white",
+                     high = "#B2182B", limits = NULL) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() +
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        name = "intensity") +
+    scale_y_reverse() +
+    coord_fixed(ratio = 1) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid = element_blank())
+}
+
+set.seed(1)
+```
+
+This walkthrough follows `generate_one_synthetic()` in its **default** configuration (`location_mode = "empirical"`, `attribute_mode = "joint"`) — the recommended pipeline as of the most recent commits. Every step visualizes what is happening on a small `r H` × `r W` canvas so plots stay readable.
+
+## Cheat sheet: parametric vs empirical
+
+Every random draw in the function is one of two types:
+
+| Step | Distribution | Type |
+|---|---|---|
+| Number of peaks | `Normal(n_peaks$mean, sd)` | **parametric** |
+| Row index `j` into observed peaks | `sample.int(n_obs)` uniform on `1..n_obs` | **empirical** (bootstrap) |
+| Peak center location on axis | `rt_loc_raw[j], cv_loc_raw[j]` + `Normal(0, jitter)` | **empirical** + parametric jitter |
+| Peak morphology (sigma_rt, sigma_cv, intensity) | `(sigma_rt_raw[j], sigma_cv_raw[j], intensity_raw[j])` | **empirical** joint triple |
+| Per-peak scale factor | `log-Normal(0, size_jitter²)` | **parametric** |
+| Background noise | `folded Normal(noise$mean, noise$sd)` per pixel | **parametric** |
+
+There is **no multivariate Normal anywhere.** Joint distributions are handled by resampling observed rows, not by fitting an MVN.
+
+---
+
+# 1. The building block — one 2D Gaussian "splotch"
+
+A single synthetic peak is a 2D Gaussian on the image grid. It has 5 numbers:
+
+- `mu_rt`, `mu_cv` — center coordinates (in pixels)
+- `sig_rt`, `sig_cv` — width along each axis (in pixels, one standard deviation)
+- `amp` — peak height
+
+## The math
+
+A 2D Gaussian aligned to the RT and CV axes is *separable*:
+
+$$G(r, c) = \exp\!\left(-\frac{1}{2}\left(\frac{r - \mu_{RT}}{\sigma_{RT}}\right)^2\right) \cdot \exp\!\left(-\frac{1}{2}\left(\frac{c - \mu_{CV}}{\sigma_{CV}}\right)^2\right)$$
+
+So we compute two 1D Gaussians — one along RT, one along CV — and take their outer product to get the 2D shape.
+
+```{r one-splotch}
+mu_rt <- 40; mu_cv <- 15
+sig_rt <- 4; sig_cv <- 1.5
+amp <- 1.0
+
+rows <- seq_len(H)                          # 1..H, positions along RT axis
+cols <- seq_len(W)                          # 1..W, positions along CV axis
+
+g_rt <- exp(-0.5 * ((rows - mu_rt) / sig_rt)^2)   # length H, 1D Gaussian along RT
+g_cv <- exp(-0.5 * ((cols - mu_cv) / sig_cv)^2)   # length W, 1D Gaussian along CV
+
+splotch <- amp * outer(g_rt, g_cv)          # H x W matrix, the 2D Gaussian
+plot_mat(splotch, title = "One synthetic peak (mu_rt=40, mu_cv=15, sig_rt=4, sig_cv=1.5, amp=1)")
+```
+
+The 1D Gaussians themselves are worth seeing on their own — the outer product just multiplies them element-wise:
+
+```{r one-splotch-marginals, fig.height = 2.5}
+mar_df <- rbind(
+  tibble(axis = "g_rt (along RT)", pos = rows, val = g_rt),
+  tibble(axis = "g_cv (along CV)", pos = cols, val = g_cv)
+)
+ggplot(mar_df, aes(x = pos, y = val)) +
+  geom_line() + facet_wrap(~ axis, scales = "free") +
+  labs(x = "pixel", y = "value") + theme_minimal()
+```
+
+## Effect of sigma
+
+Change `sig_rt`, `sig_cv` while holding everything else fixed:
+
+```{r splotch-sigma, fig.height = 3}
+mkone <- function(sr, sc) {
+  amp * outer(exp(-0.5 * ((rows - mu_rt) / sr)^2),
+              exp(-0.5 * ((cols - mu_cv) / sc)^2))
+}
+gridExtra::grid.arrange(
+  plot_mat(mkone(2, 1),    title = "sig_rt=2, sig_cv=1"),
+  plot_mat(mkone(8, 1),    title = "sig_rt=8, sig_cv=1 (tall)"),
+  plot_mat(mkone(4, 3),    title = "sig_rt=4, sig_cv=3 (wide)"),
+  ncol = 3
+)
+```
+
+## Effect of amplitude
+
+Amplitude just rescales — same shape, brighter or dimmer. Because the 1D Gaussians are unnormalized (`exp(-0.5·z²)` with no `1/(σ√(2π))` in front), the peak-center value is exactly `amp`.
+
+```{r splotch-amp, fig.height = 3}
+gridExtra::grid.arrange(
+  plot_mat(0.5 * splotch, title = "amp=0.5", limits = c(0, 1.5)),
+  plot_mat(splotch,       title = "amp=1.0", limits = c(0, 1.5)),
+  plot_mat(1.5 * splotch, title = "amp=1.5", limits = c(0, 1.5)),
+  ncol = 3
+)
+```
+
+This is the atom the whole generator is built from. Everything else in `generate_one_synthetic` is machinery for choosing the numbers `(mu_rt, mu_cv, sig_rt, sig_cv, amp)` and repeating.
+
+---
+
+# 2. Where do the numbers come from? — `peak_params`
+
+Upstream, `estimate_peak_params()` walks every real sample, runs the peak detector, and pools every detected peak's coordinates and morphology into big parallel vectors. Two families of information are stored:
+
+- **Raw observations** — one entry per detected peak: `rt_loc_raw`, `cv_loc_raw`, `sigma_rt_raw`, `sigma_cv_raw`, `intensity_raw`. Position `j` in every one of these vectors is the same real peak.
+- **Fitted summary distributions** — one number per statistic: `n_peaks$mean/sd`, `rt_loc$mean/sd`, `sigma_rt$meanlog/sdlog`, etc. Used only when you opt into `"marginal"` mode.
+
+For this walkthrough we skip the real cohort and hand-build a tiny toy `params` object with 7 imaginary observed peaks:
+
+```{r toy-params}
+peaks_obs <- tibble(
+  rt_loc    = c(0.20, 0.35, 0.50, 0.50, 0.70, 0.80, 0.85),
+  cv_loc    = c(0.30, 0.50, 0.60, 0.40, 0.70, 0.40, 0.55),
+  sigma_rt  = c(3.0,  6.0,  2.0,  4.0,  5.0,  3.0,  7.0),
+  sigma_cv  = c(1.5,  2.0,  1.0,  1.5,  2.0,  1.0,  2.5),
+  intensity = c(0.5,  1.2,  0.3,  0.8,  1.5,  0.4,  1.8)
+)
+peaks_obs
+
+toy_params <- list(
+  n_peaks_detected = nrow(peaks_obs),
+  n_peaks   = list(mean = 4, sd = 1),
+  rt_loc    = list(mean = mean(peaks_obs$rt_loc), sd = sd(peaks_obs$rt_loc)),
+  cv_loc    = list(mean = mean(peaks_obs$cv_loc), sd = sd(peaks_obs$cv_loc)),
+  sigma_rt  = list(meanlog = mean(log(peaks_obs$sigma_rt)),
+                   sdlog   = sd(log(peaks_obs$sigma_rt))),
+  sigma_cv  = list(meanlog = mean(log(peaks_obs$sigma_cv)),
+                   sdlog   = sd(log(peaks_obs$sigma_cv))),
+  intensity = list(meanlog = mean(log(peaks_obs$intensity)),
+                   sdlog   = sd(log(peaks_obs$intensity))),
+  noise     = list(mean = 0.005, sd = 0.005),
+  rt_loc_raw    = peaks_obs$rt_loc,
+  cv_loc_raw    = peaks_obs$cv_loc,
+  sigma_rt_raw  = peaks_obs$sigma_rt,
+  sigma_cv_raw  = peaks_obs$sigma_cv,
+  intensity_raw = peaks_obs$intensity
+)
+```
+
+Visualize the 7 observed peak positions on our `r H` × `r W` canvas:
+
+```{r toy-params-plot, fig.height = 3.2}
+peaks_obs %>%
+  mutate(
+    rt_pixel = rt_loc * H,
+    cv_pixel = cv_loc * W,
+    label    = as.character(seq_len(n()))
+  ) %>%
+  ggplot(aes(x = cv_pixel, y = rt_pixel, size = intensity, label = label)) +
+  geom_point(alpha = 0.6, color = "#B2182B") +
+  geom_text(size = 3, nudge_x = 1, hjust = 0) +
+  scale_y_reverse(limits = c(H, 0)) +
+  xlim(0, W) + coord_fixed() +
+  scale_size_continuous(range = c(3, 10)) +
+  labs(x = "CV pixel", y = "RT pixel",
+       title = "The 7 observed peaks in toy_params",
+       size = "observed intensity") +
+  theme_minimal()
+```
+
+**Locations are stored as fractions of image dimensions** (0–1). That way one `peak_params` object can be used to generate synthetic samples at any target `(H, W)` — the position in pixels is computed as `rt_loc * H` at generation time.
+
+---
+
+# 3. Draw ONE peak using the default pipeline
+
+Now we mimic exactly what `generate_one_synthetic` does for a single peak in `location_mode = "empirical"`, `attribute_mode = "joint"`.
+
+## 3.1 Pick an index into the observed pool — *empirical*
+
+The atomic operation is: draw a row index `j` uniformly at random from `1..n_obs`. All 5 attributes of the synthetic peak will be inherited from that row.
+
+```{r pick-j}
+n_obs <- length(toy_params$rt_loc_raw)   # 7
+j <- sample.int(n_obs, size = 1)
+j
+peaks_obs[j, ]
+```
+
+Under the default (both empirical location and joint attributes), the **same** `j` supplies both the location and the morphology. That single choice is the entire empirical draw.
+
+## 3.2 Location — empirical bootstrap plus a small parametric jitter
+
+```{r location-draw}
+location_jitter_rt <- 2  # SD in pixels
+location_jitter_cv <- 1
+
+mu_rt <- toy_params$rt_loc_raw[j] * H + rnorm(1, 0, location_jitter_rt)
+mu_cv <- toy_params$cv_loc_raw[j] * W + rnorm(1, 0, location_jitter_cv)
+mu_rt <- max(1, min(H, mu_rt))    # clamp to canvas
+mu_cv <- max(1, min(W, mu_cv))
+c(mu_rt = mu_rt, mu_cv = mu_cv)
+```
+
+The bootstrap picks one of the 7 known hotspots. The **jitter** — a `Normal(0, σ)` displacement of a couple of pixels — models the fact that even the same compound doesn't land at pixel-exact positions between real runs. Jitter is parametric with a tunable SD; the location itself is empirical.
+
+## 3.3 Morphology — empirical joint triple
+
+Because we're in joint mode, the widths and amplitude all come from the same row `j`:
+
+```{r morph-draw}
+sig_rt   <- toy_params$sigma_rt_raw[j]
+sig_cv   <- toy_params$sigma_cv_raw[j]
+base_amp <- toy_params$intensity_raw[j]
+c(sig_rt = sig_rt, sig_cv = sig_cv, base_amp = base_amp)
+```
+
+**Why it matters that this is joint**: in real GC-DMS, wider peaks tend to be brighter (more compound → both wider RT footprint and higher signal). By resampling all three together we preserve that correlation exactly — no MVN fitting required. If we had chosen `attribute_mode = "marginal"`, `sig_rt`, `sig_cv`, and `base_amp` would each be drawn from independent log-Normals fitted to the marginals of the pool, destroying the joint structure.
+
+## 3.4 Per-peak size jitter — always-on parametric log-Normal
+
+Even in joint mode, a small multiplicative perturbation is applied so we don't just produce exact copies of the 7 observed peaks:
+
+```{r size-jitter}
+size_jitter <- 0.6
+scale_factor <- exp(rnorm(1, mean = 0, sd = size_jitter))  # log-Normal(0, size_jitter²)
+sig_rt <- max(sig_rt * scale_factor, 0.8)
+sig_cv <- max(sig_cv * scale_factor, 0.8)
+amp    <- base_amp * (0.5 + 0.5 * scale_factor)
+c(scale_factor = scale_factor, sig_rt = sig_rt, sig_cv = sig_cv, amp = amp)
+```
+
+- **Log-Normal** because widths and intensity are positive multiplicative quantities.
+- The `0.8` floor on sigmas prevents pathologically thin single-pixel peaks.
+- Amplitude is scaled *half* as aggressively as sigma (`0.5 + 0.5 * scale_factor`) because empirically peak height doesn't grow proportionally with peak width.
+
+## 3.5 Rasterize the 2D Gaussian
+
+Same math as Section 1, but now with the sampled parameters:
+
+```{r one-full-peak}
+g_rt <- exp(-0.5 * ((rows - mu_rt) / sig_rt)^2)
+g_cv <- exp(-0.5 * ((cols - mu_cv) / sig_cv)^2)
+peak_k <- amp * outer(g_rt, g_cv)
+
+plot_mat(peak_k,
+         title = sprintf("One sampled peak: j=%d, mu=(%.1f, %.1f), sig=(%.2f, %.2f), amp=%.2f",
+                         j, mu_rt, mu_cv, sig_rt, sig_cv, amp))
+```
+
+That is one splotch, drawn end-to-end using the default pipeline. Compare to the entry in `peaks_obs[j, ]` above — the center is near that observed hotspot, the shape is derived from that observed peak's morphology, and the size_jitter has stretched/shrunk it slightly.
+
+---
+
+# 4. Stack N peaks into a full sample
+
+## 4.1 Decide how many peaks — parametric Normal
+
+```{r n-peaks-draw}
+n_peaks <- max(1L, round(rnorm(1,
+  mean = toy_params$n_peaks$mean,
+  sd   = max(toy_params$n_peaks$sd,
+             toy_params$n_peaks$mean * 0.3))))
+n_peaks
+```
+
+The `sd` has a `0.3 * mean` floor — if the observed cohort happened to have unusually tight peak counts, we deliberately widen the distribution. This keeps the synthetic set from all having exactly the same peak count.
+
+## 4.2 Pre-sample all N indices at once
+
+```{r preindex}
+loc_idx  <- sample.int(n_obs, size = n_peaks, replace = TRUE)
+attr_idx <- loc_idx    # joint mode + empirical location share the same index
+loc_idx
+```
+
+## 4.3 Loop and accumulate
+
+Additive superposition — each new peak's 2D Gaussian is *added* to the running canvas. Overlapping peaks sum.
+
+```{r stack, fig.height = 4.5}
+clean <- matrix(0, nrow = H, ncol = W)
+snapshots <- list()
+
+for (k in seq_len(n_peaks)) {
+  j <- loc_idx[k]
+  mu_rt <- toy_params$rt_loc_raw[j] * H + rnorm(1, 0, location_jitter_rt)
+  mu_cv <- toy_params$cv_loc_raw[j] * W + rnorm(1, 0, location_jitter_cv)
+  mu_rt <- max(1, min(H, mu_rt)); mu_cv <- max(1, min(W, mu_cv))
+
+  ja <- attr_idx[k]
+  sig_rt   <- toy_params$sigma_rt_raw[ja]
+  sig_cv   <- toy_params$sigma_cv_raw[ja]
+  base_amp <- toy_params$intensity_raw[ja]
+
+  scale_factor <- exp(rnorm(1, 0, size_jitter))
+  sig_rt <- max(sig_rt * scale_factor, 0.8)
+  sig_cv <- max(sig_cv * scale_factor, 0.8)
+  amp    <- base_amp * (0.5 + 0.5 * scale_factor)
+
+  g_rt <- exp(-0.5 * ((rows - mu_rt) / sig_rt)^2)
+  g_cv <- exp(-0.5 * ((cols - mu_cv) / sig_cv)^2)
+  clean <- clean + amp * outer(g_rt, g_cv)
+
+  snapshots[[k]] <- clean
+}
+
+# Show the accumulation
+ks <- unique(c(1L, ceiling(n_peaks / 3), ceiling(2 * n_peaks / 3), n_peaks))
+plots <- lapply(ks, function(k)
+  plot_mat(snapshots[[k]],
+           title = sprintf("After %d of %d peaks", k, n_peaks)))
+do.call(gridExtra::grid.arrange, c(plots, ncol = 2))
+```
+
+The final panel is the **clean** synthetic sample. Now we add noise.
+
+---
+
+# 5. Add noise — folded Normal
+
+```{r noise, fig.height = 3}
+noise_sd_use <- max(1e-8, toy_params$noise$sd)
+noise <- matrix(
+  abs(rnorm(H * W, mean = toy_params$noise$mean, sd = noise_sd_use)),
+  nrow = H, ncol = W
+)
+noisy <- clean + noise
+```
+
+- Each pixel is an **independent** draw from `Normal(noise$mean, noise$sd)`.
+- The `abs()` folds the negative half onto the positive half (a *folded Normal* distribution) — real ion counts can't be negative.
+- Noise is i.i.d. per pixel; there is no spatial correlation modeled. Fine as a regularizer for denoising-autoencoder training (this is Vincent et al.'s argument), but a limitation compared to real instrument noise which has row-correlated drift.
+
+```{r noise-plots, fig.height = 3.5}
+gridExtra::grid.arrange(
+  plot_mat(noise, title = "noise only",
+           limits = c(0, max(noisy))),
+  plot_mat(clean, title = "clean (peaks only)",
+           limits = c(0, max(noisy))),
+  plot_mat(noisy, title = "noisy = clean + noise (encoder input)",
+           limits = c(0, max(noisy))),
+  ncol = 3
+)
+```
+
+`generate_one_synthetic()` returns `list(clean = clean, noisy = noisy)`. During denoising pretraining the encoder gets `noisy` as input and is asked to reconstruct `clean` — that's the denoising task.
+
+---
+
+# 6. Sanity check: call the real function
+
+We built each piece manually. Now confirm the real `generate_one_synthetic()` produces the same kind of output. Random seeds will differ so the exact peaks won't match, but the character of the image should be identical.
+
+```{r end-to-end, eval = requireNamespace("classydms", quietly = TRUE), fig.height = 3.5}
+library(classydms)
+set.seed(42)
+result <- generate_one_synthetic(
+  toy_params, H = H, W = W,
+  add_noise = TRUE,
+  size_jitter = size_jitter,
+  location_mode = "empirical",
+  location_jitter_rt = location_jitter_rt,
+  location_jitter_cv = location_jitter_cv,
+  attribute_mode = "joint"
+)
+
+gridExtra::grid.arrange(
+  plot_mat(result$clean, title = "generate_one_synthetic()$clean",
+           limits = c(0, max(result$noisy))),
+  plot_mat(result$noisy, title = "generate_one_synthetic()$noisy",
+           limits = c(0, max(result$noisy))),
+  ncol = 2
+)
+```
+
+# Appendix: distribution reference
+
+Every random draw in `generate_one_synthetic`, with the parameter that governs it and its role:
+
+| Random draw | Distribution | Parameter source | Purpose |
+|---|---|---|---|
+| Number of peaks per sample | `Normal(μ, max(σ, 0.3·μ))` | `params$n_peaks$mean/sd` | how "busy" this sample is |
+| Row index `j` | uniform on `1..n_obs` | `length(params$rt_loc_raw)` | pick one real observed peak to imitate |
+| Per-peak location jitter | `Normal(0, σ_loc)` per axis | `location_jitter_rt`, `location_jitter_cv` | instrument reproducibility around each hotspot |
+| Per-peak size factor | `log-Normal(0, size_jitter²)` | `size_jitter` | regularization; avoid exact copies |
+| Per-pixel background | folded `Normal(μ, σ)` (i.i.d.) | `params$noise$mean/sd` | denoising target |
+| **Location** `(rt, cv)` | `(rt_loc_raw[j], cv_loc_raw[j])` | empirical pool | joint spatial distribution |
+| **Morphology** `(σ_rt, σ_cv, amp)` | `(sigma_rt_raw[j], sigma_cv_raw[j], intensity_raw[j])` | empirical pool | joint width–intensity coupling |
+
+**No multivariate Normal is fit anywhere.** Joint distributions (`(rt, cv)` and `(σ_rt, σ_cv, amp)`) are preserved by resampling observed rows rather than by fitting an MVN. Both have the same joint index `j` in the default configuration — that's what couples location to morphology when you resample.
