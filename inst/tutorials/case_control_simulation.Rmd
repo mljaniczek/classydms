@@ -1,0 +1,297 @@
+---
+title: "Case/control simulation — end-to-end pipeline validation with ground truth"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7.5, fig.height = 4, dpi = 96)
+library(classydms)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(purrr)
+
+# Consistent heatmap helper
+plot_mat <- function(mat, title = "", low = "white", high = "#B2182B",
+                     limits = NULL) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() +
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        name = "intensity") +
+    scale_y_reverse() +
+    coord_fixed(ratio = 0.5) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid = element_blank())
+}
+```
+
+# Purpose
+
+Every step of the classydms pipeline is validated in isolation (report on real cohorts, tutorial on toy params). But there's no ground truth for whether the **full pipeline** — preprocess → params → pretrain → classify → saliency — can recover a signal we *know* is there.
+
+This tutorial injects known "biomarker" peaks into a synthetic case group and asks two questions:
+
+1. **Classification**: can the pipeline distinguish cases from controls? (Metric: cross-validated AUC.)
+2. **Biomarker recovery**: does the spatial saliency map localize the injected biomarkers? (Metric: per-pixel AUC of saliency values against a ground-truth mask around each biomarker.)
+
+If Level 1 (single strong biomarker) can't hit AUC ≥ 0.80 on either metric, the pipeline has a bug and we should stop. If it can, Levels 2 and 3 stress-test performance under progressively more realistic conditions.
+
+# 1. Load a base cohort's `peak_params`
+
+The base peak distribution should come from a real cohort so backgrounds look realistic. Here we use the small `sampledata/influenza` slice that ships with the package (adjust paths for your own cohort).
+
+Adjust `disease_dir` / `control_dir` to point at any real GC-DMS cohort you have on disk; the pooled `peak_params` from those samples defines "background" for the simulation.
+
+```{r load-base}
+# here::here() resolves paths relative to the project root so the tutorial
+# knits regardless of the current working directory.
+disease_dir <- if (requireNamespace("here", quietly = TRUE)) {
+  here::here("sampledata", "influenza")
+} else "sampledata/influenza"
+control_dir <- if (requireNamespace("here", quietly = TRUE)) {
+  here::here("sampledata", "influenza_controls")
+} else "sampledata/influenza_controls"
+
+loaded <- load_dms_directory(
+  disease_dir = disease_dir,
+  control_dir = control_dir,
+  pattern     = "POS.*\\.(xls|txt|tsv|csv)$"
+)
+samples_raw <- loaded$samples
+message("Loaded ", length(samples_raw), " samples")
+
+samples_proc <- map(samples_raw, ~process_one_sample(.x,
+  sg_p = 3, sg_n = 21, asls_lambda = 1e6, asls_p = 0.01, asls_niter = 10))
+samples_dust <- map(samples_proc, ~baseline_basement(.x, basement_thr = 0.005))
+b_list <- map(samples_dust, ~trim_bounds_from_occupancy(.x$Z))
+R0 <- max(sapply(samples_dust, function(s) nrow(s$Z)))
+C0 <- max(sapply(samples_dust, function(s) ncol(s$Z)))
+global_b <- pooled_trim_bounds(b_list, R = R0, C = C0,
+                                q_lo = 0.05, q_hi = 0.95)
+samples_trim <- map(samples_dust, ~trim_sample(.x, bounds = global_b))
+Z_raw     <- map(samples_trim, ~.x$Z)
+Z_pretrim <- map(samples_trim, ~if (!is.null(.x$Z_pretrim)) .x$Z_pretrim else .x$Z)
+
+pp <- estimate_peak_params(Z_raw, Z_pretrim_list = Z_pretrim,
+                            top_k = 500, frac_height = 0.5,
+                            verbose = FALSE)
+H_native <- nrow(Z_raw[[1]]); W_native <- ncol(Z_raw[[1]])
+sprintf("Base pool: %d peaks; native image %d x %d",
+        pp$n_peaks_detected, H_native, W_native)
+```
+
+# 2. Hold out biomarkers for Level 1
+
+`biomarkers_level1()` picks 1 random peak from the pool as the biomarker template, sets case prevalence to 95% / control 5%, and case intensity multiplier to ×2.0. The peak *and any pool peaks within a protected radius* are stripped from the returned `background_peak_params`, so backgrounds sampled from it never land near the biomarker.
+
+```{r holdout}
+scenario <- biomarkers_level1(pp, seed = 42L)
+scenario$biomarkers
+sprintf("Pool: %d peaks -> %d after holding out biomarker + protected radius",
+        pp$n_peaks_detected,
+        scenario$background_peak_params$n_peaks_detected)
+```
+
+# 3. Simulate the cohort
+
+30 cases + 30 controls should be enough to see a Level 1 signal without slow pretraining.
+
+```{r simulate}
+sim <- simulate_case_control_cohort(
+  scenario$background_peak_params,
+  scenario$biomarkers,
+  n_cases    = 30L,
+  n_controls = 30L,
+  H = H_native, W = W_native,
+  seed = 7L
+)
+table(sim$y, dnn = "class (2 = case, 1 = control)")
+
+# Per-biomarker firing rate by class — sanity check that prevalences match design
+firing <- as.data.frame(sim$per_sample_firing)
+colnames(firing) <- paste0("biomarker_", seq_len(ncol(sim$per_sample_firing)))
+firing$class <- factor(sim$y, levels = c(1, 2), labels = c("control", "case"))
+firing %>%
+  tidyr::pivot_longer(cols = starts_with("biomarker_"),
+                      names_to = "biomarker", values_to = "fired") %>%
+  group_by(class, biomarker) %>%
+  summarise(prevalence = mean(fired), .groups = "drop")
+```
+
+# 4. Visualize a case and a control side by side
+
+The biomarker location for Level 1:
+
+```{r plot-biomarker-loc}
+biom <- scenario$biomarkers
+b_r <- biom$rt_loc * H_native
+b_c <- biom$cv_loc * W_native
+sprintf("Biomarker at RT pixel %.0f, CV pixel %.0f", b_r, b_c)
+```
+
+Compare a case with the biomarker firing against a control where it doesn't:
+
+```{r visualize-samples, fig.height = 6}
+# Find a case and a control that fired appropriately
+case_idx    <- which(sim$y == 2L & sim$per_sample_firing[, 1])[1]
+control_idx <- which(sim$y == 1L & !sim$per_sample_firing[, 1])[1]
+
+Z_case    <- sim$samples[[case_idx]]$Z
+Z_control <- sim$samples[[control_idx]]$Z
+
+# Overlay a marker at the biomarker location
+mark_biomarker <- function(p, r, c) {
+  p + annotate("point", x = c, y = r, shape = 21, color = "cyan",
+               fill = NA, size = 8, stroke = 1.2)
+}
+
+lim <- c(0, max(c(Z_case, Z_control)))
+gridExtra::grid.arrange(
+  mark_biomarker(plot_mat(Z_case, "Case (biomarker fired)", limits = lim),
+                 b_r, b_c),
+  mark_biomarker(plot_mat(Z_control, "Control (biomarker absent)", limits = lim),
+                 b_r, b_c),
+  ncol = 2
+)
+```
+
+The cyan circle marks the biomarker location. On the case, that region has an extra 2D-Gaussian blob added on top of the background; on the control, the region is empty (background peaks have been protected out of the pool).
+
+# 5. Preprocess and pad the simulated cohort
+
+The simulated samples were produced clean — no baseline drift, no dust threshold — so preprocessing largely passes them through. We still normalize and pad to make sure they enter the encoder at the same size as any real cohort would.
+
+```{r preprocess-sim}
+sim_Z_list <- map(sim$samples, ~.x$Z)
+Z_norm  <- map(sim_Z_list, normalize_sample)
+pad_dims <- compute_pad_targets(Z_norm)
+Z_padded <- map(Z_norm, ~pad_to_target(.x, pad_dims$H, pad_dims$W))
+sprintf("Padded image size: %d x %d", pad_dims$H, pad_dims$W)
+```
+
+# 6. Pretraining and classification (heavy — flip `eval = TRUE` to run)
+
+These chunks are `eval = FALSE` by default because pretraining takes ~5–15 minutes even on a small cohort. Set `PRETRAIN <- TRUE` to run everything downstream.
+
+```{r pretrain-flag}
+PRETRAIN <- FALSE   # flip to TRUE to actually run pretraining + eval
+```
+
+```{r pretrain, eval = PRETRAIN}
+# Peak params estimated on the *simulated* cohort — this is what a real
+# analysis would do, treating the simulation as if it were unknown data.
+sim_pp <- estimate_peak_params(sim_Z_list,
+                                top_k = 2500, frac_height = 0.5,
+                                verbose = FALSE)
+
+pretrain_result <- pretrain_denoising_online(
+  sim_pp,
+  H = pad_dims$H, W = pad_dims$W,
+  steps_per_epoch  = 100L,       # short for tutorial speed
+  epochs           = 10L,        # short
+  batch_size       = 32L,
+  num_workers      = 1L,
+  dust_threshold   = 0.005,
+  size_jitter      = 0.15,
+  device           = "cpu",
+  seed             = 1L
+)
+```
+
+## 6a. Classification: case vs control AUC
+
+```{r classify, eval = PRETRAIN}
+elnet <- cv_encoder_elastic_net(pretrain_result$encoder,
+                                 Z_list = Z_padded, y = sim$y,
+                                 k = 5, alpha = 0.5)
+sprintf("Case/control AUC (5-fold CV): %.3f", elnet$auc)
+```
+
+**Level 1 acceptance target: AUC ≥ 0.80.** Below that, stop and investigate — a Level 1 signal that strong should be detectable. Between 0.80 and 0.90 is acceptable and moves us to Level 2. Above 0.95 is expected but not required.
+
+## 6b. Biomarker recovery: saliency + spatial AUC
+
+```{r saliency, eval = PRETRAIN}
+case_idx_all <- which(sim$y == 2L)
+orig_dims <- lapply(sim$samples,
+                     function(s) c(H = nrow(s$Z), W = ncol(s$Z)))
+
+sal <- aggregate_saliency_masked(pretrain_result$encoder,
+                                  Z_padded, coefs = elnet$coefs,
+                                  sample_indices = case_idx_all,
+                                  orig_dims = orig_dims)
+str(sal, max.level = 1)
+
+# The saliency is in *native* image coordinates (pre-padding). The
+# biomarker rt_loc / cv_loc are also fractions of the native H_native,
+# W_native, so we evaluate in native coordinates directly.
+recovery <- evaluate_biomarker_recovery(
+  sal, scenario$biomarkers,
+  H = H_native, W = W_native,
+  match_radius_rt = 8L, match_radius_cv = 2L,
+  top_k = 5L
+)
+sprintf("Biomarker recovery — per-pixel AUC: %.3f", recovery$auc_per_pixel)
+sprintf("Biomarker recovery — recall @ top-5: %.3f", recovery$recall_at_k)
+sprintf("Biomarker recovery — precision @ top-5: %.3f", recovery$precision_at_k)
+```
+
+# 7. Fake-saliency demo — always runs
+
+Since pretraining is expensive, the eval below uses a *synthesized* saliency map as a placeholder — a Gaussian blob at each biomarker location plus uniform noise. This confirms that `evaluate_biomarker_recovery()` returns sensible metrics.
+
+```{r fake-saliency, fig.height = 4}
+biom <- scenario$biomarkers
+fake_sal <- matrix(0, nrow = H_native, ncol = W_native)
+for (b in seq_len(nrow(biom))) {
+  mu_r <- biom$rt_loc[b] * H_native
+  mu_c <- biom$cv_loc[b] * W_native
+  sig_r <- biom$sigma_rt[b]; sig_c <- biom$sigma_cv[b]
+  g_r <- exp(-0.5 * ((seq_len(H_native) - mu_r) / sig_r)^2)
+  g_c <- exp(-0.5 * ((seq_len(W_native) - mu_c) / sig_c)^2)
+  fake_sal <- fake_sal + outer(g_r, g_c)
+}
+set.seed(1)
+fake_sal <- fake_sal + matrix(runif(H_native * W_native, 0, 0.05),
+                               H_native, W_native)
+
+rec <- evaluate_biomarker_recovery(fake_sal, biom,
+                                    H = H_native, W = W_native,
+                                    top_k = 5L)
+sprintf("[fake saliency] per-pixel AUC: %.3f", rec$auc_per_pixel)
+sprintf("[fake saliency] recall @ top-5: %.3f", rec$recall_at_k)
+
+plot_mat(fake_sal, title = "Fake saliency (Gaussian blob at biomarker + uniform noise)") +
+  annotate("point", x = b_c, y = b_r, shape = 21, color = "cyan",
+           fill = NA, size = 8, stroke = 1.2)
+```
+
+Random-baseline sanity: uniform noise saliency should return AUC ≈ 0.5.
+
+```{r fake-saliency-chance}
+set.seed(2)
+noise_sal <- matrix(runif(H_native * W_native), H_native, W_native)
+rec_chance <- evaluate_biomarker_recovery(noise_sal, biom,
+                                           H = H_native, W = W_native,
+                                           top_k = 5L)
+sprintf("[chance] per-pixel AUC: %.3f  (should be near 0.5)",
+        rec_chance$auc_per_pixel)
+```
+
+# 8. Next steps — Levels 2 and 3
+
+Once Level 1 passes the AUC ≥ 0.80 gates on both metrics, run the same pipeline with the harder scenarios by replacing `biomarkers_level1()` with `biomarkers_level2()` or `biomarkers_level3()`. Expected results:
+
+- **Level 2** (3 biomarkers, 80/20 prevalence, ×1.5 intensity): case/control AUC ≥ 0.85, biomarker recovery AUC ≥ 0.75
+- **Level 3** (6 biomarkers, 60/40 prevalence, ×1.2 intensity): case/control AUC ≥ 0.70, biomarker recovery AUC ≥ 0.65
+
+If Level 3 achieves those numbers, the pipeline is validated on realistic subtle-signal scenarios. If not, focus attention on the encoder pretraining and elastic-net regularization — the classification signal may be present but the interpretability layer isn't localizing it well.
