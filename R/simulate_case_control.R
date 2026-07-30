@@ -25,6 +25,14 @@
 #'   peaks are also removed from the background pool. Default matches
 #'   the default `min_sep_rt`, `min_sep_cv` on a 1400 x 40 image (15 /
 #'   1400 and 3 / 40).
+#' @param min_intensity_quantile Optional numeric in `[0, 1)`. When
+#'   non-`NULL`, biomarker templates are drawn only from pool peaks
+#'   whose `intensity_raw` is at or above the given quantile of the
+#'   pool's intensity distribution — e.g. `0.90` restricts selection
+#'   to the top-10% brightest peaks. Useful for sanity-check
+#'   scenarios where you want the injected biomarker to be visually
+#'   obvious even in a very sparse image. `NULL` (default) samples
+#'   uniformly from the whole pool.
 #' @param seed Optional RNG seed for reproducible template selection.
 #'
 #' @return A list with:
@@ -42,6 +50,7 @@ holdout_biomarkers <- function(peak_params,
                                 n_biomarkers,
                                 protect_radius_rt = 15 / 1400,
                                 protect_radius_cv = 3  / 40,
+                                min_intensity_quantile = NULL,
                                 seed = NULL) {
   needed <- c("rt_loc_raw", "cv_loc_raw",
               "sigma_rt_raw", "sigma_cv_raw", "intensity_raw")
@@ -57,10 +66,28 @@ holdout_biomarkers <- function(peak_params,
     stop("n_biomarkers (", n_biomarkers,
          ") must be less than pool size (", n_pool, ").")
   }
+  if (!is.null(min_intensity_quantile)) {
+    if (min_intensity_quantile < 0 || min_intensity_quantile >= 1) {
+      stop("min_intensity_quantile must be in [0, 1); got ",
+           min_intensity_quantile)
+    }
+  }
   if (!is.null(seed)) set.seed(seed)
 
-  # Pick biomarker indices uniformly at random from the pool
-  biomarker_idx <- sample.int(n_pool, size = n_biomarkers, replace = FALSE)
+  # Restrict the eligible pool by intensity, if requested
+  eligible <- seq_len(n_pool)
+  if (!is.null(min_intensity_quantile)) {
+    thr <- as.numeric(stats::quantile(peak_params$intensity_raw,
+                                        min_intensity_quantile))
+    eligible <- which(peak_params$intensity_raw >= thr)
+    if (length(eligible) < n_biomarkers) {
+      stop("Only ", length(eligible), " peaks at or above the ",
+           min_intensity_quantile, " intensity quantile, but ",
+           n_biomarkers, " biomarkers requested.")
+    }
+  }
+  biomarker_idx <- if (length(eligible) == n_biomarkers) eligible
+                   else sample(eligible, size = n_biomarkers, replace = FALSE)
 
   templates <- tibble::tibble(
     rt_loc    = peak_params$rt_loc_raw[biomarker_idx],
@@ -144,9 +171,12 @@ build_biomarker_spec <- function(templates,
 
 #' Level 1 (sanity check) biomarker scenario
 #'
-#' 1 biomarker, extreme prevalence gap (95% cases vs 5% controls),
-#' 2x intensity multiplier in cases. Case/control AUC should be well
-#' above 0.90 if the pipeline works.
+#' 1 biomarker drawn from the *top 10% brightest* pool peaks
+#' (`min_intensity_quantile = 0.90`), extreme prevalence gap (95%
+#' cases vs 5% controls), 5x intensity multiplier in cases. Designed
+#' to be visually obvious in a spot-check plot; case/control AUC
+#' should be well above 0.90 if the pipeline works. If Level 1 fails,
+#' something in the pipeline is broken.
 #'
 #' @param peak_params Output of [estimate_peak_params()].
 #' @param seed Optional RNG seed for reproducible biomarker selection.
@@ -154,12 +184,14 @@ build_biomarker_spec <- function(templates,
 #'   [simulate_case_control_cohort()].
 #' @export
 biomarkers_level1 <- function(peak_params, seed = NULL) {
-  ho <- holdout_biomarkers(peak_params, n_biomarkers = 1L, seed = seed)
+  ho <- holdout_biomarkers(peak_params, n_biomarkers = 1L,
+                            min_intensity_quantile = 0.90,
+                            seed = seed)
   spec <- build_biomarker_spec(
     ho$biomarker_templates,
     case_prevalence        = 0.95,
     control_prevalence     = 0.05,
-    case_intensity_mult    = 2.0,
+    case_intensity_mult    = 5.0,
     control_intensity_mult = 1.0
   )
   list(biomarkers = spec, background_peak_params = ho$background_peak_params)
@@ -167,13 +199,16 @@ biomarkers_level1 <- function(peak_params, seed = NULL) {
 
 #' Level 2 (realistic) biomarker scenario
 #'
-#' 3 biomarkers, moderate prevalence gap (~80% vs ~20%), 1.5x intensity
-#' multiplier in cases. Case/control AUC should be at least ~0.85 if
-#' the pipeline works.
+#' 3 biomarkers drawn from the *upper half* of the pool by intensity
+#' (`min_intensity_quantile = 0.50`), moderate prevalence gap
+#' (~80% vs ~20%), 1.5x intensity multiplier in cases. Case/control
+#' AUC should be at least ~0.85 if the pipeline works.
 #' @inheritParams biomarkers_level1
 #' @export
 biomarkers_level2 <- function(peak_params, seed = NULL) {
-  ho <- holdout_biomarkers(peak_params, n_biomarkers = 3L, seed = seed)
+  ho <- holdout_biomarkers(peak_params, n_biomarkers = 3L,
+                            min_intensity_quantile = 0.50,
+                            seed = seed)
   spec <- build_biomarker_spec(
     ho$biomarker_templates,
     case_prevalence        = 0.80,
@@ -186,13 +221,16 @@ biomarkers_level2 <- function(peak_params, seed = NULL) {
 
 #' Level 3 (hard) biomarker scenario
 #'
-#' 6 biomarkers, small prevalence gap (~60% vs ~40%), 1.2x intensity
-#' multiplier in cases. Stress-tests the pipeline; AUC around 0.70 is
-#' a passing result at this difficulty.
+#' 6 biomarkers drawn uniformly from the pool (any intensity), small
+#' prevalence gap (~60% vs ~40%), 1.2x intensity multiplier in cases.
+#' Stress-tests the pipeline including dim biomarkers; AUC around
+#' 0.70 is a passing result at this difficulty.
 #' @inheritParams biomarkers_level1
 #' @export
 biomarkers_level3 <- function(peak_params, seed = NULL) {
-  ho <- holdout_biomarkers(peak_params, n_biomarkers = 6L, seed = seed)
+  ho <- holdout_biomarkers(peak_params, n_biomarkers = 6L,
+                            min_intensity_quantile = NULL,
+                            seed = seed)
   spec <- build_biomarker_spec(
     ho$biomarker_templates,
     case_prevalence        = 0.60,

@@ -9,6 +9,7 @@ holdout_biomarkers(
   n_biomarkers,
   protect_radius_rt = 15/1400,
   protect_radius_cv = 3/40,
+  min_intensity_quantile = NULL,
   seed = NULL
 )
 }
@@ -24,6 +25,15 @@ image dimensions) around each biomarker inside which observed
 peaks are also removed from the background pool. Default matches
 the default \code{min_sep_rt}, \code{min_sep_cv} on a 1400 x 40 image (15 /
 1400 and 3 / 40).}
+
+\item{min_intensity_quantile}{Optional numeric in \verb{[0, 1)}. When
+non-\code{NULL}, biomarker templates are drawn only from pool peaks
+whose \code{intensity_raw} is at or above the given quantile of the
+pool's intensity distribution — e.g. \code{0.90} restricts selection
+to the top-10\% brightest peaks. Useful for sanity-check
+scenarios where you want the injected biomarker to be visually
+obvious even in a very sparse image. \code{NULL} (default) samples
+uniformly from the whole pool.}
 
 \item{seed}{Optional RNG seed for reproducible template selection.}
 }

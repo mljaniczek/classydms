@@ -16,7 +16,10 @@ list(biomarkers, background_peak_params) — pass both to
 \code{\link[=simulate_case_control_cohort]{simulate_case_control_cohort()}}.
 }
 \description{
-1 biomarker, extreme prevalence gap (95\% cases vs 5\% controls),
-2x intensity multiplier in cases. Case/control AUC should be well
-above 0.90 if the pipeline works.
+1 biomarker drawn from the \emph{top 10\% brightest} pool peaks
+(\code{min_intensity_quantile = 0.90}), extreme prevalence gap (95\%
+cases vs 5\% controls), 5x intensity multiplier in cases. Designed
+to be visually obvious in a spot-check plot; case/control AUC
+should be well above 0.90 if the pipeline works. If Level 1 fails,
+something in the pipeline is broken.
 }

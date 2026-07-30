@@ -12,7 +12,8 @@ biomarkers_level2(peak_params, seed = NULL)
 \item{seed}{Optional RNG seed for reproducible biomarker selection.}
 }
 \description{
-3 biomarkers, moderate prevalence gap (~80\% vs ~20\%), 1.5x intensity
-multiplier in cases. Case/control AUC should be at least ~0.85 if
-the pipeline works.
+3 biomarkers drawn from the \emph{upper half} of the pool by intensity
+(\code{min_intensity_quantile = 0.50}), moderate prevalence gap
+(~80\% vs ~20\%), 1.5x intensity multiplier in cases. Case/control
+AUC should be at least ~0.85 if the pipeline works.
 }

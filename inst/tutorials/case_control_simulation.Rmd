@@ -16,16 +16,41 @@ library(dplyr)
 library(tibble)
 library(purrr)
 
-# Consistent heatmap helper
+# Consistent heatmap helper (log = TRUE compresses the dynamic range so
+# dim structure is visible next to bright peaks)
 plot_mat <- function(mat, title = "", low = "white", high = "#B2182B",
-                     limits = NULL) {
+                     limits = NULL, log = FALSE) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  scale <- if (log) {
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        trans = "log1p", name = "log(1+intensity)")
+  } else {
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        name = "intensity")
+  }
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() +
+    scale +
+    scale_y_reverse() +
+    coord_fixed(ratio = 0.5) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid = element_blank())
+}
+
+# Diverging-scale helper for difference maps
+plot_mat_diff <- function(mat, title = "", limits = NULL,
+                          low = "#2166AC", high = "#B2182B") {
   H <- nrow(mat); W <- ncol(mat)
   df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
   df$val <- as.vector(mat)
   ggplot(df, aes(x = cv, y = rt, fill = val)) +
     geom_tile() +
-    scale_fill_gradient(low = low, high = high, limits = limits,
-                        name = "intensity") +
+    scale_fill_gradient2(low = low, mid = "white", high = high,
+                          midpoint = 0, limits = limits,
+                          name = "case - control") +
     scale_y_reverse() +
     coord_fixed(ratio = 0.5) +
     labs(x = "CV pixel", y = "RT pixel", title = title) +
@@ -138,15 +163,19 @@ b_c <- biom$cv_loc * W_native
 sprintf("Biomarker at RT pixel %.0f, CV pixel %.0f", b_r, b_c)
 ```
 
-Compare a case with the biomarker firing against a control where it doesn't:
+Compare a case with the biomarker firing against a control where it doesn't. The absolute intensity of a single injected peak is small relative to the brightest background peaks, so the linear-scale view often makes the biomarker invisible. We plot three views to make the signal visible:
 
-```{r visualize-samples, fig.height = 6}
+- **Log-scale case and control panels** — compress the dynamic range so dim structure and the biomarker are both readable.
+- **Case − control difference panel** — a per-sample subtraction on a diverging color scale (red = case brighter, blue = control brighter). Injected biomarkers show up as a red blob at their location regardless of absolute intensity.
+
+```{r visualize-samples, fig.height = 6.5}
 # Find a case and a control that fired appropriately
 case_idx    <- which(sim$y == 2L & sim$per_sample_firing[, 1])[1]
 control_idx <- which(sim$y == 1L & !sim$per_sample_firing[, 1])[1]
 
 Z_case    <- sim$samples[[case_idx]]$Z
 Z_control <- sim$samples[[control_idx]]$Z
+Z_diff    <- Z_case - Z_control
 
 # Overlay a marker at the biomarker location
 mark_biomarker <- function(p, r, c) {
@@ -154,17 +183,43 @@ mark_biomarker <- function(p, r, c) {
                fill = NA, size = 8, stroke = 1.2)
 }
 
-lim <- c(0, max(c(Z_case, Z_control)))
+lim_log <- c(0, max(c(Z_case, Z_control)))
+lim_diff <- c(-1, 1) * max(abs(Z_diff))
+
 gridExtra::grid.arrange(
-  mark_biomarker(plot_mat(Z_case, "Case (biomarker fired)", limits = lim),
+  mark_biomarker(plot_mat(Z_case, "Case (biomarker fired) — log scale",
+                          limits = lim_log, log = TRUE),
                  b_r, b_c),
-  mark_biomarker(plot_mat(Z_control, "Control (biomarker absent)", limits = lim),
+  mark_biomarker(plot_mat(Z_control, "Control (biomarker absent) — log scale",
+                          limits = lim_log, log = TRUE),
                  b_r, b_c),
-  ncol = 2
+  mark_biomarker(plot_mat_diff(Z_diff, "Case − Control (diverging)",
+                                limits = lim_diff),
+                 b_r, b_c),
+  ncol = 3
 )
 ```
 
-The cyan circle marks the biomarker location. On the case, that region has an extra 2D-Gaussian blob added on top of the background; on the control, the region is empty (background peaks have been protected out of the pool).
+The cyan circle marks the biomarker location. On the diff panel, the injected biomarker shows up as a red blob (case has extra signal there); the blue speckle elsewhere is the random per-sample variation in which background peaks were drawn — that's noise as far as the classifier is concerned, and should average out across many samples.
+
+Averaging the diff over ALL cases and controls makes the systematic signal even clearer:
+
+```{r average-diff, fig.height = 4}
+case_indices    <- which(sim$y == 2L)
+control_indices <- which(sim$y == 1L)
+Z_case_mean    <- Reduce(`+`, lapply(sim$samples[case_indices],    `[[`, "Z")) / length(case_indices)
+Z_control_mean <- Reduce(`+`, lapply(sim$samples[control_indices], `[[`, "Z")) / length(control_indices)
+Z_diff_mean    <- Z_case_mean - Z_control_mean
+
+mark_biomarker(
+  plot_mat_diff(Z_diff_mean,
+                sprintf("mean(case) − mean(control), N=%d each",
+                        length(case_indices)),
+                limits = c(-1, 1) * max(abs(Z_diff_mean))),
+  b_r, b_c)
+```
+
+If the pipeline is correctly injecting the biomarker, the averaged diff will show a red blob centered on the biomarker (cyan circle) and near-zero elsewhere — because random per-sample background variation averages out but the systematic biomarker signal does not.
 
 # 5. Preprocess and pad the simulated cohort
 

@@ -12,7 +12,8 @@ biomarkers_level3(peak_params, seed = NULL)
 \item{seed}{Optional RNG seed for reproducible biomarker selection.}
 }
 \description{
-6 biomarkers, small prevalence gap (~60\% vs ~40\%), 1.2x intensity
-multiplier in cases. Stress-tests the pipeline; AUC around 0.70 is
-a passing result at this difficulty.
+6 biomarkers drawn uniformly from the pool (any intensity), small
+prevalence gap (~60\% vs ~40\%), 1.2x intensity multiplier in cases.
+Stress-tests the pipeline including dim biomarkers; AUC around
+0.70 is a passing result at this difficulty.
 }
