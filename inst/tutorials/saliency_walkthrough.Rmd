@@ -1,0 +1,265 @@
+---
+title: "Walkthrough: aggregate_saliency_masked step by step"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 3.5, dpi = 96)
+library(classydms)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+
+plot_mat <- function(mat, title = "", low = "white", high = "#B2182B",
+                     limits = NULL) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() +
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        name = "intensity") +
+    scale_y_reverse() +
+    coord_fixed(ratio = 0.5) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank())
+}
+plot_mat_diverging <- function(mat, title = "", limits = NULL) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  if (is.null(limits)) limits <- c(-1, 1) * max(abs(mat))
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                          midpoint = 0, limits = limits,
+                          name = "saliency") +
+    scale_y_reverse() +
+    coord_fixed(ratio = 0.5) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank())
+}
+```
+
+# What `aggregate_saliency_masked` does
+
+Converts the elastic-net classifier's decision into a spatial `(RT, CV)` map showing *where in the image* the classifier is finding its signal. Answers the biomarker-discovery question: given that the model says a sample looks like a case, which coordinates drove the prediction?
+
+The construction is a variant of **Class Activation Mapping (CAM)** adapted for this pipeline:
+
+1. For one sample, get the encoder's per-channel spatial activation map `A[c, r, c']` (64 channels × H_enc × W_enc pixels at encoder resolution).
+2. Weight each channel by its elastic-net coefficient `w[c]` — the same coefficients from `cv_encoder_elastic_net$coefs`. Positive coefs push toward class 2 (case), negative toward class 1.
+3. Sum across channels: `CAM[r, c'] = Σ_c w[c] * A[c, r, c']`. This is a *linear combination* of encoder activations, weighted by the classifier — regions of the image where the case-pushing channels light up get high positive CAM values.
+4. Upsample bilinearly from encoder resolution back to full image resolution.
+5. **Aggregate across all cases**, ignoring padded regions, so per-sample noise averages out and the systematic class-associated regions show up.
+
+Why CAM works: the classifier is *linear* in the global-average-pooled encoder features (elastic net is a linear model). Reversing the average — pushing the same weights back onto the pre-pool spatial map — gives a mathematically equivalent decomposition of the classifier score into per-pixel contributions.
+
+# Parameter cheat sheet
+
+| Param | Default | Role |
+|---|---|---|
+| `encoder` | — (required) | Pretrained `dms_encoder`. Same one used to build `coefs` |
+| `Z_list` | — (required) | Named list of preprocessed, padded intensity matrices |
+| `coefs` | — (required) | Elastic-net coefficients (length 64) — take from `cv_encoder_elastic_net$coefs` |
+| `sample_indices` | — (required) | Which samples to aggregate over. Usually the case group; sometimes the whole cohort or specific subgroups |
+| `orig_dims` | — (required) | List of `c(H = ..., W = ...)` pairs giving each sample's pre-padding dimensions. Used for masking — pixels that were padding in a given sample don't count toward its saliency |
+| `device` | `"cpu"` | `"cpu"` / `"cuda"` / `"mps"` — where the encoder forward pass runs |
+
+**Why the parameter design looks this way:**
+
+- **`coefs` is separate from `encoder`** — the encoder is class-agnostic, learned in pretraining. `coefs` come from the labeled-data classifier. Keeping them separate lets you compute *different saliency maps for different classification tasks* using the same encoder (e.g., disease A vs control, then disease B vs control).
+- **`sample_indices` is explicit** — you might want case-only, control-only (as a sanity check that it looks different), or all samples. The classifier signal comes primarily from cases; averaging over cases only usually gives the cleanest map.
+- **`orig_dims` is required** — most cohorts pad samples to a common size, so a "sample" is actually valid signal in a subregion and zeros in the padded region. Averaging saliency over pixels that are padding for some samples would artificially deflate those regions. The mask fixes that.
+
+# 1. Setup: build a mini cohort with a real signal
+
+We need an encoder AND classifier coefs to demonstrate. The setup is the same as the elastic-net walkthrough — small toy params, hold out a bright biomarker, simulate a small case/control cohort, pretrain briefly, run the classifier.
+
+```{r setup-cohort, cache = TRUE}
+set.seed(1)
+peaks_obs <- tibble(
+  rt_loc    = c(0.2, 0.35, 0.5, 0.5, 0.7, 0.8, 0.85),
+  cv_loc    = c(0.3, 0.5,  0.6, 0.4, 0.7, 0.4, 0.55),
+  sigma_rt  = c(3,   6,    2,   4,   5,   3,   7),
+  sigma_cv  = c(1.5, 2,    1,   1.5, 2,   1,   2.5),
+  intensity = c(0.5, 1.2,  0.3, 0.8, 1.5, 0.4, 1.8)
+)
+toy_params <- list(
+  n_peaks_detected = nrow(peaks_obs),
+  n_peaks   = list(mean = 8, sd = 2),
+  rt_loc    = list(mean = mean(peaks_obs$rt_loc), sd = sd(peaks_obs$rt_loc)),
+  cv_loc    = list(mean = mean(peaks_obs$cv_loc), sd = sd(peaks_obs$cv_loc)),
+  sigma_rt  = list(meanlog = mean(log(peaks_obs$sigma_rt)),
+                   sdlog   = sd(log(peaks_obs$sigma_rt))),
+  sigma_cv  = list(meanlog = mean(log(peaks_obs$sigma_cv)),
+                   sdlog   = sd(log(peaks_obs$sigma_cv))),
+  intensity = list(meanlog = mean(log(peaks_obs$intensity)),
+                   sdlog   = sd(log(peaks_obs$intensity))),
+  noise     = list(mean = 0.005, sd = 0.005),
+  rt_loc_raw    = peaks_obs$rt_loc,
+  cv_loc_raw    = peaks_obs$cv_loc,
+  sigma_rt_raw  = peaks_obs$sigma_rt,
+  sigma_cv_raw  = peaks_obs$sigma_cv,
+  intensity_raw = peaks_obs$intensity
+)
+H <- 100L; W <- 30L
+
+scenario <- biomarkers_level1(toy_params, seed = 42L)
+sim <- simulate_case_control_cohort(
+  scenario$background_peak_params, scenario$biomarkers,
+  n_cases = 15L, n_controls = 15L,
+  H = H, W = W, seed = 7L
+)
+Z_list <- lapply(sim$samples, `[[`, "Z")
+y <- sim$y
+
+pretrain_result <- pretrain_denoising_online(
+  scenario$background_peak_params,
+  H = H, W = W,
+  steps_per_epoch = 30L, epochs = 5L, batch_size = 16L,
+  noise_scale = 3.0, val_n = 32L, device = "cpu", seed = 1L
+)
+encoder <- pretrain_result$encoder
+
+elnet <- cv_encoder_elastic_net(encoder, Z_list, y,
+                                 k = 5L, alpha = 0.5, seed = 1L)
+sprintf("Pretrain done. Case/control AUC = %.3f, %d non-zero coefs",
+        elnet$auc, sum(elnet$coefs != 0))
+
+# Biomarker's target location for reference
+b_r <- scenario$biomarkers$rt_loc * H
+b_c <- scenario$biomarkers$cv_loc * W
+sprintf("Biomarker at RT pixel %.0f, CV pixel %.0f", b_r, b_c)
+```
+
+At this tiny scale (30 samples, 5 pretrain epochs, 100×30 image) the classifier signal is weak but this is enough to see the mechanism.
+
+# 2. Under the hood: one sample's CAM
+
+`aggregate_saliency_masked` calls `compute_saliency_map` per sample. Let's do it explicitly for one case:
+
+```{r one-cam, fig.height = 4}
+case_idx <- which(y == 2L & sim$per_sample_firing[, 1])[1]
+Z_case <- Z_list[[case_idx]]
+
+sal_one <- compute_saliency_map(encoder, Z_case, coefs = elnet$coefs,
+                                 device = "cpu")
+str(sal_one, max.level = 1)
+```
+
+Two versions come back:
+
+```{r one-cam-plot, fig.height = 4}
+gridExtra::grid.arrange(
+  plot_mat_diverging(sal_one$raw_cam,
+                     sprintf("raw_cam: encoder-resolution (%dx%d)",
+                             nrow(sal_one$raw_cam), ncol(sal_one$raw_cam))),
+  plot_mat_diverging(sal_one$upsampled_cam,
+                     sprintf("upsampled_cam: input-resolution (%dx%d)",
+                             nrow(sal_one$upsampled_cam),
+                             ncol(sal_one$upsampled_cam))),
+  ncol = 2
+)
+```
+
+- **`raw_cam`** is at *encoder resolution*, which is smaller than the input because the encoder downsamples (stem strides). For a 100×30 input with stem strides 4×1, the raw CAM is about 25×30.
+- **`upsampled_cam`** is bilinearly interpolated to the input size (100×30). Uses `torch::nnf_interpolate` internally. Necessary for aligning saliency with input-space coordinates.
+
+Red = classifier is pushing toward case at that region; blue = toward control; white = neutral or zero. On a single sample the map is noisy — even if there's a real biomarker signal, one sample's activation carries a lot of per-sample idiosyncrasy.
+
+# 3. Averaging across cases — this is what aggregation does
+
+The point of `aggregate_saliency_masked` is: **the classifier signal is systematic (same location across cases) while per-sample noise is random**. Averaging over many cases cancels the noise and reinforces the signal.
+
+```{r aggregation, fig.height = 4}
+case_indices    <- which(y == 2L)
+control_indices <- which(y == 1L)
+orig_dims <- lapply(sim$samples,
+                     function(s) c(H = nrow(s$Z), W = ncol(s$Z)))
+
+sal_cases    <- aggregate_saliency_masked(encoder, Z_list,
+                                            coefs = elnet$coefs,
+                                            sample_indices = case_indices,
+                                            orig_dims = orig_dims)
+sal_controls <- aggregate_saliency_masked(encoder, Z_list,
+                                            coefs = elnet$coefs,
+                                            sample_indices = control_indices,
+                                            orig_dims = orig_dims)
+
+mark <- function(p, r, c)
+  p + annotate("point", x = c, y = r, shape = 21, color = "cyan",
+               fill = NA, size = 8, stroke = 1.2)
+
+lim <- c(-1, 1) * max(abs(c(sal_cases, sal_controls)))
+gridExtra::grid.arrange(
+  mark(plot_mat_diverging(sal_cases,    "aggregated saliency: cases",
+                          limits = lim), b_r, b_c),
+  mark(plot_mat_diverging(sal_controls, "aggregated saliency: controls",
+                          limits = lim), b_r, b_c),
+  ncol = 2
+)
+```
+
+**How to read this on a real run:**
+
+- **Cases panel**: red regions are where the classifier consistently says "this looks like a case". The biomarker location (cyan circle) should show up red if the pipeline is working.
+- **Controls panel**: the same regions should show *blue* — where controls are systematically less like cases at those coordinates. Alternatively they might be near zero because the biomarker peak is simply absent (no signal to weight).
+- **Consistent red-in-cases + blue-in-controls at the biomarker location** = the classifier learned the injected signal AND localized it correctly.
+
+At this tiny scale (5 pretrain epochs) the maps may look mostly gray — that's expected. On a real run with meaningful pretraining, hotspots at biomarker locations are usually clear.
+
+# 4. The masking mechanism — why `orig_dims` matters
+
+Every sample enters as an `H × W` padded matrix, but the actual data occupies only `(orig_H, orig_W)` in the top-left. `aggregate_saliency_masked` uses `orig_dims` to build a **per-sample mask**:
+
+```r
+# From R/interpretability.R, inside the aggregation loop
+mask <- matrix(0, H, W)
+mask[seq_len(orig_H), seq_len(orig_W)] <- 1
+sum_mat   <- sum_mat + cam * mask       # only real-data pixels contribute
+count_mat <- count_mat + mask            # per-pixel divisor
+```
+
+Without this, aggregation would treat padded (zero-input) regions as "the classifier said neutral here", which artificially deflates the average toward zero at pixels that are padding for even one sample.
+
+To see the effect explicitly, compare padded and pre-padded coordinate systems:
+
+```{r pad-viz, fig.height = 3}
+# In this toy setup all samples share H x W so masking is a no-op.
+# On a real cohort orig_dims varies per sample and masking matters.
+tbl <- tibble(
+  sample = seq_along(orig_dims),
+  orig_H = sapply(orig_dims, `[`, "H"),
+  orig_W = sapply(orig_dims, `[`, "W")
+)
+head(tbl)
+sprintf("Padded H x W: %d x %d. Orig dims range: H %d..%d, W %d..%d",
+        H, W, min(tbl$orig_H), max(tbl$orig_H),
+        min(tbl$orig_W), max(tbl$orig_W))
+```
+
+In this tutorial all samples share dimensions because we generated them at `H × W`, so masking is a no-op. On a real cohort where samples were trimmed to slightly different sizes before padding, the mask ensures each pixel's average only counts samples that had real data there.
+
+# 5. Using the map — what to do with a saliency hotspot
+
+Once you have `sal_cases`, the practical follow-ups:
+
+- **Find local maxima** — `top_local_maxima(sal_cases, top_k = 10)` gives the K brightest hotspots as `(RT_pixel, CV_pixel, value)`. That's your candidate biomarker locations.
+- **Map back to physical units** — the RT and CV axes in your original files (`samples[[i]]$time` and `samples[[i]]$cv`) tell you what those pixel coordinates mean in seconds and volts. That's what you'd cross-reference with a compound library.
+- **Compare with controls** — if you also compute `sal_controls`, subtracting gives you a *class-difference saliency* that highlights regions where the signal is specific to cases rather than shared.
+- **Evaluate against ground truth** (in a simulation): `evaluate_biomarker_recovery(sal_cases, biomarkers, ...)` returns per-pixel AUC and top-K precision/recall.
+
+# Practical tips
+
+- **Always use `sample_indices` = the case group** for the primary saliency map. Aggregating over all samples smears the signal because control saliencies contribute opposite-sign contributions.
+- **Averaging is a stability tool, not a magic filter** — if the underlying classifier AUC is chance-level, no amount of aggregation will produce a meaningful map. Check `cv_encoder_elastic_net$auc` first; if it's ≤ 0.60 the saliency isn't reliable.
+- **`raw_cam` vs `upsampled_cam`** — you almost always want the upsampled version for interpretation. The raw version is useful for debugging (checking that encoder channels are firing at all).
+- **`coefs` from `cv_encoder_elastic_net`** are averaged across CV folds. Alternative: run `cv_encoder_elastic_net` yourself with `k = 1` for a single-fold classifier if you want no averaging, or aggregate coefs by median instead of mean.

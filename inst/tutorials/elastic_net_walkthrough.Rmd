@@ -1,0 +1,282 @@
+---
+title: "Walkthrough: cv_encoder_elastic_net step by step"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 3.5, dpi = 96)
+library(classydms)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+
+plot_mat <- function(mat, title = "", low = "white", high = "#B2182B",
+                     limits = NULL) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() +
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        name = "intensity") +
+    scale_y_reverse() +
+    coord_fixed(ratio = 0.5) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank())
+}
+```
+
+# What `cv_encoder_elastic_net` does
+
+Two-step supervised classification on top of a *pretrained, frozen* encoder:
+
+1. **Extract features** — every sample goes through the encoder once. The encoder output is a spatial feature map; we global-average-pool it to a 64-dim vector per sample. This step is deterministic — no training, no gradients.
+2. **Elastic net binary classifier** — 5-fold stratified CV; on each fold, fit `glmnet::cv.glmnet(x = features, y = labels, family = "binomial")` on the training samples and predict on the held-out ones. Report out-of-fold predictions, AUC, and mean elastic-net coefficients.
+
+Why elastic net rather than a fine-tuned neural classifier head:
+
+- **64 features, small N cohorts** — elastic net is well-suited to this regime; a neural head would overfit.
+- **Interpretability** — the elastic net coefficients directly weight each encoder channel, and each encoder channel has a spatial activation pattern. This lets us build a saliency map by weighting channel activations by their coefficients (see the `aggregate_saliency_masked` walkthrough).
+- **Fast, deterministic, no hyperparameter drama** — `cv.glmnet` picks `lambda` automatically per fold.
+
+# Parameter cheat sheet
+
+| Param | Default | Role |
+|---|---|---|
+| `encoder` | — (required) | A pretrained `dms_encoder`. Frozen — no training here |
+| `Z_list` | — (required) | Named list of preprocessed, padded intensity matrices, one per sample |
+| `y` | — (required) | Binary labels. Integer vector, typically `1` = control, `2` = case, aligned with `Z_list` |
+| `k` | `5L` | Number of CV folds. Stratified — each fold has similar class balance |
+| `alpha` | `0.5` | Elastic net mixing. `0` = pure ridge (all features shrunk, none dropped). `1` = pure LASSO (feature selection, some coefs = 0). `0.5` = equal weight (default) |
+| `nlambda` | `100L` | Number of regularization strengths for `cv.glmnet` to search. Rarely tune |
+| `seed` | `1L` | RNG seed for fold assignment. Set to a specific value if you want reproducible folds |
+| `device` | `"cpu"` | Where the encoder forward pass runs. `"cuda"` / `"mps"` if pretrained there |
+
+**Why the defaults look the way they do:**
+
+- **`k = 5`**: standard bias-variance sweet spot for small-cohort CV. Larger `k` (like 10) gives lower bias but more variance per fold and takes longer.
+- **`alpha = 0.5`**: mixing LASSO and ridge in equal parts. Pure LASSO can be unstable when several features are correlated (arbitrarily picks one); pure ridge keeps everything and hurts interpretability. `alpha = 0.5` is a robust default across many biomedical problems.
+- **`nlambda = 100`**: `glmnet`'s default. The regularization path is essentially free to compute; you rarely need more.
+
+# 1. Toy setup — build a tiny cohort with a real signal
+
+To have an encoder that produces useful features we need to pretrain it. We build a small `peak_params`, hold out one bright biomarker (using the `biomarkers_level1` scenario), and simulate a small case/control cohort.
+
+```{r toy-setup}
+set.seed(1)
+peaks_obs <- tibble(
+  rt_loc    = c(0.2, 0.35, 0.5, 0.5, 0.7, 0.8, 0.85),
+  cv_loc    = c(0.3, 0.5,  0.6, 0.4, 0.7, 0.4, 0.55),
+  sigma_rt  = c(3,   6,    2,   4,   5,   3,   7),
+  sigma_cv  = c(1.5, 2,    1,   1.5, 2,   1,   2.5),
+  intensity = c(0.5, 1.2,  0.3, 0.8, 1.5, 0.4, 1.8)
+)
+toy_params <- list(
+  n_peaks_detected = nrow(peaks_obs),
+  n_peaks   = list(mean = 8, sd = 2),
+  rt_loc    = list(mean = mean(peaks_obs$rt_loc), sd = sd(peaks_obs$rt_loc)),
+  cv_loc    = list(mean = mean(peaks_obs$cv_loc), sd = sd(peaks_obs$cv_loc)),
+  sigma_rt  = list(meanlog = mean(log(peaks_obs$sigma_rt)),
+                   sdlog   = sd(log(peaks_obs$sigma_rt))),
+  sigma_cv  = list(meanlog = mean(log(peaks_obs$sigma_cv)),
+                   sdlog   = sd(log(peaks_obs$sigma_cv))),
+  intensity = list(meanlog = mean(log(peaks_obs$intensity)),
+                   sdlog   = sd(log(peaks_obs$intensity))),
+  noise     = list(mean = 0.005, sd = 0.005),
+  rt_loc_raw    = peaks_obs$rt_loc,
+  cv_loc_raw    = peaks_obs$cv_loc,
+  sigma_rt_raw  = peaks_obs$sigma_rt,
+  sigma_cv_raw  = peaks_obs$sigma_cv,
+  intensity_raw = peaks_obs$intensity
+)
+H <- 100L; W <- 30L
+```
+
+Hold out one bright biomarker and simulate:
+
+```{r simulate-cohort}
+scenario <- biomarkers_level1(toy_params, seed = 42L)
+sim <- simulate_case_control_cohort(
+  scenario$background_peak_params, scenario$biomarkers,
+  n_cases = 15L, n_controls = 15L,
+  H = H, W = W, seed = 7L
+)
+Z_list <- lapply(sim$samples, `[[`, "Z")
+y      <- sim$y
+table(y, dnn = "class (2 = case, 1 = control)")
+```
+
+# 2. Quick pretrain (tiny, ~30 seconds)
+
+```{r pretrain, cache = TRUE}
+pretrain_result <- pretrain_denoising_online(
+  scenario$background_peak_params,
+  H = H, W = W,
+  steps_per_epoch = 30L, epochs = 5L, batch_size = 16L,
+  noise_scale = 3.0, val_n = 32L, device = "cpu", seed = 1L
+)
+encoder <- pretrain_result$encoder
+```
+
+# 3. Under the hood: extract encoder features first
+
+`cv_encoder_elastic_net` calls `extract_encoder_features` internally. Let's do it explicitly to see the output:
+
+```{r extract-features}
+feats <- extract_encoder_features(encoder, Z_list, device = "cpu")
+dim(feats)   # n_samples x 64
+```
+
+The 64 numbers per sample are the **global-average-pooled encoder output**. That's the input to the classifier.
+
+Visualize the feature matrix — rows are samples, columns are the 64 encoder channels, sorted by class:
+
+```{r feature-heatmap, fig.height = 5}
+ord <- order(y)
+feats_sorted <- feats[ord, ]
+row_labels <- factor(y[ord], levels = c(1, 2),
+                      labels = c("control", "case"))
+
+feat_long <- as.data.frame(feats_sorted) |>
+  mutate(sample = seq_len(nrow(feats_sorted)),
+         class = row_labels) |>
+  tidyr::pivot_longer(cols = -c(sample, class),
+                      names_to = "channel", values_to = "activation") |>
+  mutate(channel = as.integer(sub("V", "", channel)))
+
+ggplot(feat_long, aes(x = channel, y = sample, fill = activation)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0) +
+  labs(x = "encoder channel (1..64)", y = "sample (sorted by class)",
+       title = "Sample × channel feature matrix") +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+Look for **channels where the color changes between the case and control rows** — those are the encoder channels that respond to class-associated content and will get non-zero elastic-net coefficients downstream. At this tiny scale after only 5 epochs of pretraining, differences may be subtle; on a real run they're often clearly banded.
+
+# 4. Distribution of features by class
+
+Per-channel Wilcoxon on the encoder features — a quick preview of what elastic net will find:
+
+```{r feature-wilcox}
+wilcox_p <- sapply(seq_len(ncol(feats)), function(i)
+  wilcox.test(feats[y == 2, i], feats[y == 1, i])$p.value)
+tibble(channel = seq_along(wilcox_p), p = wilcox_p) |>
+  arrange(p) |>
+  head(8)
+```
+
+Channels near the top of this list are the ones the elastic net will lean on.
+
+# 5. Fit the classifier — `cv_encoder_elastic_net`
+
+```{r classify}
+elnet <- cv_encoder_elastic_net(
+  encoder, Z_list = Z_list, y = y,
+  k = 5L, alpha = 0.5, nlambda = 100L, seed = 1L
+)
+elnet$auc
+```
+
+What we get back:
+
+```{r elnet-structure}
+str(elnet, max.level = 1)
+```
+
+- `probs`: length-N vector of *out-of-fold* predicted probabilities of class 2. Each sample was in the test fold exactly once.
+- `auc`: single number, `pROC::auc(y, probs)`.
+- `features`: the 64-dim feature matrix from step 3.
+- `coefs`: mean elastic-net coefficients across folds. One per encoder channel; positive = pushes prediction toward class 2 (case), negative = toward class 1 (control), zero = LASSO shrunk to zero and dropped.
+
+# 6. ROC curve
+
+```{r roc, fig.height = 4}
+library(pROC)
+roc_obj <- roc(y, elnet$probs, quiet = TRUE, direction = "<")
+plot(roc_obj, main = sprintf("ROC — AUC = %.3f", elnet$auc),
+     col = "#B2182B", lwd = 2)
+abline(0, 1, lty = 2, col = "grey60")
+```
+
+# 7. Coefficient interpretation
+
+```{r coefs, fig.height = 3.5}
+coef_df <- tibble(
+  channel = seq_along(elnet$coefs),
+  coef = elnet$coefs
+) |>
+  mutate(sign = case_when(
+    coef > 0 ~ "pushes toward case",
+    coef < 0 ~ "pushes toward control",
+    TRUE     ~ "dropped (LASSO)"
+  ))
+n_nonzero <- sum(elnet$coefs != 0)
+n_pos     <- sum(elnet$coefs > 0)
+n_neg     <- sum(elnet$coefs < 0)
+sprintf("Non-zero: %d / 64 (positive: %d, negative: %d)",
+        n_nonzero, n_pos, n_neg)
+
+ggplot(coef_df, aes(x = channel, y = coef, fill = sign)) +
+  geom_col() +
+  scale_fill_manual(values = c("pushes toward case" = "#B2182B",
+                                "pushes toward control" = "#2166AC",
+                                "dropped (LASSO)" = "grey80")) +
+  labs(x = "encoder channel", y = "mean elastic-net coefficient",
+       title = "Which encoder channels the classifier uses") +
+  theme_minimal()
+```
+
+**How to read this:**
+
+- Higher `|coef|` = channel matters more.
+- Sign shows which class it favors.
+- **Dropped channels** (coef = 0) are where LASSO shrinkage decided the channel doesn't help; interpretation-wise they're background noise. The number of non-zero coefs reflects how compact the class-discriminating signal is.
+- The next step (saliency) turns these 64 coefficients into a spatial map by weighting the encoder's channel activations by these coefficients.
+
+# 8. Effect of `alpha`
+
+Sweep alpha to see the ridge → LASSO transition:
+
+```{r alpha-sweep, fig.height = 3.5}
+alphas <- c(0.0, 0.25, 0.5, 0.75, 1.0)
+sweep <- lapply(alphas, function(a) {
+  fit <- cv_encoder_elastic_net(encoder, Z_list, y,
+                                 k = 5L, alpha = a, seed = 1L)
+  tibble(alpha = a, auc = fit$auc,
+         n_nonzero = sum(fit$coefs != 0))
+})
+sweep_df <- bind_rows(sweep)
+sweep_df
+
+ggplot(sweep_df, aes(x = alpha)) +
+  geom_line(aes(y = auc, color = "AUC")) +
+  geom_point(aes(y = auc, color = "AUC")) +
+  geom_line(aes(y = n_nonzero / 64, color = "n_nonzero / 64")) +
+  geom_point(aes(y = n_nonzero / 64, color = "n_nonzero / 64")) +
+  labs(x = "alpha", y = "value",
+       title = "Effect of elastic net mixing") +
+  theme_minimal()
+```
+
+At tiny scale on 30 samples this is noisy. On a real cohort you'd see:
+- **AUC roughly stable** across `alpha` in the 0.1–0.9 range if the signal is real
+- **`n_nonzero` dropping monotonically** as `alpha` → 1 (LASSO shrinkage tightens)
+
+Pick `alpha` for interpretability trade-offs: closer to 1 gives you fewer non-zero channels (more parsimonious saliency map), closer to 0 keeps more channels (smoother saliency, less selection).
+
+# Practical tips
+
+- **Always call `cv_encoder_elastic_net` with a specific `seed`** if you want reproducible folds. Otherwise the fold assignment is stochastic.
+- **`k = 5` is the standard**; consider `k = 10` only if you have >100 samples per class.
+- **`alpha = 0.5` is safe**; sweep if you care about interpretability vs stability trade-off.
+- **The 64-dim feature bottleneck is fixed** by the encoder architecture. If you need a different dimensionality, that's an encoder-architecture change (not a `cv_encoder_elastic_net` argument).
+- **The elastic net coefficients `elnet$coefs` are the input to `aggregate_saliency_masked`** — that's how the classifier signal gets projected back into image space for interpretation.

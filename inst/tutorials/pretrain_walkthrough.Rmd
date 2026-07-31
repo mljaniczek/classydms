@@ -1,0 +1,250 @@
+---
+title: "Walkthrough: pretrain_denoising_online step by step"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 3.5, dpi = 96)
+library(classydms)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+
+plot_mat <- function(mat, title = "", low = "white", high = "#B2182B",
+                     limits = NULL, log = FALSE) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  scale <- if (log) {
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        trans = "log1p", name = "log(1+I)")
+  } else {
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        name = "intensity")
+  }
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() + scale + scale_y_reverse() +
+    coord_fixed(ratio = 0.5) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank())
+}
+```
+
+# What `pretrain_denoising_online` does
+
+Self-supervised training of a convolutional encoder on synthetic GC-DMS images. The encoder isn't given any class labels — it only sees pairs of `(noisy, clean)` synthetic samples and is asked to reconstruct `clean` from `noisy`. The point isn't the reconstruction itself; it's that this task forces the encoder to learn features that describe *the structure of GC-DMS peaks in general* (Vincent et al. 2008). Those features then transfer to downstream classification on real labeled data — even a very small labeled cohort — via a lightweight elastic net on the 64-dim encoder output.
+
+"Online" means synthetic training batches are generated on the fly per step rather than pre-generated to disk. This lets the model see effectively unlimited unique synthetic samples with a constant memory footprint.
+
+# Parameter cheat sheet
+
+| Param | Default | Role |
+|---|---|---|
+| `peak_params` | — (required) | Output of `estimate_peak_params()` — the empirical distribution the generator samples from |
+| `H`, `W` | — (required) | Input image dimensions in pixels (padded to a common size beforehand) |
+| **Sizing** | | |
+| `steps_per_epoch` | `500L` | Number of mini-batches per epoch |
+| `epochs` | `30L` | Total epochs |
+| `batch_size` | `32L` | Samples per gradient step |
+| `val_n` | `200L` | Size of a *fixed* synthetic validation set for tracking |
+| `val_real` | `NULL` | Optional list of real Z matrices for tracking real-data reconstruction MSE — critical when tuning `noise_scale` |
+| **Optimization** | | |
+| `lr` | `1e-3` | Adam learning rate |
+| `weight_decay` | `1e-4` | L2 regularization on encoder weights |
+| `grad_clip` | `1.0` | Clip global gradient norm to this; stability guard |
+| `norm_clamp` | `10.0` | Clamp the batch loss to this; prevents a bad synthetic batch from tanking training |
+| **Data generation** (all forwarded to `generate_one_synthetic`) | | |
+| `add_noise` | `TRUE` | Whether to add background noise. `FALSE` collapses to a pure reconstruction AE (typically much less useful) |
+| `noise_scale` | `1.0` | Multiplier on `params$noise$sd`. `1.0` = real-cohort noise; larger = harder denoising task = stronger regularization |
+| `size_jitter` | `0.15` | SD of per-peak log-Normal size multiplier |
+| `location_mode` | `"empirical"` | Bootstrap observed `(rt, cv)` (default) vs marginal Normal draws |
+| `location_jitter_rt`, `location_jitter_cv` | `2`, `1` | SD of per-peak location jitter (pixels) |
+| `attribute_mode` | `"joint"` | Bootstrap observed morphology triple (default) vs independent marginals |
+| `dust_threshold` | `0` | Zero pixels below this on synthetic samples before normalization; match real-data `basement_thr` |
+| **Architecture** | | |
+| `stem_stride_rt`, `stem_stride_cv` | `4L`, `1L` | Encoder-stem downsampling per axis. RT gets aggressive downsampling because RT pixel count is much larger than CV |
+| **Runtime** | | |
+| `device` | auto | `"cpu"` / `"cuda"` / `"mps"` |
+| `num_workers` | `1L` | Parallel R-side data generation via `mclapply` on Unix. Speed only |
+| `num_threads` | `NULL` | Override torch's thread count. Apple Silicon benefits from setting to number of performance cores |
+| `save_path` | `NULL` | Write encoder + autoencoder + manifest to disk each epoch. Set for any real run — a crash mid-training means recoverable state |
+| `resume_from` | `NULL` | Path to a previously-saved encoder to resume from. Same-session use; hyperparameters must match the original |
+| `checkpoint_every` | `10L` | Rotate a numbered checkpoint every N epochs |
+| `loss_diagnostics` | `TRUE` | Print median / p95 / max batch loss each epoch |
+| `seed` | `42L` | RNG seed |
+
+**Why the defaults look the way they do:**
+
+- **`lr = 1e-3` with Adam** — standard well-behaved LR for ResNet-style encoders in this size range. If loss plateaus early, halve; if unstable, halve.
+- **`weight_decay = 1e-4`** — mild L2 regularization typical for small vision networks.
+- **`grad_clip = 1.0` and `norm_clamp = 10.0`** — belt-and-suspenders against a single unlucky synthetic batch producing huge losses / gradients and destabilizing the model. Rarely trigger after epoch 1.
+- **`size_jitter = 0.15`** was tuned down from a former default of `0.6` because `0.6` produced synthetic peaks noticeably larger or smaller than any real observed peak (not biologically plausible). `0.15` gives ~×1.16 multiplicative variation which matches typical GC-DMS peak-size variability.
+- **`stem_stride_rt = 4L`, `stem_stride_cv = 1L`** — asymmetric downsampling reflects the asymmetric pixel dimensions (RT ~1400px vs CV ~40px). Uniform stride would either over-shrink CV or under-shrink RT.
+
+# 1. Toy setup
+
+To keep this fast we build a small `peak_params` by hand and train on a `100 × 30` canvas.
+
+```{r toy-setup}
+peaks_obs <- tibble(
+  rt_loc    = c(0.2, 0.35, 0.5, 0.5, 0.7, 0.8, 0.85),
+  cv_loc    = c(0.3, 0.5,  0.6, 0.4, 0.7, 0.4, 0.55),
+  sigma_rt  = c(3,   6,    2,   4,   5,   3,   7),
+  sigma_cv  = c(1.5, 2,    1,   1.5, 2,   1,   2.5),
+  intensity = c(0.5, 1.2,  0.3, 0.8, 1.5, 0.4, 1.8)
+)
+toy_params <- list(
+  n_peaks_detected = nrow(peaks_obs),
+  n_peaks   = list(mean = 8, sd = 2),
+  rt_loc    = list(mean = mean(peaks_obs$rt_loc), sd = sd(peaks_obs$rt_loc)),
+  cv_loc    = list(mean = mean(peaks_obs$cv_loc), sd = sd(peaks_obs$cv_loc)),
+  sigma_rt  = list(meanlog = mean(log(peaks_obs$sigma_rt)),
+                   sdlog   = sd(log(peaks_obs$sigma_rt))),
+  sigma_cv  = list(meanlog = mean(log(peaks_obs$sigma_cv)),
+                   sdlog   = sd(log(peaks_obs$sigma_cv))),
+  intensity = list(meanlog = mean(log(peaks_obs$intensity)),
+                   sdlog   = sd(log(peaks_obs$intensity))),
+  noise     = list(mean = 0.005, sd = 0.005),
+  rt_loc_raw    = peaks_obs$rt_loc,
+  cv_loc_raw    = peaks_obs$cv_loc,
+  sigma_rt_raw  = peaks_obs$sigma_rt,
+  sigma_cv_raw  = peaks_obs$sigma_cv,
+  intensity_raw = peaks_obs$intensity
+)
+H <- 100L; W <- 30L
+```
+
+# 2. One training pair — what the model actually sees
+
+Every training step is a batch of `(noisy, clean)` pairs. The encoder-decoder gets `noisy` as input and is trained to output `clean`. This is the "denoising" task.
+
+```{r one-pair, fig.height = 3}
+set.seed(1)
+pair <- generate_one_synthetic(toy_params, H = H, W = W,
+                                add_noise = TRUE, noise_scale = 3.0)
+gridExtra::grid.arrange(
+  plot_mat(pair$clean, "clean (training target)",
+           limits = c(0, max(pair$noisy))),
+  plot_mat(pair$noisy, "noisy (encoder input)",
+           limits = c(0, max(pair$noisy))),
+  ncol = 2
+)
+```
+
+I set `noise_scale = 3.0` here (vs the default `1.0`) so the noise is visible on the plot. In a real run, sweep `c(1, 3, 5, 10)` and pick the highest value where `val_real` MSE stays flat.
+
+# 3. Train — a fast 5-epoch run
+
+```{r train, cache = TRUE}
+result <- pretrain_denoising_online(
+  toy_params,
+  H = H, W = W,
+  steps_per_epoch  = 30L,   # tiny for tutorial; production ~500
+  epochs           = 5L,    # tiny; production ~30
+  batch_size       = 16L,
+  lr               = 1e-3,
+  weight_decay     = 1e-4,
+  add_noise        = TRUE,
+  noise_scale      = 3.0,
+  size_jitter      = 0.15,
+  val_n            = 32L,
+  device           = "cpu",
+  seed             = 1L
+)
+```
+
+The returned object:
+
+```{r result-structure}
+str(result, max.level = 1)
+```
+
+# 4. Loss curves
+
+Two things to look at:
+
+```{r loss-curves, fig.height = 3.5}
+loss_df <- tibble(
+  epoch = seq_along(result$loss_history),
+  train_loss = result$loss_history,
+  val_loss   = if (!is.null(result$val_loss_history))
+                 result$val_loss_history else rep(NA, length(result$loss_history))
+)
+loss_long <- tidyr::pivot_longer(loss_df, cols = -epoch,
+                                  names_to = "split", values_to = "mse")
+ggplot(loss_long, aes(x = epoch, y = mse, color = split)) +
+  geom_line(size = 1.1) + geom_point(size = 2) +
+  scale_y_log10() +
+  labs(y = "MSE (log scale)",
+       title = "Training and validation MSE per epoch") +
+  theme_minimal()
+```
+
+**What to look for in a real run:**
+
+- **Both curves decreasing then plateauing** → healthy training. Stop around the plateau.
+- **Training keeps dropping while validation flattens or rises** → overfitting the synthetic distribution. Reduce `epochs` or `steps_per_epoch`, or increase `weight_decay`.
+- **Training and validation both flat and high** → the model isn't learning anything. Check that `noise_scale` isn't so high the input is uninformative, that `lr` isn't too small, and that the synthetic data isn't degenerate.
+- **Loss spikes** → increase `grad_clip` (tighten) or `norm_clamp`.
+
+At this tiny scale on 5 epochs the loss barely moves, so this plot is illustrative not diagnostic.
+
+# 5. Reconstruction on a fresh synthetic sample
+
+Feed a NEW synthetic sample through the trained autoencoder:
+
+```{r reconstruction, fig.height = 3.5}
+set.seed(99)
+test_pair <- generate_one_synthetic(toy_params, H = H, W = W,
+                                     add_noise = TRUE, noise_scale = 3.0)
+x <- torch::torch_tensor(test_pair$noisy, dtype = torch::torch_float())$
+  unsqueeze(1)$unsqueeze(1)
+torch::with_no_grad({ recon <- result$autoencoder(x) })
+recon_mat <- as.matrix(recon$squeeze()$to(device = "cpu"))
+
+lim <- c(0, max(c(test_pair$noisy, recon_mat)))
+gridExtra::grid.arrange(
+  plot_mat(test_pair$noisy, "noisy input", limits = lim),
+  plot_mat(test_pair$clean, "clean target", limits = lim),
+  plot_mat(recon_mat,       "reconstruction", limits = lim),
+  ncol = 3
+)
+```
+
+Reconstruction is imperfect after only 5 epochs on a tiny dataset — the point of the plot is to show *the flow*. In a real run you'd want the reconstruction visibly similar to the clean target, especially at peak locations.
+
+For real-data reconstruction QC (does the encoder generalize from synthetic to real?) use `reconstruct_real_samples()` with real preprocessed samples.
+
+# 6. The manifest
+
+If you passed `save_path`, three files are written each epoch: the encoder (`*.pt`), the full autoencoder (`*_autoencoder.pt`), and a manifest (`*_manifest.Rdata`). The manifest records the full hyperparameter configuration so a run is reproducible from disk:
+
+```{r manifest-fields}
+# str of what the manifest would contain (fields recorded per run)
+manifest_fields <- c(
+  "peak_params (the empirical distribution used)",
+  "hyperparams (H, W, epochs, batch_size, lr, weight_decay, add_noise,",
+  "  size_jitter, grad_clip, norm_clamp, val_n, dust_threshold,",
+  "  location_mode, location_jitter_rt/cv, attribute_mode, noise_scale,",
+  "  val_real_n, checkpoint_every, stem_stride_rt/cv, device, seed)",
+  "loss_history (train MSE per epoch)",
+  "val_loss_history (synthetic validation MSE per epoch)",
+  "real_val_loss_history (if val_real was passed)",
+  "batch_loss_stats (median/p95/max loss diagnostics per epoch)",
+  "last_epoch_completed (for resume_from)"
+)
+cat(manifest_fields, sep = "\n")
+```
+
+# Practical tips
+
+- **Always pass `val_real`** in real runs — it's the single most useful signal for whether synthetic pretraining generalizes.
+- **Set `save_path`** — a crash mid-epoch loses hours otherwise.
+- **`num_workers > 1`** helps a lot on GPU/MPS backends where the GPU otherwise sits idle waiting for R to prepare the next batch. A reasonable choice on M-series is `num_workers = N_performance_cores - 2`.
+- **For a first run on a new cohort**: leave everything at defaults except `H`, `W`, `save_path`, and `val_real`. Only tune `noise_scale` and `size_jitter` if the encoder underperforms on classification.
