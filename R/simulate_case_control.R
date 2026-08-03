@@ -169,6 +169,48 @@ build_biomarker_spec <- function(templates,
   templates
 }
 
+#' Maximally-favorable ("sanity-max") biomarker scenario
+#'
+#' Combines every lever we have in the direction of "make signal
+#' impossible to miss":
+#' \itemize{
+#'   \item 5 biomarkers (collective signal, not one lone peak)
+#'   \item Drawn from top 5% of pool by intensity
+#'   \item Perfect presence / absence: `case_prevalence = 1.0`,
+#'     `control_prevalence = 0.0`
+#'   \item Case intensity multiplier = 10x
+#'   \item Sparse background: `n_peaks$mean = 30` and
+#'     `n_peaks$sd = 5` overwritten on the returned peak_params so
+#'     synthetic samples have only ~30 background peaks rather than
+#'     ~1300, making injected biomarkers dominate total image intensity
+#' }
+#'
+#' Intended as a **pipeline validation** scenario, not a difficulty
+#' benchmark: if case/control AUC on this scenario is < 0.95, something
+#' in the pipeline is broken and Levels 1/2/3 are not worth running.
+#'
+#' @inheritParams biomarkers_level1
+#' @return list(biomarkers, background_peak_params) — pass both to
+#'   [simulate_case_control_cohort()].
+#' @export
+biomarkers_sanity_max <- function(peak_params, seed = NULL) {
+  ho <- holdout_biomarkers(peak_params, n_biomarkers = 5L,
+                            min_intensity_quantile = 0.95,
+                            seed = seed)
+  bg <- ho$background_peak_params
+  # Force sparse background so injected biomarkers dominate.
+  bg$n_peaks$mean <- 30
+  bg$n_peaks$sd   <- 5
+  spec <- build_biomarker_spec(
+    ho$biomarker_templates,
+    case_prevalence        = 1.0,
+    control_prevalence     = 0.0,
+    case_intensity_mult    = 10.0,
+    control_intensity_mult = 1.0
+  )
+  list(biomarkers = spec, background_peak_params = bg)
+}
+
 #' Level 1 (sanity check) biomarker scenario
 #'
 #' 1 biomarker drawn from the *top 10% brightest* pool peaks

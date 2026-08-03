@@ -1,0 +1,346 @@
+---
+title: "Pipeline sanity check — does the full stack work at all?"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 3.5, dpi = 96)
+library(classydms)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(pROC)
+
+plot_mat <- function(mat, title = "", low = "white", high = "#B2182B",
+                     limits = NULL) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() +
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        name = "intensity", oob = scales::squish) +
+    scale_y_reverse() +
+    coord_fixed(ratio = 0.5) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank())
+}
+plot_diverging <- function(mat, title = "", limits = NULL) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  if (is.null(limits)) limits <- c(-1, 1) * max(abs(mat))
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                          midpoint = 0, limits = limits, name = "saliency",
+                          oob = scales::squish) +
+    scale_y_reverse() +
+    coord_fixed(ratio = 0.5) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank())
+}
+```
+
+# Purpose
+
+Every previous tutorial builds intuition for *one* function. This one runs the **entire pipeline** — synthesize → pretrain → classify → interpret — under maximally-favorable conditions and asks:
+
+- **Does the classifier detect an injected signal we know is there?**
+- **Do the encoder's features actually vary with class?**
+- **Does the saliency map put its hotspot at the injected biomarker?**
+- **How much do these results depend on cohort size?**
+
+If Level-1 case/control AUC on your real cohort is coming back near chance (0.50–0.60), something is likely broken. The right diagnostic move is to run this scenario, which is designed so that if AUC isn't ≥ 0.95 there's a pipeline bug, not just a hard signal.
+
+The tutorial uses small `150 × 30` images so a full pretrain + classify + saliency run finishes in about a minute on CPU.
+
+# 1. The sanity-max scenario
+
+`biomarkers_sanity_max()` combines every "make the signal easy" lever we have:
+
+| Lever | Value | Rationale |
+|---|---|---|
+| # biomarkers | 5 | Collective signal, not one lone peak |
+| Intensity quantile pool | top 5% | Bright observed peaks |
+| Case prevalence | 1.00 | Present in every case |
+| Control prevalence | 0.00 | Never in controls |
+| Case intensity multiplier | 10× | Very bright injection |
+| Background `n_peaks$mean` | 30 | Sparse — biomarkers dominate |
+
+Compared to Level 1 (~1300 peaks background, 1 biomarker, 5× mult), sanity-max shrinks background by ~40× and grows signal by ~50×. Signal fraction of total image intensity jumps from ~3% to well over 50%.
+
+```{r toy-params}
+# A procedurally-built toy pool of ~200 peaks spread across the image
+# so top-5% quantile filtering has enough candidates. Real cohorts have
+# many thousands of pool peaks.
+set.seed(1)
+N_POOL <- 200L
+peaks_obs <- tibble(
+  rt_loc    = runif(N_POOL, 0.10, 0.90),
+  cv_loc    = runif(N_POOL, 0.15, 0.85),
+  sigma_rt  = exp(rnorm(N_POOL, log(4),   0.4)),
+  sigma_cv  = exp(rnorm(N_POOL, log(1.5), 0.3)),
+  intensity = exp(rnorm(N_POOL, log(0.5), 0.7))
+)
+toy_params <- list(
+  n_peaks_detected = nrow(peaks_obs),
+  n_peaks   = list(mean = 20, sd = 5),
+  rt_loc    = list(mean = mean(peaks_obs$rt_loc), sd = sd(peaks_obs$rt_loc)),
+  cv_loc    = list(mean = mean(peaks_obs$cv_loc), sd = sd(peaks_obs$cv_loc)),
+  sigma_rt  = list(meanlog = mean(log(peaks_obs$sigma_rt)),
+                   sdlog   = sd(log(peaks_obs$sigma_rt))),
+  sigma_cv  = list(meanlog = mean(log(peaks_obs$sigma_cv)),
+                   sdlog   = sd(log(peaks_obs$sigma_cv))),
+  intensity = list(meanlog = mean(log(peaks_obs$intensity)),
+                   sdlog   = sd(log(peaks_obs$intensity))),
+  noise     = list(mean = 0.005, sd = 0.005),
+  rt_loc_raw    = peaks_obs$rt_loc,
+  cv_loc_raw    = peaks_obs$cv_loc,
+  sigma_rt_raw  = peaks_obs$sigma_rt,
+  sigma_cv_raw  = peaks_obs$sigma_cv,
+  intensity_raw = peaks_obs$intensity
+)
+H <- 150L; W <- 30L
+cat(sprintf("Pool: %d peaks. Intensity quantiles (25/50/95/100%%):\n",
+            N_POOL))
+print(round(quantile(peaks_obs$intensity, c(0.25, 0.50, 0.95, 1.0)), 3))
+```
+
+```{r scenario}
+scenario <- biomarkers_sanity_max(toy_params, seed = 42L)
+cat("Biomarker templates:\n")
+print(scenario$biomarkers)
+cat("\nBackground n_peaks setting (should be 30):",
+    scenario$background_peak_params$n_peaks$mean, "\n")
+```
+
+# 2. Simulate the cohort
+
+Use a moderate-size cohort (60 case + 60 control) — enough for stable 5-fold CV.
+
+```{r simulate, cache = TRUE}
+sim <- simulate_case_control_cohort(
+  scenario$background_peak_params, scenario$biomarkers,
+  n_cases = 60L, n_controls = 60L,
+  H = H, W = W, seed = 7L
+)
+Z_list <- lapply(sim$samples, `[[`, "Z")
+y <- sim$y
+table(y, dnn = "class (2 = case, 1 = control)")
+
+# Sanity: every case should have every biomarker fired
+sprintf("Biomarker firing per class (should be 1.00 for cases, 0.00 for controls):")
+firing <- as.data.frame(sim$per_sample_firing)
+firing$class <- factor(y, levels = c(1, 2), labels = c("control", "case"))
+firing |>
+  tidyr::pivot_longer(-class, names_to = "biomarker", values_to = "fired") |>
+  group_by(class) |> summarise(prevalence = mean(fired), .groups = "drop")
+```
+
+Visualize one case vs one control on log scale + diff:
+
+```{r sim-viz, fig.height = 4}
+Z_case    <- Z_list[[which(y == 2L)[1]]]
+Z_control <- Z_list[[which(y == 1L)[1]]]
+Z_diff    <- Z_case - Z_control
+
+biom <- scenario$biomarkers
+b_r <- biom$rt_loc * H
+b_c <- biom$cv_loc * W
+mark_biomarkers <- function(p) {
+  p + annotate("point", x = b_c, y = b_r, shape = 21, color = "cyan",
+               fill = NA, size = 6, stroke = 1.2)
+}
+
+lim <- c(0, max(c(Z_case, Z_control)))
+gridExtra::grid.arrange(
+  mark_biomarkers(plot_mat(Z_case, "case sample", limits = lim)),
+  mark_biomarkers(plot_mat(Z_control, "control sample", limits = lim)),
+  mark_biomarkers(plot_diverging(Z_diff, "case - control")),
+  ncol = 3
+)
+```
+
+Every cyan circle in the case panel should have a red blob (biomarker fired), and none of them in the control panel. The diff panel should be dominated by red at biomarker locations.
+
+# 3. Pretrain the encoder
+
+Fast pretraining directly from the (sparse) `background_peak_params`. The encoder is class-agnostic — it just learns the general "peak on background" structure of the sparse-background distribution.
+
+```{r pretrain, cache = TRUE}
+pretrain_result <- pretrain_denoising_online(
+  scenario$background_peak_params,
+  H = H, W = W,
+  steps_per_epoch = 50L, epochs = 8L, batch_size = 16L,
+  noise_scale = 3.0, val_n = 32L,
+  device = "cpu", seed = 1L
+)
+encoder <- pretrain_result$encoder
+```
+
+# 4. Encoder-channel sanity check
+
+**Before touching the classifier**, ask: do any of the 64 encoder channels actually vary with class? If none do, the encoder isn't seeing the class-associated content and there's nothing for the elastic net to work with. If some do, the elastic net should be able to use them.
+
+```{r encoder-channel-check, fig.height = 3.5}
+feats <- extract_encoder_features(encoder, Z_list, device = "cpu")
+dim(feats)
+
+# Per-channel Wilcoxon by class
+p_raw <- sapply(seq_len(64L), function(c)
+  suppressWarnings(wilcox.test(feats[y == 2L, c], feats[y == 1L, c])$p.value))
+p_bh <- p.adjust(p_raw, method = "BH")
+
+sig_alpha_05  <- sum(p_bh < 0.05, na.rm = TRUE)
+sig_alpha_001 <- sum(p_bh < 0.001, na.rm = TRUE)
+sprintf("Encoder channels with BH-FDR-significant class difference:")
+sprintf("  q < 0.05:  %d / 64", sig_alpha_05)
+sprintf("  q < 0.001: %d / 64", sig_alpha_001)
+
+ch_df <- tibble(channel = seq_len(64L), p_raw = p_raw, p_bh = p_bh) |>
+  arrange(p_bh)
+ggplot(ch_df, aes(x = seq_len(64), y = -log10(p_bh))) +
+  geom_col(fill = "#B2182B") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = -log10(0.001), linetype = "dashed", color = "grey60") +
+  labs(x = "encoder channel (sorted by significance)",
+       y = "-log10(BH-adjusted p)",
+       title = "Per-channel Wilcoxon between cases and controls") +
+  theme_minimal()
+```
+
+**How to read this:**
+
+- **Many significant channels** = encoder is representing class content well. Elastic net will have signal to work with.
+- **Very few** = encoder doesn't distinguish cases from controls at the feature level. Elastic net can't recover what isn't in its input. Fix upstream (more pretraining, different `noise_scale`, more diverse pretraining distribution).
+- **None** = pipeline is broken somewhere before the classifier.
+
+# 5. Classify — case/control AUC
+
+```{r classify}
+elnet <- cv_encoder_elastic_net(
+  encoder, Z_list = Z_list, y = y,
+  k = 5L, alpha = 0.5, seed = 1L
+)
+sprintf("Case/control AUC (5-fold CV): %.3f", elnet$auc)
+sprintf("Non-zero elastic-net coefficients: %d / 64", sum(elnet$coefs != 0))
+```
+
+**Acceptance targets for sanity-max:**
+
+- AUC ≥ 0.95: pipeline is healthy, move on to progressively harder scenarios.
+- AUC 0.75–0.95: pipeline works but there's something to improve. Likely: encoder pretraining under-fits (increase epochs) or noise_scale too high.
+- AUC < 0.75 despite the aggressive sanity-max settings: something is broken. Check the encoder-channel Wilcoxon in step 4 — if no channels are significant, look at the encoder (dead channels? bad pretraining loss?). If channels ARE significant but elastic net misses them, look at the classifier (regularization too aggressive? fold size too small?).
+
+# 6. Saliency + biomarker recovery
+
+```{r saliency, fig.height = 4}
+case_indices    <- which(y == 2L)
+control_indices <- which(y == 1L)
+orig_dims <- lapply(sim$samples, function(s) c(H = nrow(s$Z), W = ncol(s$Z)))
+
+sal_cases    <- aggregate_saliency_masked(encoder, Z_list,
+                                            coefs = elnet$coefs,
+                                            sample_indices = case_indices,
+                                            orig_dims = orig_dims)
+sal_controls <- aggregate_saliency_masked(encoder, Z_list,
+                                            coefs = elnet$coefs,
+                                            sample_indices = control_indices,
+                                            orig_dims = orig_dims)
+
+lim <- c(-1, 1) * max(abs(c(sal_cases, sal_controls)))
+gridExtra::grid.arrange(
+  mark_biomarkers(plot_diverging(sal_cases,    "saliency: cases", limits = lim)),
+  mark_biomarkers(plot_diverging(sal_controls, "saliency: controls", limits = lim)),
+  ncol = 2
+)
+
+recovery <- evaluate_biomarker_recovery(
+  sal_cases, scenario$biomarkers,
+  H = H, W = W,
+  match_radius_rt = 8L, match_radius_cv = 2L,
+  top_k = 5L
+)
+sprintf("Per-pixel biomarker recovery AUC: %.3f",  recovery$auc_per_pixel)
+sprintf("Recall @ top-5: %.3f", recovery$recall_at_k)
+sprintf("Precision @ top-5: %.3f", recovery$precision_at_k)
+```
+
+**Acceptance targets:**
+
+- Per-pixel AUC ≥ 0.85 on sanity-max
+- Recall @ top-5 ≥ 0.60 (at least 3 of 5 biomarkers land in the top-5 saliency hotspots)
+
+# 7. Cohort size sweep — does bigger help?
+
+Fix the encoder, vary the classifier cohort. Subsample the simulated cohort to different sizes and re-run classification only. This isolates cohort-size effect on the elastic net from cohort-size effect on encoder training.
+
+```{r size-sweep, fig.height = 3.5, cache = TRUE}
+sizes <- c(10L, 20L, 40L, 60L)
+n_reps <- 5L  # different random subsamples per size for a variance estimate
+
+sweep <- lapply(sizes, function(n) {
+  aucs <- sapply(seq_len(n_reps), function(rep) {
+    set.seed(100L + n * 10L + rep)
+    case_sub <- sample(case_indices, n)
+    ctrl_sub <- sample(control_indices, n)
+    idx <- c(case_sub, ctrl_sub)
+    fit <- cv_encoder_elastic_net(encoder, Z_list[idx], y[idx],
+                                   k = 5L, alpha = 0.5, seed = 1L)
+    fit$auc
+  })
+  tibble(n_per_class = n,
+         auc_mean = mean(aucs), auc_sd = sd(aucs),
+         auc_lo = quantile(aucs, 0.25), auc_hi = quantile(aucs, 0.75))
+})
+sweep_df <- bind_rows(sweep)
+sweep_df
+
+ggplot(sweep_df, aes(x = n_per_class, y = auc_mean)) +
+  geom_ribbon(aes(ymin = auc_lo, ymax = auc_hi), alpha = 0.2, fill = "#B2182B") +
+  geom_line(color = "#B2182B", size = 1.1) +
+  geom_point(color = "#B2182B", size = 3) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey60") +
+  scale_x_continuous(breaks = sizes) +
+  labs(x = "samples per class", y = "case/control AUC",
+       title = sprintf("Effect of cohort size (%d reps per size)", n_reps),
+       subtitle = "Encoder fixed; only the classifier cohort varies") +
+  ylim(0.4, 1.0) +
+  theme_minimal()
+```
+
+**How to read this:**
+
+- **Monotone increase, flattening after N = 40–60** = you have enough samples per class to make the classifier stable. Adding more is diminishing returns.
+- **Steep increase across all sizes with no plateau** = you need more samples. Scale up cohort.
+- **Flat and low across all sizes** = the signal is too weak for the classifier to detect regardless of cohort size. The problem is upstream (encoder, pretraining, biomarker strength), not sample count.
+- **High variance (wide ribbon)** = classifier is unstable in your regime; consider larger `k` in CV or averaging across seeds.
+
+# Summary — what to conclude
+
+Compare your results against these acceptance targets:
+
+| Metric | Sanity-max target | Your result | Verdict |
+|---|---|---|---|
+| Case/control AUC | ≥ 0.95 | (fill in) | pass / borderline / fail |
+| Encoder-channel Wilcoxon (BH q < 0.05) | ≥ 20 / 64 | (fill in) | pass / borderline / fail |
+| Biomarker recovery per-pixel AUC | ≥ 0.85 | (fill in) | pass / borderline / fail |
+| Cohort-size curve | monotone, plateau by N=60 | (fill in) | pass / borderline / fail |
+
+If all four are green, the pipeline mechanics are sound and you can climb the difficulty ladder (Level 1 → Level 2 → Level 3, then real cohorts). If any are red, investigate that specific piece before running longer / bigger.
+
+# Future experiments to plug in here
+
+Ideas noted for later — not implemented yet:
+
+- **Pretrain on a broader distribution than the simulation.** Currently the encoder is trained on `scenario$background_peak_params`, which is derived from the same base distribution as the simulation. Inflate `n_peaks$mean`, widen `size_jitter`, or pretrain from a different real cohort's params to test whether a more diverse pretraining distribution improves generalization.
+- **Vary encoder pretraining cohort size.** Same as the classifier-cohort sweep in section 7, but retrain the encoder at each size. Isolates encoder-training-cohort effect from classifier-cohort effect.
+- **Vary encoder architecture.** Bottleneck dimension (currently 64), stem strides, number of ResNet blocks. These are architecture changes so they need code edits, not just arg changes.
