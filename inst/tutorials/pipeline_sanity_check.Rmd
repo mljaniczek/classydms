@@ -337,6 +337,202 @@ Compare your results against these acceptance targets:
 
 If all four are green, the pipeline mechanics are sound and you can climb the difficulty ladder (Level 1 → Level 2 → Level 3, then real cohorts). If any are red, investigate that specific piece before running longer / bigger.
 
+# 8. Realistic-intensity scenario
+
+Sanity-max multiplied biomarker intensity by 10× so the injected signal was visually obvious. In real GC-DMS biomarker studies the differential compounds are often *at the same intensity scale* as background peaks — the signal comes from **which peaks are present**, not from any one peak being dramatically brighter.
+
+This section keeps the sanity property (perfect presence in cases, complete absence in controls) but removes both the intensity multiplier and the top-quantile bias, so biomarkers are drawn from the same distribution as background peaks. Visually indistinguishable from background peaks in a single sample; only the systematic presence/absence across samples reveals them.
+
+```{r realistic-scenario}
+# Build a realistic-intensity scenario manually rather than through a
+# level preset. Uniform quantile means biomarkers can come from anywhere
+# in the pool; case_intensity_mult = 1.0 means no boost.
+ho_r <- holdout_biomarkers(toy_params, n_biomarkers = 5L,
+                            min_intensity_quantile = NULL,
+                            seed = 42L)
+bg_r <- ho_r$background_peak_params
+bg_r$n_peaks$mean <- 30
+bg_r$n_peaks$sd   <- 5
+
+biom_r <- build_biomarker_spec(
+  ho_r$biomarker_templates,
+  case_prevalence        = 1.0,
+  control_prevalence     = 0.0,
+  case_intensity_mult    = 1.0,    # <-- no boost
+  control_intensity_mult = 1.0
+)
+
+# Compare biomarker intensity ranges between scenarios
+smx_min <- min(scenario$biomarkers$intensity)
+smx_max <- max(scenario$biomarkers$intensity)
+smx_mlt <- scenario$biomarkers$case_intensity_mult[1]
+rea_min <- min(biom_r$intensity)
+rea_max <- max(biom_r$intensity)
+
+tibble(
+  scenario = c("sanity-max", "realistic"),
+  biomarker_intensity_range = c(
+    paste0(round(smx_min, 2), " - ", round(smx_max, 2)),
+    paste0(round(rea_min, 2), " - ", round(rea_max, 2))
+  ),
+  case_intensity_mult = c(smx_mlt, 1.0),
+  effective_case_amp_range = c(
+    paste0(round(smx_min * smx_mlt, 2), " - ",
+           round(smx_max * smx_mlt, 2)),
+    paste0(round(rea_min, 2), " - ", round(rea_max, 2))
+  )
+) |> knitr::kable(align = "lrrr")
+```
+
+## Simulate the realistic cohort
+
+```{r realistic-simulate, cache = TRUE}
+sim_r <- simulate_case_control_cohort(
+  bg_r, biom_r,
+  n_cases = 60L, n_controls = 60L,
+  H = H, W = W, seed = 11L
+)
+Z_r <- lapply(sim_r$samples, `[[`, "Z")
+y_r <- sim_r$y
+b_r_pos <- biom_r$rt_loc * H
+b_c_pos <- biom_r$cv_loc * W
+```
+
+Visualize a case and a control on their **own** intensity scale (so the reader can see that biomarker peaks look just like background peaks):
+
+```{r realistic-viz, fig.height = 4}
+Z_case_r    <- Z_r[[which(y_r == 2L)[1]]]
+Z_ctrl_r    <- Z_r[[which(y_r == 1L)[1]]]
+Z_diff_r    <- Z_case_r - Z_ctrl_r
+mark_r <- function(p) {
+  p + annotate("point", x = b_c_pos, y = b_r_pos, shape = 21,
+               color = "cyan", fill = NA, size = 6, stroke = 1.2)
+}
+lim_r <- c(0, max(c(Z_case_r, Z_ctrl_r)))
+gridExtra::grid.arrange(
+  mark_r(plot_mat(Z_case_r, "case", limits = lim_r)),
+  mark_r(plot_mat(Z_ctrl_r, "control", limits = lim_r)),
+  mark_r(plot_diverging(Z_diff_r, "case - control")),
+  ncol = 3
+)
+```
+
+The biomarker circles in the case panel should be filled in with peaks that are **the same brightness** as any other peak on the canvas — no visual distinction. The control panel should have empty circles (no peak at those exact locations). The diff panel shows the systematic signal despite that visual overlap.
+
+## Retrain the encoder on the realistic background
+
+Principled evaluation requires a fresh encoder trained without leakage from the biomarker regions in *this* scenario. Even though the peak morphology distribution is similar to sanity-max, the specific peaks held out differ, so retraining is the right move.
+
+```{r realistic-pretrain, cache = TRUE}
+pretrain_r <- pretrain_denoising_online(
+  bg_r,
+  H = H, W = W,
+  steps_per_epoch = 50L, epochs = 8L, batch_size = 16L,
+  noise_scale = 3.0, val_n = 32L,
+  device = "cpu", seed = 1L
+)
+encoder_r <- pretrain_r$encoder
+```
+
+## Encoder-channel sanity check on the realistic scenario
+
+```{r realistic-encoder-check, fig.height = 3.5}
+feats_r <- extract_encoder_features(encoder_r, Z_r, device = "cpu")
+p_raw_r <- sapply(seq_len(64L), function(c)
+  suppressWarnings(wilcox.test(feats_r[y_r == 2L, c],
+                                feats_r[y_r == 1L, c])$p.value))
+p_bh_r  <- p.adjust(p_raw_r, method = "BH")
+
+sig_r_05  <- sum(p_bh_r < 0.05, na.rm = TRUE)
+sig_r_001 <- sum(p_bh_r < 0.001, na.rm = TRUE)
+sprintf("Realistic — Encoder channels significant at BH q < 0.05:  %d / 64", sig_r_05)
+sprintf("Realistic — Encoder channels significant at BH q < 0.001: %d / 64", sig_r_001)
+
+ggplot(tibble(channel = seq_len(64L), p_bh = p_bh_r),
+       aes(x = channel, y = -log10(p_bh))) +
+  geom_col(fill = "#B2182B") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = -log10(0.001), linetype = "dashed", color = "grey60") +
+  labs(x = "encoder channel", y = "-log10(BH q)",
+       title = "Realistic scenario: per-channel Wilcoxon by class") +
+  theme_minimal()
+```
+
+## Classification and biomarker recovery
+
+```{r realistic-classify}
+elnet_r <- cv_encoder_elastic_net(
+  encoder_r, Z_list = Z_r, y = y_r,
+  k = 5L, alpha = 0.5, seed = 1L
+)
+sprintf("Realistic — case/control AUC (5-fold CV): %.3f", elnet_r$auc)
+sprintf("Realistic — non-zero elastic-net coefs: %d / 64",
+        sum(elnet_r$coefs != 0))
+```
+
+```{r realistic-saliency, fig.height = 4}
+case_idx_r <- which(y_r == 2L); control_idx_r <- which(y_r == 1L)
+orig_dims_r <- lapply(sim_r$samples,
+                       function(s) c(H = nrow(s$Z), W = ncol(s$Z)))
+
+sal_r <- aggregate_saliency_masked(encoder_r, Z_r,
+                                     coefs = elnet_r$coefs,
+                                     sample_indices = case_idx_r,
+                                     orig_dims = orig_dims_r)
+sal_ctrl_r <- aggregate_saliency_masked(encoder_r, Z_r,
+                                          coefs = elnet_r$coefs,
+                                          sample_indices = control_idx_r,
+                                          orig_dims = orig_dims_r)
+lim_s <- c(-1, 1) * max(abs(c(sal_r, sal_ctrl_r)))
+gridExtra::grid.arrange(
+  mark_r(plot_diverging(sal_r,      "saliency: cases", limits = lim_s)),
+  mark_r(plot_diverging(sal_ctrl_r, "saliency: controls", limits = lim_s)),
+  ncol = 2
+)
+
+recovery_r <- evaluate_biomarker_recovery(
+  sal_r, biom_r, H = H, W = W,
+  match_radius_rt = 8L, match_radius_cv = 2L, top_k = 5L
+)
+sprintf("Realistic — biomarker recovery per-pixel AUC: %.3f",
+        recovery_r$auc_per_pixel)
+sprintf("Realistic — recall @ top-5: %.3f",  recovery_r$recall_at_k)
+sprintf("Realistic — precision @ top-5: %.3f", recovery_r$precision_at_k)
+```
+
+## Comparison: sanity-max vs realistic-intensity
+
+```{r comparison}
+tibble(
+  metric = c("case/control AUC",
+             "encoder channels (BH q < 0.05)",
+             "encoder channels (BH q < 0.001)",
+             "biomarker recovery per-pixel AUC",
+             "recall @ top-5",
+             "precision @ top-5"),
+  sanity_max = c(sprintf("%.3f", elnet$auc),
+                 sprintf("%d / 64", sig_alpha_05),
+                 sprintf("%d / 64", sig_alpha_001),
+                 sprintf("%.3f", recovery$auc_per_pixel),
+                 sprintf("%.3f", recovery$recall_at_k),
+                 sprintf("%.3f", recovery$precision_at_k)),
+  realistic = c(sprintf("%.3f", elnet_r$auc),
+                sprintf("%d / 64", sig_r_05),
+                sprintf("%d / 64", sig_r_001),
+                sprintf("%.3f", recovery_r$auc_per_pixel),
+                sprintf("%.3f", recovery_r$recall_at_k),
+                sprintf("%.3f", recovery_r$precision_at_k))
+) |> knitr::kable(align = "lrr")
+```
+
+**What to read from this comparison:**
+
+- **Case/control AUC drops but should stay well above chance** if the pipeline is honestly leveraging the presence/absence pattern rather than the intensity shift. Below ~0.85 on the realistic scenario means the classifier was primarily riding the intensity multiplier in sanity-max rather than learning "biomarker present at these coords".
+- **Fewer significant encoder channels** is expected — signal in feature space is less pronounced without the intensity boost. But some should still be significant if the encoder is representing presence-vs-absence rather than intensity.
+- **Biomarker recovery AUC** tells you whether saliency still points at the right spatial regions. If classification AUC is good but recovery AUC drops sharply, the classifier is finding the signal through some non-spatial shortcut — worth investigating.
+
+If AUC on the realistic scenario stays above ~0.85, the pipeline is genuinely learning the presence/absence structure and not just riding a big intensity difference. That's the more realistic capability for actual biomarker discovery.
+
 # Future experiments to plug in here
 
 Ideas noted for later — not implemented yet:
@@ -344,3 +540,5 @@ Ideas noted for later — not implemented yet:
 - **Pretrain on a broader distribution than the simulation.** Currently the encoder is trained on `scenario$background_peak_params`, which is derived from the same base distribution as the simulation. Inflate `n_peaks$mean`, widen `size_jitter`, or pretrain from a different real cohort's params to test whether a more diverse pretraining distribution improves generalization.
 - **Vary encoder pretraining cohort size.** Same as the classifier-cohort sweep in section 7, but retrain the encoder at each size. Isolates encoder-training-cohort effect from classifier-cohort effect.
 - **Vary encoder architecture.** Bottleneck dimension (currently 64), stem strides, number of ResNet blocks. These are architecture changes so they need code edits, not just arg changes.
+- **Intermediate intensity levels.** Sweep `case_intensity_mult` between 1.0 and 10.0 to find where classification AUC starts to fall off. Maps the "difficulty vs multiplier" curve.
+- **Weaker presence/absence.** Combine the realistic-intensity setup with imperfect prevalence (e.g. `case_prev = 0.85, control_prev = 0.15`) to approach real-cohort conditions.
