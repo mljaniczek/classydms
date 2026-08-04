@@ -277,9 +277,11 @@ build_peak_catalog <- function(peak_params,
   # Precompute per-cluster member index vectors.
   cluster_members <- split(seq_len(n_peaks), cluster_id)
 
+  n_cohort_samples <- n_samples   # avoid shadowing inside tibble()
   cluster_rows <- lapply(seq_len(n_clusters), function(cid) {
     members <- cluster_members[[as.character(cid)]]
     unique_samples <- unique(sample_idx[members])
+    n_uniq <- length(unique_samples)
     tibble::tibble(
       compound_id     = cid,
       rt_loc          = stats::median(rt[members]),
@@ -289,8 +291,8 @@ build_peak_catalog <- function(peak_params,
       location_sd_cv  = if (length(members) > 1L)
                           stats::sd(cv[members]) else 0,
       n_observations  = length(members),
-      n_samples       = length(unique_samples),
-      prevalence      = length(unique_samples) / n_samples,
+      n_samples       = n_uniq,
+      prevalence      = n_uniq / n_cohort_samples,
       sigma_rt_obs    = list(peak_params$sigma_rt_raw[members]),
       sigma_cv_obs    = list(peak_params$sigma_cv_raw[members]),
       intensity_obs   = list(intensity[members]),
