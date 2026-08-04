@@ -420,6 +420,78 @@ catalog_summary <- function(catalog,
   invisible(out)
 }
 
+#' Compactness diagnostic for a peak catalog
+#'
+#' Reports statistics that reveal whether the clustering radius is
+#' set correctly. The key statistic is `median_obs_per_sample` — the
+#' typical number of pool peaks each compound catches per sample. A
+#' well-clustered catalog has this near 1.0 (each real compound
+#' contributes one peak per sample on average). Values noticeably
+#' above 1.0 mean the clusters are wide enough to catch multiple
+#' distinct peaks from the same sample, indicating over-merging — a
+#' looser eps than the true compound-position separation.
+#'
+#' Also reports the distribution of location-spread within compounds
+#' (in pixel units at a specified target image size, default native
+#' `1400 x 40`), and the fraction of compounds passing progressively
+#' stricter prevalence thresholds.
+#'
+#' @param catalog A `peak_catalog` object.
+#' @param H,W Image dimensions in pixels used to convert location
+#'   spread from fraction back to pixels. Defaults `1400 x 40` (native
+#'   GC-DMS). Pass your actual padded / trimmed dimensions for
+#'   accurate diagnostics.
+#' @param over_merge_threshold Cutoff above which a compound is
+#'   flagged as over-merged. Default `1.5` (a compound catching more
+#'   than 1.5 pool peaks per sample on average is suspect).
+#'
+#' @return A one-row tibble with compactness statistics. Also invisibly
+#'   returns the underlying per-compound data if you want to inspect
+#'   individual compounds via `attr(x, "per_compound")`.
+#' @export
+catalog_compactness <- function(catalog,
+                                 H = 1400L, W = 40L,
+                                 over_merge_threshold = 1.5) {
+  stopifnot(inherits(catalog, "peak_catalog"))
+  if (nrow(catalog$compounds) == 0L) {
+    return(tibble::tibble(
+      n_compounds            = 0L,
+      median_obs_per_sample  = NA_real_,
+      q75_obs_per_sample     = NA_real_,
+      max_obs_per_sample     = NA_real_,
+      frac_over_merged       = NA_real_,
+      median_loc_sd_rt_px    = NA_real_,
+      q95_loc_sd_rt_px       = NA_real_,
+      median_loc_sd_cv_px    = NA_real_,
+      q95_loc_sd_cv_px       = NA_real_,
+      pct_anchor_gte_90pct   = NA_real_,
+      pct_anchor_gte_99pct   = NA_real_
+    ))
+  }
+  per_compound <- dplyr::mutate(catalog$compounds,
+    obs_per_sample = n_observations / n_samples,
+    loc_sd_rt_px   = location_sd_rt * H,
+    loc_sd_cv_px   = location_sd_cv * W
+  )
+  qtile <- function(x, p) as.numeric(stats::quantile(x, p, na.rm = TRUE))
+  out <- tibble::tibble(
+    n_compounds            = nrow(catalog$compounds),
+    median_obs_per_sample  = stats::median(per_compound$obs_per_sample),
+    q75_obs_per_sample     = qtile(per_compound$obs_per_sample, 0.75),
+    max_obs_per_sample     = max(per_compound$obs_per_sample),
+    frac_over_merged       = mean(per_compound$obs_per_sample >
+                                     over_merge_threshold),
+    median_loc_sd_rt_px    = stats::median(per_compound$loc_sd_rt_px),
+    q95_loc_sd_rt_px       = qtile(per_compound$loc_sd_rt_px, 0.95),
+    median_loc_sd_cv_px    = stats::median(per_compound$loc_sd_cv_px),
+    q95_loc_sd_cv_px       = qtile(per_compound$loc_sd_cv_px, 0.95),
+    pct_anchor_gte_90pct   = 100 * mean(catalog$compounds$prevalence >= 0.90),
+    pct_anchor_gte_99pct   = 100 * mean(catalog$compounds$prevalence >= 0.99)
+  )
+  attr(out, "per_compound") <- per_compound
+  out
+}
+
 #' Plot the spatial distribution of a peak catalog
 #'
 #' Compound positions are shown as red points sized by prevalence,
