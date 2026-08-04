@@ -67,6 +67,110 @@ backfill_sample_idx_raw <- function(peak_params, sample_names = NULL) {
   peak_params
 }
 
+#' Subset a peak_params object to a chosen set of samples
+#'
+#' Given a `peak_params` object with `sample_idx_raw` (or after
+#' [backfill_sample_idx_raw()]), returns a new `peak_params` containing
+#' only the peaks and metadata for the specified samples. Useful for
+#' building per-condition catalogs from a single pooled
+#' `estimate_peak_params` run — split a combined disease+control
+#' `peak_params` into `pp_disease` and `pp_control` without rerunning
+#' the expensive step.
+#'
+#' Sample indices in the returned object are remapped to `1:length(sample_indices)`
+#' so downstream tools that expect contiguous 1-based indexing work.
+#' `sample_names`, if present, are subset to match. Fitted summary
+#' statistics (`rt_loc$mean/sd`, `sigma_rt$meanlog/sdlog`, etc.) are
+#' recomputed from the subset; noise stats are kept as-is (pooled
+#' across samples in the original run, which is usually close enough
+#' unless the condition of interest has systematically different
+#' background noise).
+#'
+#' @param peak_params A `peak_params` object with `sample_idx_raw`.
+#' @param sample_indices Integer vector of sample indices (in the
+#'   original peak_params' 1..n_samples space) to keep. Common
+#'   pattern: `which(y == disease_label)`.
+#' @return A `peak_params`-shaped list containing only the specified
+#'   samples' peaks. Ready to pass to [build_peak_catalog()] and other
+#'   downstream tools.
+#' @export
+subset_peak_params <- function(peak_params, sample_indices) {
+  if (is.null(peak_params$sample_idx_raw)) {
+    stop("subset_peak_params: peak_params$sample_idx_raw is missing. ",
+         "Call backfill_sample_idx_raw() first, or rerun ",
+         "estimate_peak_params.")
+  }
+  sample_indices <- as.integer(sample_indices)
+  if (any(is.na(sample_indices)) || any(sample_indices < 1L)) {
+    stop("subset_peak_params: sample_indices must be positive integers.")
+  }
+  n_orig <- if (!is.null(peak_params$n_samples)) peak_params$n_samples
+            else max(peak_params$sample_idx_raw)
+  if (any(sample_indices > n_orig)) {
+    stop("subset_peak_params: sample_indices contains values beyond ",
+         "the original n_samples (", n_orig, ").")
+  }
+
+  keep_mask <- peak_params$sample_idx_raw %in% sample_indices
+  out <- peak_params
+
+  # Subset the per-peak _raw vectors
+  raw_fields <- c("rt_loc_raw", "cv_loc_raw",
+                  "sigma_rt_raw", "sigma_cv_raw",
+                  "intensity_raw", "sample_idx_raw")
+  for (nm in raw_fields) {
+    if (!is.null(peak_params[[nm]])) {
+      out[[nm]] <- peak_params[[nm]][keep_mask]
+    }
+  }
+
+  # Remap sample_idx_raw to contiguous 1..length(sample_indices)
+  out$sample_idx_raw <- match(out$sample_idx_raw, sort(sample_indices))
+  out$n_samples <- length(sample_indices)
+  out$n_peaks_detected <- sum(keep_mask)
+
+  # Sample names, if present
+  if (!is.null(peak_params$sample_names)) {
+    out$sample_names <- peak_params$sample_names[sort(sample_indices)]
+  }
+
+  # n_peaks$values (per-sample counts) — subset by kept samples
+  if (!is.null(peak_params$n_peaks$values)) {
+    out$n_peaks$values <- peak_params$n_peaks$values[sort(sample_indices)]
+    if (length(out$n_peaks$values) > 0L) {
+      out$n_peaks$mean <- mean(out$n_peaks$values)
+      out$n_peaks$sd   <- if (length(out$n_peaks$values) > 1L)
+                            stats::sd(out$n_peaks$values) else 0
+    }
+  }
+
+  # Recompute the fitted marginal summaries from the subset
+  safe_mean <- function(x) if (length(x) == 0L) NA_real_ else mean(x)
+  safe_sd   <- function(x) if (length(x) < 2L)  0         else stats::sd(x)
+  fit_lognormal <- function(x) {
+    x <- x[is.finite(x) & x > 0]
+    if (length(x) < 10L) return(list(meanlog = 0, sdlog = 1))
+    list(meanlog = mean(log(x)), sdlog = stats::sd(log(x)))
+  }
+  if (!is.null(out$rt_loc_raw)) {
+    out$rt_loc <- list(values = out$rt_loc_raw,
+                       mean = safe_mean(out$rt_loc_raw),
+                       sd   = safe_sd(out$rt_loc_raw))
+    out$cv_loc <- list(values = out$cv_loc_raw,
+                       mean = safe_mean(out$cv_loc_raw),
+                       sd   = safe_sd(out$cv_loc_raw))
+  }
+  if (!is.null(out$sigma_rt_raw)) {
+    out$sigma_rt  <- fit_lognormal(out$sigma_rt_raw)
+    out$sigma_cv  <- fit_lognormal(out$sigma_cv_raw)
+    out$intensity <- fit_lognormal(out$intensity_raw)
+  }
+
+  # noise stays as-is (pooled from original run — usually close enough)
+
+  out
+}
+
 #' Build a peak catalog from a peak_params object
 #'
 #' Greedy clustering: peaks are sorted by intensity descending, each
