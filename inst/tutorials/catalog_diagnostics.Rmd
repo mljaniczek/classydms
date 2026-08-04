@@ -1,0 +1,332 @@
+---
+title: "Peak catalog diagnostics — how many compounds are in your cohort?"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 96)
+library(classydms)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(purrr)
+```
+
+# Purpose
+
+Real GC-DMS samples share the same underlying compounds. If subject A's spectrum has a peak at RT = 42.3s, CV = 17V, subject B's spectrum usually has one at *the same* position (with different brightness, or occasionally absent). Our current synthetic generator doesn't capture this — it draws random peak positions independently per sample.
+
+To fix that, we need a **peak catalog**: a data-derived list of the specific (RT, CV) positions where peaks reliably appear, with prevalence and morphology distributions for each. This tutorial builds and diagnoses the catalog on the flu sampledata to see:
+
+- How many compounds do we actually have?
+- How does the count change with clustering radius and support threshold?
+- Where do "loner" peaks (that didn't cluster) fall spatially?
+
+Once we know these numbers, we can plug the catalog into synthetic generation for realistic backgrounds — that's the follow-up commit.
+
+# 1. Load flu cohort and build `peak_params`
+
+```{r load-data, cache = TRUE}
+disease_dir <- if (requireNamespace("here", quietly = TRUE)) {
+  here::here("sampledata", "influenza")
+} else "sampledata/influenza"
+control_dir <- if (requireNamespace("here", quietly = TRUE)) {
+  here::here("sampledata", "influenza_controls")
+} else "sampledata/influenza_controls"
+
+loaded <- load_dms_directory(
+  disease_dir = disease_dir,
+  control_dir = control_dir,
+  pattern     = "POS.*\\.(xls|txt|tsv|csv)$"
+)
+samples_proc <- map(loaded$samples, ~process_one_sample(.x,
+  sg_p = 3, sg_n = 21, asls_lambda = 1e6,
+  asls_p = 0.01, asls_niter = 10))
+samples_dust <- map(samples_proc,
+                     ~baseline_basement(.x, basement_thr = 0.005))
+b_list <- map(samples_dust, ~trim_bounds_from_occupancy(.x$Z))
+R0 <- max(sapply(samples_dust, function(s) nrow(s$Z)))
+C0 <- max(sapply(samples_dust, function(s) ncol(s$Z)))
+gb <- pooled_trim_bounds(b_list, R = R0, C = C0,
+                          q_lo = 0.05, q_hi = 0.95)
+samples_trim <- map(samples_dust, ~trim_sample(.x, bounds = gb))
+Z_raw     <- map(samples_trim, ~.x$Z)
+Z_pretrim <- map(samples_trim,
+                  ~if (!is.null(.x$Z_pretrim)) .x$Z_pretrim else .x$Z)
+
+pp <- estimate_peak_params(Z_raw, Z_pretrim_list = Z_pretrim,
+                            top_k = 500, frac_height = 0.5,
+                            verbose = FALSE)
+sprintf("Pool has %d peaks from %d samples", pp$n_peaks_detected, pp$n_samples)
+```
+
+At the smoke-test scale (6 samples × top_k = 500) we get 3000 pool peaks. On a real 200-sample cohort at top_k = 2500 you'd have ~500,000 pool peaks — the catalog algorithm scales to that.
+
+# 2. Build the catalog at default parameters
+
+```{r build-catalog}
+t0 <- proc.time()[3]
+catalog <- build_peak_catalog(
+  pp,
+  eps_rt = 0.01, eps_cv = 0.05,
+  min_support_frac = 0.10,
+  min_cluster_size = 2L
+)
+sprintf("Catalog built in %.2f s", proc.time()[3] - t0)
+```
+
+## Diagnostic summary
+
+```{r summary}
+summary_stats <- catalog_summary(catalog)
+```
+
+**Important note on the 6-sample sampledata**: at this cohort size, the discrete prevalence values are `{1/6, 2/6, ..., 6/6}` = `{16.7%, 33.3%, 50%, 66.7%, 83.3%, 100%}`. Any cluster of size ≥ 2 has prevalence ≥ 16.7%, which is above the 10% threshold — so at this scale, the size-2 constraint fully dominates. On a real 100+ sample cohort the support threshold will separate common compounds from rare ones meaningfully.
+
+# 3. Spatial overlay — where do the compounds sit?
+
+```{r plot-catalog, fig.height = 6}
+plot_catalog(catalog, pp, show_small = TRUE, show_singletons = TRUE)
+```
+
+- **Red points, sized by prevalence** — compounds. Bigger points = more prevalent across the cohort.
+- **Blue points** — small clusters (below support or size threshold). None at this scale.
+- **Purple points** — singletons (loner peaks). Notice whether they cluster near compounds or fall away in empty regions.
+
+# 4. Compound prevalence distribution
+
+```{r prevalence-hist, fig.height = 3.5}
+if (nrow(catalog$compounds) > 0L) {
+  ggplot(catalog$compounds, aes(x = prevalence)) +
+    geom_histogram(bins = 20, fill = "#B2182B", color = "white") +
+    labs(x = "prevalence (fraction of samples)",
+         y = "n compounds",
+         title = "Prevalence distribution across compounds") +
+    theme_minimal()
+}
+```
+
+On a real cohort you'd see something like:
+- A tall bar near prevalence = 1.0 (universal / anchor compounds)
+- A long tail toward low prevalence (rare / sporadic compounds)
+- The 10% support threshold cuts everything below the tail
+
+# 5. How does the catalog change with clustering radius?
+
+Tighter radius → each real compound splits into multiple small clusters. Looser radius → distinct compounds merge into elongated clusters. There's usually a sweet spot where the count stabilizes.
+
+```{r eps-sweep, fig.height = 3.5}
+eps_rt_grid <- c(0.005, 0.01, 0.02, 0.05)
+eps_cv_grid <- c(0.02,  0.05, 0.10, 0.20)
+sweep_grid  <- expand.grid(eps_rt = eps_rt_grid, eps_cv = eps_cv_grid)
+
+sweep_rows <- pmap(sweep_grid, function(eps_rt, eps_cv) {
+  cc <- build_peak_catalog(pp, eps_rt = eps_rt, eps_cv = eps_cv,
+                            min_support_frac = 0.10)
+  tibble(eps_rt = eps_rt, eps_cv = eps_cv,
+         n_compounds = nrow(cc$compounds),
+         n_singletons = nrow(cc$singletons))
+})
+sweep_df <- bind_rows(sweep_rows)
+
+ggplot(sweep_df, aes(x = eps_rt, y = n_compounds,
+                      color = factor(eps_cv))) +
+  geom_line(size = 1.1) + geom_point(size = 3) +
+  scale_x_log10() +
+  labs(x = "eps_rt (fraction)", y = "n compounds",
+       color = "eps_cv",
+       title = "Compound count vs clustering radius") +
+  theme_minimal()
+```
+
+The sweet spot is usually near where the curve starts to flatten. Peaks whose true `(RT, CV)` positions differ by less than this radius get merged, so pick a radius that's smaller than the typical distance between distinct compounds but larger than the per-peak jitter.
+
+# 6. How does the catalog change with support threshold?
+
+```{r support-sweep, fig.height = 3.5}
+supp_grid <- c(0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.99)
+supp_rows <- lapply(supp_grid, function(sf) {
+  cc <- build_peak_catalog(pp, min_support_frac = sf)
+  tibble(min_support_frac = sf, n_compounds = nrow(cc$compounds))
+})
+bind_rows(supp_rows)
+```
+
+On a real cohort, this table gives you a sense of the catalog's tiered structure:
+
+- Compounds at 90%+ prevalence: **anchor** compounds. Universal metabolites; the backbone every synthetic sample should include.
+- 25–90% prevalence: **common** compounds. Consistent enough to include with their observed prevalence.
+- 10–25% prevalence: **frequent** compounds. Worth keeping but you'll see them in less than half the samples.
+- Below 10%: **sporadic**. Excluded by default (become small_clusters or singletons).
+
+# 7. Loner analysis
+
+Loners (singletons) are pool peaks that didn't cluster with any other peak within the eps radius. Two possible interpretations:
+
+1. **Noise / detection artifacts** — a spurious local maximum that got picked up by the peak detector but doesn't reflect a real compound.
+2. **True rare compounds** — a compound that only one subject in this small cohort happens to have expressed.
+
+## 7a. Spatial distribution of loners
+
+```{r loner-spatial, fig.height = 6}
+sng <- catalog$singletons
+cmp <- catalog$compounds
+if (nrow(sng) > 0L) {
+  ggplot() +
+    geom_hex(data = tibble(rt_loc = pp$rt_loc_raw, cv_loc = pp$cv_loc_raw),
+              aes(x = cv_loc, y = rt_loc),
+              bins = c(30, 60), alpha = 0.4) +
+    scale_fill_gradient(low = "grey90", high = "grey30",
+                         name = "pool peaks") +
+    geom_point(data = sng, aes(x = cv_loc, y = rt_loc),
+               color = "#7570b3", size = 0.8, alpha = 0.6) +
+    geom_point(data = cmp, aes(x = cv_loc, y = rt_loc,
+                                size = prevalence),
+                color = "#B2182B", alpha = 0.7) +
+    scale_size_continuous(range = c(1, 4)) +
+    scale_y_reverse() +
+    labs(x = "CV (fraction)", y = "RT (fraction)",
+         title = sprintf("Loners (%d, purple) vs compounds (%d, red)",
+                         nrow(sng), nrow(cmp))) +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
+}
+```
+
+**How to read this on a real cohort:**
+
+- Loners tightly co-located with compounds → likely detection noise near real peaks. Fine to discard.
+- Loners in empty regions far from any compound → maybe genuine rare compounds one subject had. Worth investigating individual subjects.
+- Loners forming a spatial pattern of their own → maybe you need a tighter or looser eps.
+
+## 7b. Intensity of loners vs compounds
+
+Are loners typically dim (probably noise) or bright (real compounds that just happen to only appear in one subject in this small cohort)?
+
+```{r loner-intensity, fig.height = 3.5}
+if (nrow(catalog$singletons) > 0L && nrow(catalog$compounds) > 0L) {
+  loner_intens <- sapply(catalog$singletons$intensity_obs,
+                          function(v) v[1])
+  cmp_intens_median <- sapply(catalog$compounds$intensity_obs,
+                               function(v) stats::median(v))
+  cmp_intens_max    <- sapply(catalog$compounds$intensity_obs,
+                               function(v) max(v))
+
+  int_df <- rbind(
+    tibble(intensity = loner_intens,       group = "loners"),
+    tibble(intensity = cmp_intens_median,  group = "compound median"),
+    tibble(intensity = cmp_intens_max,     group = "compound max")
+  )
+  ggplot(int_df, aes(x = intensity, fill = group, color = group)) +
+    geom_density(alpha = 0.35) +
+    scale_x_log10() +
+    labs(x = "intensity (log scale)", y = "density",
+         title = "Loner intensity vs compound intensity") +
+    theme_minimal()
+}
+```
+
+**If loners are systematically dim** relative to compound medians, they're likely detection noise — the peak detector barely caught them. Safe to drop.
+
+**If loners are as bright as compound medians** on average, some are probably real compounds that just happen to be sample-specific. Worth flagging as sporadic contamination or genuine subject-level variation.
+
+## 7c. Loner correlation — do loners recur across samples at nearby positions?
+
+If two loners in different samples land within a small radius of each other, they *should* have been clustered together but the greedy algorithm missed them (e.g., because the seed peak was elsewhere). This is a diagnostic for whether eps is too tight.
+
+```{r loner-recur}
+if (nrow(catalog$singletons) > 1L) {
+  sng_df <- catalog$singletons
+  # For each pair of loners, are they closer than eps_rt/2 x eps_cv/2?
+  loose_eps_rt <- catalog$parameters$eps_rt / 2
+  loose_eps_cv <- catalog$parameters$eps_cv / 2
+  n_pairs_close <- 0L
+  for (i in seq_len(nrow(sng_df) - 1L)) {
+    for (j in (i + 1L):nrow(sng_df)) {
+      if (abs(sng_df$rt_loc[i] - sng_df$rt_loc[j]) <= loose_eps_rt &&
+          abs(sng_df$cv_loc[i] - sng_df$cv_loc[j]) <= loose_eps_cv) {
+        n_pairs_close <- n_pairs_close + 1L
+      }
+    }
+  }
+  sprintf("Loner pairs within (eps/2) of each other: %d / %d possible",
+          n_pairs_close, choose(nrow(sng_df), 2))
+}
+```
+
+If this count is high, some loners could be co-catalogued as small clusters by tightening the greedy or switching to DBSCAN. If low, the greedy is doing its job and loners are genuinely isolated.
+
+# 8. Case vs control catalog comparison (mini demo)
+
+At 6 samples this comparison isn't statistically meaningful, but the mechanism is worth showing. On a real ~100+ sample cohort you'd build catalogs from cases-only and controls-only, then compare.
+
+```{r case-control-catalogs}
+disease_idx <- which(loaded$y == 2L)
+control_idx <- which(loaded$y == 1L)
+
+# Split the pool by class (using sample_idx_raw)
+peak_class <- ifelse(pp$sample_idx_raw %in% disease_idx, "disease", "control")
+
+# Build class-specific peak_params objects for catalog construction.
+# In practice you'd re-run estimate_peak_params on just the disease
+# samples and just the control samples separately, but for this
+# tutorial we'll partition the existing pool.
+subset_pp <- function(pp, keep_mask, n_samples) {
+  out <- pp
+  for (nm in c("rt_loc_raw", "cv_loc_raw", "sigma_rt_raw",
+               "sigma_cv_raw", "intensity_raw", "sample_idx_raw")) {
+    out[[nm]] <- pp[[nm]][keep_mask]
+  }
+  # Remap sample_idx to the subset
+  unique_orig <- sort(unique(out$sample_idx_raw))
+  out$sample_idx_raw <- match(out$sample_idx_raw, unique_orig)
+  out$n_samples <- length(unique_orig)
+  out$n_peaks_detected <- sum(keep_mask)
+  out
+}
+
+pp_disease <- subset_pp(pp, peak_class == "disease", length(disease_idx))
+pp_control <- subset_pp(pp, peak_class == "control", length(control_idx))
+
+cat_disease <- build_peak_catalog(pp_disease)
+cat_control <- build_peak_catalog(pp_control)
+
+tibble(
+  cohort  = c("disease-only", "control-only"),
+  n_samples = c(pp_disease$n_samples, pp_control$n_samples),
+  n_pool_peaks = c(pp_disease$n_peaks_detected, pp_control$n_peaks_detected),
+  n_compounds  = c(nrow(cat_disease$compounds),
+                    nrow(cat_control$compounds)),
+  n_singletons = c(nrow(cat_disease$singletons),
+                    nrow(cat_control$singletons))
+)
+```
+
+On a real cohort this gives you the raw material to answer scientific questions:
+
+- **Which compounds are in both catalogs?** → shared human volatile compounds.
+- **Which compounds are only in the disease catalog with high prevalence?** → potential biomarkers.
+- **Which compounds have different prevalence between catalogs?** → biomarker candidates.
+- **Which compounds have different intensity distributions between catalogs?** → biomarker candidates via intensity, not presence.
+
+Cross-catalog matching by proximity + prevalence-difference testing is a natural next function (`compare_catalogs`). For now the tutorial gives you the per-cohort catalogs to play with.
+
+# What comes next
+
+Once you're comfortable with the catalog on your real data, the two follow-up commits are:
+
+1. **`generate_one_synthetic_from_catalog(catalog, H, W, ...)`** — for each compound, Bernoulli-draw its presence, then sample morphology from its observed distribution and place at the compound center with small jitter. Synthetic samples now share the same underlying compound structure across samples, matching real data.
+2. **`simulate_case_control_from_catalog(catalog, biomarker_indices, ...)`** — designate some compounds as biomarkers with case/control-specific prevalence and intensity multipliers. Simpler and more principled than the current `holdout_biomarkers` design because compound positions are already well-defined.
+
+Both will slot into the existing simulation pipeline; the current functions stay for backward compatibility. The updated encoder should be pretrained on catalog-based synthetic data — the shared-compound inductive bias likely improves downstream classification substantially.
+
+Also on the roadmap:
+
+- **`compare_catalogs()`** — match compounds across multiple catalogs by proximity, report shared / unique / differentially-prevalent compounds.
+- **`merge_catalogs()`** — build a universal or intersection catalog from per-condition catalogs.
+- **DBSCAN clustering option** in `build_peak_catalog` — better handling of elongated / chained peak groups.
