@@ -101,7 +101,7 @@ H <- 100L; W <- 30L
 Hold out one bright biomarker and simulate:
 
 ```{r simulate-cohort}
-scenario <- biomarkers_level1(toy_params, seed = 42L)
+scenario <- biomarkers_level1(toy_params, H = H, W = W, seed = 42L)
 sim <- simulate_case_control_cohort(
   scenario$background_peak_params, scenario$biomarkers,
   n_cases = 15L, n_controls = 15L,

@@ -115,7 +115,7 @@ print(round(quantile(peaks_obs$intensity, c(0.25, 0.50, 0.95, 1.0)), 3))
 ```
 
 ```{r scenario}
-scenario <- biomarkers_sanity_max(toy_params, seed = 42L)
+scenario <- biomarkers_sanity_max(toy_params, H = H, W = W, seed = 42L)
 cat("Biomarker templates:\n")
 print(scenario$biomarkers)
 cat("\nBackground n_peaks setting (should be 30):",
@@ -348,6 +348,7 @@ This section keeps the sanity property (perfect presence in cases, complete abse
 # level preset. Uniform quantile means biomarkers can come from anywhere
 # in the pool; case_intensity_mult = 1.0 means no boost.
 ho_r <- holdout_biomarkers(toy_params, n_biomarkers = 5L,
+                            H = H, W = W,
                             min_intensity_quantile = NULL,
                             seed = 42L)
 bg_r <- ho_r$background_peak_params

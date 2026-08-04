@@ -7,8 +7,15 @@
 holdout_biomarkers(
   peak_params,
   n_biomarkers,
-  protect_radius_rt = 15/1400,
-  protect_radius_cv = 3/40,
+  H = NULL,
+  W = NULL,
+  min_sep_rt = 8L,
+  min_sep_cv = 2L,
+  location_jitter_rt = 2,
+  location_jitter_cv = 1,
+  jitter_safety_sd = 3,
+  protect_radius_rt = NULL,
+  protect_radius_cv = NULL,
   min_intensity_quantile = NULL,
   seed = NULL
 )
@@ -20,11 +27,37 @@ holdout_biomarkers(
 
 \item{n_biomarkers}{Integer; number of biomarker templates to draw.}
 
+\item{H, W}{Optional integer image dimensions (pixels). When
+provided, \code{protect_radius_rt} and \code{protect_radius_cv} are
+automatically derived as \code{(min_sep + jitter_safety_sd * jitter) / dim},
+which guarantees background peaks stay \code{min_sep + safety*jitter}
+pixels away from every biomarker location even after
+\code{location_jitter} is applied at simulation time. Strongly
+recommended over the fraction defaults, which were designed for a
+native ~1400 x 40 image and under-protect at smaller sizes.}
+
+\item{min_sep_rt, min_sep_cv}{Minimum spatial separation between
+biomarker and background peak \emph{centers} (in pixels). Defaults
+match the peak-detector defaults so the "protected" region is
+at least as large as the region a peak occupies.}
+
+\item{location_jitter_rt, location_jitter_cv}{Per-peak location
+jitter SD (pixels) that will be applied at simulation time by
+\code{\link[=simulate_case_control_cohort]{simulate_case_control_cohort()}}. Used when computing the derived
+\verb{protect_radius_*} from \code{H}, \code{W}.}
+
+\item{jitter_safety_sd}{Multiplier on \verb{location_jitter_*} used in
+the derived protect radius formula. \code{3} covers ~99.7\% of Normal
+draws so background peaks are essentially never jittered into a
+biomarker region.}
+
 \item{protect_radius_rt, protect_radius_cv}{Radii (in fractions of
 image dimensions) around each biomarker inside which observed
-peaks are also removed from the background pool. Default matches
-the default \code{min_sep_rt}, \code{min_sep_cv} on a 1400 x 40 image (15 /
-1400 and 3 / 40).}
+peaks are also removed from the background pool. When \code{H} (or
+\code{W}) is passed, these are computed automatically from the derived
+formula and any user-provided value is ignored. Backwards-
+compatible defaults (\code{15 / 1400} for RT, \code{3 / 40} for CV) are used
+only when neither \code{H} nor an explicit fraction is provided.}
 
 \item{min_intensity_quantile}{Optional numeric in \verb{[0, 1)}. When
 non-\code{NULL}, biomarker templates are drawn only from pool peaks

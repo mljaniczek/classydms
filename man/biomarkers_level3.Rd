@@ -4,10 +4,17 @@
 \alias{biomarkers_level3}
 \title{Level 3 (hard) biomarker scenario}
 \usage{
-biomarkers_level3(peak_params, seed = NULL)
+biomarkers_level3(peak_params, H = NULL, W = NULL, seed = NULL)
 }
 \arguments{
 \item{peak_params}{Output of \code{\link[=estimate_peak_params]{estimate_peak_params()}}.}
+
+\item{H, W}{Optional image dimensions in pixels. When provided,
+forwarded to \code{\link[=holdout_biomarkers]{holdout_biomarkers()}} so the protect radius scales
+safely for the target image size. Strongly recommended — the
+default fraction-based protect radius under-protects on smaller
+images than ~1400 x 40 and can cause background peaks to leak
+into biomarker regions after location jitter.}
 
 \item{seed}{Optional RNG seed for reproducible biomarker selection.}
 }

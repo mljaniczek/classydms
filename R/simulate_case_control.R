@@ -20,11 +20,33 @@
 #'   `rt_loc_raw`, `cv_loc_raw`, `sigma_rt_raw`, `sigma_cv_raw`,
 #'   `intensity_raw`.
 #' @param n_biomarkers Integer; number of biomarker templates to draw.
+#' @param H,W Optional integer image dimensions (pixels). When
+#'   provided, `protect_radius_rt` and `protect_radius_cv` are
+#'   automatically derived as `(min_sep + jitter_safety_sd * jitter) / dim`,
+#'   which guarantees background peaks stay `min_sep + safety*jitter`
+#'   pixels away from every biomarker location even after
+#'   `location_jitter` is applied at simulation time. Strongly
+#'   recommended over the fraction defaults, which were designed for a
+#'   native ~1400 x 40 image and under-protect at smaller sizes.
+#' @param min_sep_rt,min_sep_cv Minimum spatial separation between
+#'   biomarker and background peak *centers* (in pixels). Defaults
+#'   match the peak-detector defaults so the "protected" region is
+#'   at least as large as the region a peak occupies.
+#' @param location_jitter_rt,location_jitter_cv Per-peak location
+#'   jitter SD (pixels) that will be applied at simulation time by
+#'   [simulate_case_control_cohort()]. Used when computing the derived
+#'   `protect_radius_*` from `H`, `W`.
+#' @param jitter_safety_sd Multiplier on `location_jitter_*` used in
+#'   the derived protect radius formula. `3` covers ~99.7% of Normal
+#'   draws so background peaks are essentially never jittered into a
+#'   biomarker region.
 #' @param protect_radius_rt,protect_radius_cv Radii (in fractions of
 #'   image dimensions) around each biomarker inside which observed
-#'   peaks are also removed from the background pool. Default matches
-#'   the default `min_sep_rt`, `min_sep_cv` on a 1400 x 40 image (15 /
-#'   1400 and 3 / 40).
+#'   peaks are also removed from the background pool. When `H` (or
+#'   `W`) is passed, these are computed automatically from the derived
+#'   formula and any user-provided value is ignored. Backwards-
+#'   compatible defaults (`15 / 1400` for RT, `3 / 40` for CV) are used
+#'   only when neither `H` nor an explicit fraction is provided.
 #' @param min_intensity_quantile Optional numeric in `[0, 1)`. When
 #'   non-`NULL`, biomarker templates are drawn only from pool peaks
 #'   whose `intensity_raw` is at or above the given quantile of the
@@ -48,8 +70,14 @@
 #' @export
 holdout_biomarkers <- function(peak_params,
                                 n_biomarkers,
-                                protect_radius_rt = 15 / 1400,
-                                protect_radius_cv = 3  / 40,
+                                H = NULL, W = NULL,
+                                min_sep_rt = 8L,
+                                min_sep_cv = 2L,
+                                location_jitter_rt = 2,
+                                location_jitter_cv = 1,
+                                jitter_safety_sd = 3,
+                                protect_radius_rt = NULL,
+                                protect_radius_cv = NULL,
                                 min_intensity_quantile = NULL,
                                 seed = NULL) {
   needed <- c("rt_loc_raw", "cv_loc_raw",
@@ -65,6 +93,23 @@ holdout_biomarkers <- function(peak_params,
   if (n_biomarkers >= n_pool) {
     stop("n_biomarkers (", n_biomarkers,
          ") must be less than pool size (", n_pool, ").")
+  }
+
+  # Compute protect_radius from image dims + jitter when H / W provided;
+  # else fall back to the (legacy) fraction defaults sized for a native
+  # ~1400 x 40 image. Explicit protect_radius_* takes precedence only if
+  # H / W not provided.
+  if (!is.null(H)) {
+    derived_rt <- (min_sep_rt + jitter_safety_sd * location_jitter_rt) / H
+    protect_radius_rt <- derived_rt
+  } else if (is.null(protect_radius_rt)) {
+    protect_radius_rt <- 15 / 1400
+  }
+  if (!is.null(W)) {
+    derived_cv <- (min_sep_cv + jitter_safety_sd * location_jitter_cv) / W
+    protect_radius_cv <- derived_cv
+  } else if (is.null(protect_radius_cv)) {
+    protect_radius_cv <- 3 / 40
   }
   if (!is.null(min_intensity_quantile)) {
     if (min_intensity_quantile < 0 || min_intensity_quantile >= 1) {
@@ -193,8 +238,10 @@ build_biomarker_spec <- function(templates,
 #' @return list(biomarkers, background_peak_params) — pass both to
 #'   [simulate_case_control_cohort()].
 #' @export
-biomarkers_sanity_max <- function(peak_params, seed = NULL) {
+biomarkers_sanity_max <- function(peak_params, H = NULL, W = NULL,
+                                    seed = NULL) {
   ho <- holdout_biomarkers(peak_params, n_biomarkers = 5L,
+                            H = H, W = W,
                             min_intensity_quantile = 0.95,
                             seed = seed)
   bg <- ho$background_peak_params
@@ -221,12 +268,20 @@ biomarkers_sanity_max <- function(peak_params, seed = NULL) {
 #' something in the pipeline is broken.
 #'
 #' @param peak_params Output of [estimate_peak_params()].
+#' @param H,W Optional image dimensions in pixels. When provided,
+#'   forwarded to [holdout_biomarkers()] so the protect radius scales
+#'   safely for the target image size. Strongly recommended — the
+#'   default fraction-based protect radius under-protects on smaller
+#'   images than ~1400 x 40 and can cause background peaks to leak
+#'   into biomarker regions after location jitter.
 #' @param seed Optional RNG seed for reproducible biomarker selection.
 #' @return list(biomarkers, background_peak_params) — pass both to
 #'   [simulate_case_control_cohort()].
 #' @export
-biomarkers_level1 <- function(peak_params, seed = NULL) {
+biomarkers_level1 <- function(peak_params, H = NULL, W = NULL,
+                                seed = NULL) {
   ho <- holdout_biomarkers(peak_params, n_biomarkers = 1L,
+                            H = H, W = W,
                             min_intensity_quantile = 0.90,
                             seed = seed)
   spec <- build_biomarker_spec(
@@ -247,8 +302,10 @@ biomarkers_level1 <- function(peak_params, seed = NULL) {
 #' AUC should be at least ~0.85 if the pipeline works.
 #' @inheritParams biomarkers_level1
 #' @export
-biomarkers_level2 <- function(peak_params, seed = NULL) {
+biomarkers_level2 <- function(peak_params, H = NULL, W = NULL,
+                                seed = NULL) {
   ho <- holdout_biomarkers(peak_params, n_biomarkers = 3L,
+                            H = H, W = W,
                             min_intensity_quantile = 0.50,
                             seed = seed)
   spec <- build_biomarker_spec(
@@ -269,8 +326,10 @@ biomarkers_level2 <- function(peak_params, seed = NULL) {
 #' 0.70 is a passing result at this difficulty.
 #' @inheritParams biomarkers_level1
 #' @export
-biomarkers_level3 <- function(peak_params, seed = NULL) {
+biomarkers_level3 <- function(peak_params, H = NULL, W = NULL,
+                                seed = NULL) {
   ho <- holdout_biomarkers(peak_params, n_biomarkers = 6L,
+                            H = H, W = W,
                             min_intensity_quantile = NULL,
                             seed = seed)
   spec <- build_biomarker_spec(
