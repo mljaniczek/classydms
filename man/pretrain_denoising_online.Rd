@@ -23,6 +23,7 @@ pretrain_denoising_online(
   location_jitter_cv = 1,
   attribute_mode = c("joint", "marginal"),
   noise_scale = 1,
+  catalog = NULL,
   val_real = NULL,
   val_n = 200L,
   checkpoint_every = 10L,

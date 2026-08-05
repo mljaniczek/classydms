@@ -497,6 +497,71 @@ catalog_compactness <- function(catalog,
   out
 }
 
+#' Split a catalog into two disjoint sub-catalogs by compound
+#'
+#' Randomly partitions the catalog's compounds into two sets. Useful
+#' for encoder-transfer experiments: pretrain the encoder on
+#' synthetic data generated from sub-catalog A, then simulate
+#' case/control data from sub-catalog B — biomarker compounds and
+#' background compounds in B are all guaranteed to have been unseen
+#' during pretraining.
+#'
+#' Small clusters and singletons are left untouched (attached to the
+#' first split only) since they're not typically used for synthetic
+#' generation.
+#'
+#' @param catalog A `peak_catalog` object.
+#' @param frac Fraction of compounds to place in the first split.
+#'   Default `0.5`.
+#' @param seed Optional RNG seed for reproducible partitioning.
+#' @return A list with `a` and `b`, each a valid `peak_catalog` with
+#'   its own compound subset. `a` also carries any `small_clusters`
+#'   and `singletons` from the original.
+#' @export
+split_catalog <- function(catalog, frac = 0.5, seed = NULL) {
+  stopifnot(inherits(catalog, "peak_catalog"))
+  if (frac <= 0 || frac >= 1) stop("frac must be in (0, 1).")
+  if (!is.null(seed)) set.seed(seed)
+
+  compounds <- catalog$compounds
+  n <- nrow(compounds)
+  n_a <- max(1L, round(frac * n))
+  idx_a <- sort(sample.int(n, size = n_a, replace = FALSE))
+  idx_b <- setdiff(seq_len(n), idx_a)
+
+  compounds_a <- compounds[idx_a, ]
+  compounds_b <- compounds[idx_b, ]
+  compounds_a$compound_id <- seq_len(nrow(compounds_a))
+  compounds_b$compound_id <- seq_len(nrow(compounds_b))
+
+  base_shell <- list(
+    small_clusters = catalog$small_clusters[0, ],
+    singletons     = catalog$singletons[0, ],
+    noise          = catalog$noise,
+    parameters     = catalog$parameters
+  )
+  cat_a <- structure(
+    c(list(compounds = compounds_a),
+      base_shell,
+      list(small_clusters = catalog$small_clusters,
+           singletons     = catalog$singletons))[
+        c("compounds", "small_clusters", "singletons",
+          "noise", "parameters")],
+    class = "peak_catalog"
+  )
+  cat_b <- structure(
+    list(
+      compounds      = compounds_b,
+      small_clusters = catalog$small_clusters[0, ],
+      singletons     = catalog$singletons[0, ],
+      noise          = catalog$noise,
+      parameters     = catalog$parameters
+    ),
+    class = "peak_catalog"
+  )
+  list(a = cat_a, b = cat_b)
+}
+
 #' Plot the spatial distribution of a peak catalog
 #'
 #' Compound positions are shown as red points sized by prevalence,

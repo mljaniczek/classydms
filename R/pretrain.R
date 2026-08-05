@@ -207,6 +207,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                        attribute_mode = c("joint",
                                                           "marginal"),
                                        noise_scale = 1.0,
+                                       catalog = NULL,
                                        val_real = NULL,
                                        val_n = 200L,
                                        checkpoint_every = 10L,
@@ -220,6 +221,12 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                        resume_from = NULL,
                                        seed = 42L,
                                        verbose = TRUE) {
+  if (is.null(catalog) && is.null(peak_params)) {
+    stop("pretrain_denoising_online: pass either peak_params or catalog.")
+  }
+  if (!is.null(catalog)) {
+    stopifnot(inherits(catalog, "peak_catalog"))
+  }
   if (!is.null(num_threads)) {
     torch::torch_set_num_threads(as.integer(num_threads))
   }
@@ -256,6 +263,10 @@ pretrain_denoising_online <- function(peak_params, H, W,
   message("  CPU threads (torch): ", torch::torch_get_num_threads())
   message("  R-side data workers: ", num_workers,
           if (use_parallel) " (parallel via mclapply)" else " (serial)")
+  message("  Source: ",
+          if (!is.null(catalog))
+            paste0("peak_catalog (", nrow(catalog$compounds), " compounds)")
+          else "peak_params")
   message("  size_jitter: ", size_jitter)
   message("  dust_threshold: ", dust_threshold,
           if (dust_threshold > 0)
@@ -338,7 +349,15 @@ pretrain_denoising_online <- function(peak_params, H, W,
   # default uses L'Ecuyer-CMRG streams so workers produce independent
   # synthetic samples without colliding RNG states.
   generate_one_pair <- function(i) {
-    pair <- generate_one_synthetic(peak_params, H, W,
+    pair <- if (!is.null(catalog)) {
+      generate_one_synthetic_from_catalog(catalog, H, W,
+                                    add_noise = add_noise,
+                                    size_jitter = size_jitter,
+                                    location_jitter_rt = location_jitter_rt,
+                                    location_jitter_cv = location_jitter_cv,
+                                    noise_scale = noise_scale)
+    } else {
+      generate_one_synthetic(peak_params, H, W,
                                     add_noise = add_noise,
                                     size_jitter = size_jitter,
                                     location_mode = location_mode,
@@ -346,6 +365,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                     location_jitter_cv = location_jitter_cv,
                                     attribute_mode = attribute_mode,
                                     noise_scale = noise_scale)
+    }
     # Dust thresholding matches real-data preprocessing (see
     # baseline_basement) so synthetic samples have the same sparsity
     # profile as real samples entering the encoder.
