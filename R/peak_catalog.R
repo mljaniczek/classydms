@@ -321,6 +321,9 @@ build_peak_catalog <- function(peak_params,
       compounds       = compounds,
       small_clusters  = small_clusters,
       singletons      = singletons,
+      noise           = if (!is.null(peak_params$noise))
+                          peak_params$noise
+                        else list(mean = 0.005, sd = 0.005),
       parameters      = list(
         eps_rt              = eps_rt,
         eps_cv              = eps_cv,
