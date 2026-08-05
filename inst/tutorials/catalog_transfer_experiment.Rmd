@@ -1,0 +1,222 @@
+---
+title: "Catalog-transfer experiment — does encoder pretraining generalize?"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 96)
+library(classydms)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(purrr)
+library(pROC)
+```
+
+# Purpose
+
+The key transfer-learning question: **can one encoder pretrained on "generic peakiness" from one distribution be applied to case/control classification on a *different* distribution?**
+
+If yes → we can train one big encoder from many diseases combined (or synthetic-from-scratch) and reuse it. If no → we need per-disease pretraining, which changes the deployment story significantly.
+
+Design:
+
+1. Build a peak catalog from a real cohort (this tutorial: 6-sample flu subset).
+2. Split the catalog into two disjoint halves — split A (for pretraining) and split B (for classification).
+3. Pretrain an encoder on synthetic data from split A. **The encoder never sees split B's compounds.**
+4. Simulate a case/control cohort from split B, injecting biomarkers into split B's compounds.
+5. Classify with elastic net; report AUC.
+6. Compare against a "matched" baseline: pretrain and classify on the same split B — reveals the transfer penalty.
+
+Also comparing `size_jitter` values to test whether wider training-time morphology jitter improves transfer.
+
+# 1. Load flu data and build catalog
+
+```{r load, cache = TRUE}
+disease_dir <- if (requireNamespace("here", quietly = TRUE)) {
+  here::here("sampledata", "influenza")
+} else "sampledata/influenza"
+control_dir <- if (requireNamespace("here", quietly = TRUE)) {
+  here::here("sampledata", "influenza_controls")
+} else "sampledata/influenza_controls"
+
+loaded <- load_dms_directory(disease_dir, control_dir,
+  pattern = "POS.*\\.(xls|txt|tsv|csv)$")
+samples_proc <- map(loaded$samples, ~process_one_sample(.x,
+  sg_p = 3, sg_n = 21, asls_lambda = 1e6, asls_p = 0.01, asls_niter = 10))
+samples_dust <- map(samples_proc, ~baseline_basement(.x, basement_thr = 0.005))
+b_list <- map(samples_dust, ~trim_bounds_from_occupancy(.x$Z))
+R0 <- max(sapply(samples_dust, function(s) nrow(s$Z)))
+C0 <- max(sapply(samples_dust, function(s) ncol(s$Z)))
+gb <- pooled_trim_bounds(b_list, R = R0, C = C0, q_lo = 0.05, q_hi = 0.95)
+samples_trim <- map(samples_dust, ~trim_sample(.x, bounds = gb))
+Z_raw <- map(samples_trim, ~.x$Z)
+Z_pretrim <- map(samples_trim,
+                  ~if (!is.null(.x$Z_pretrim)) .x$Z_pretrim else .x$Z)
+pp <- estimate_peak_params(Z_raw, Z_pretrim_list = Z_pretrim,
+                            top_k = 500, verbose = FALSE)
+
+catalog <- build_peak_catalog(pp, eps_rt = 0.003, eps_cv = 0.015)
+sprintf("Full catalog: %d compounds", nrow(catalog$compounds))
+```
+
+At the smoke-test scale the compound count is small; on your real AKI-scale cohort you'd have ~2000-3000 compounds and the transfer test is more meaningful.
+
+# 2. Split the catalog
+
+```{r split}
+splits <- split_catalog(catalog, frac = 0.5, seed = 1L)
+sprintf("Split A (pretraining): %d compounds", nrow(splits$a$compounds))
+sprintf("Split B (classification): %d compounds", nrow(splits$b$compounds))
+```
+
+The two splits are guaranteed to have **disjoint compound identities**. Any compound in A cannot appear in B and vice versa.
+
+# 3. Simulate a case/control cohort from split B
+
+Biomarkers are drawn from split B (independent of split A's pretraining data).
+
+```{r simulate, cache = TRUE}
+H <- nrow(Z_raw[[1]]); W <- ncol(Z_raw[[1]])
+biom_spec <- catalog_biomarkers_sanity_max(splits$b,
+  min_base_prevalence = 0.3, seed = 42L)
+sim <- simulate_case_control_from_catalog(splits$b,
+  biomarkers = biom_spec,
+  n_cases = 20L, n_controls = 20L,
+  H = H, W = W, seed = 7L)
+sprintf("Cohort: %d samples", length(sim$samples))
+```
+
+# 4. Two pretraining regimes to compare
+
+## 4a. Transfer regime — pretrain on split A
+
+The encoder sees only compounds from split A during pretraining. It never sees any biomarker or background compound from split B until inference time.
+
+```{r pretrain-transfer, cache = TRUE}
+pt_transfer <- pretrain_denoising_online(
+  peak_params = NULL,
+  catalog = splits$a,
+  H = H, W = W,
+  steps_per_epoch = 40L, epochs = 5L, batch_size = 8L,
+  size_jitter = 0.15,
+  noise_scale = 3.0, val_n = 16L,
+  device = "cpu", seed = 1L,
+  verbose = FALSE
+)
+```
+
+## 4b. Matched regime — pretrain on split B (upper bound)
+
+Same encoder architecture, same hyperparameters, but pretraining sees split B's compounds. This is the "encoder was trained on the target distribution" upper bound.
+
+```{r pretrain-matched, cache = TRUE}
+pt_matched <- pretrain_denoising_online(
+  peak_params = NULL,
+  catalog = splits$b,
+  H = H, W = W,
+  steps_per_epoch = 40L, epochs = 5L, batch_size = 8L,
+  size_jitter = 0.15,
+  noise_scale = 3.0, val_n = 16L,
+  device = "cpu", seed = 1L,
+  verbose = FALSE
+)
+```
+
+## 4c. Wider-jitter transfer regime — larger `size_jitter`
+
+Test whether forcing the encoder to see more morphological variation during pretraining improves transfer.
+
+```{r pretrain-transfer-wide, cache = TRUE}
+pt_transfer_wide <- pretrain_denoising_online(
+  peak_params = NULL,
+  catalog = splits$a,
+  H = H, W = W,
+  steps_per_epoch = 40L, epochs = 5L, batch_size = 8L,
+  size_jitter = 0.5,   # wider
+  noise_scale = 3.0, val_n = 16L,
+  device = "cpu", seed = 1L,
+  verbose = FALSE
+)
+```
+
+# 5. Classify and compare AUC
+
+```{r classify}
+Z_list <- lapply(sim$samples, `[[`, "Z")
+
+fit_and_report <- function(encoder, label) {
+  set.seed(1L)
+  elnet <- cv_encoder_elastic_net(encoder, Z_list, sim$y,
+                                    k = 5L, alpha = 0.5, seed = 1L)
+  tibble(regime = label, auc = elnet$auc,
+         n_nonzero_coefs = sum(elnet$coefs != 0))
+}
+results <- bind_rows(
+  fit_and_report(pt_transfer$encoder,       "transfer (split A, jitter=0.15)"),
+  fit_and_report(pt_matched$encoder,        "matched  (split B, jitter=0.15)"),
+  fit_and_report(pt_transfer_wide$encoder,  "transfer (split A, jitter=0.5)")
+)
+results |> knitr::kable(digits = 3)
+```
+
+**How to read this:**
+
+- **`matched` AUC** is the upper bound — encoder was trained on the target distribution's compound positions.
+- **`transfer (jitter=0.15)` AUC**: how much do we lose by pretraining on an independent compound subset?
+- **`transfer (jitter=0.5)` AUC**: does wider morphology jitter improve transfer?
+
+Interpretation guide:
+
+- **Transfer ≈ matched**: the encoder learned "generic peakiness" that generalizes across compound sets. One big encoder across diseases is viable.
+- **Transfer << matched**: encoder memorized specific compound positions during pretraining. Per-disease encoders needed.
+- **Wider jitter > tight jitter transfer**: wider training-time jitter helps generalization. Use it in production.
+- **Wider jitter < tight jitter transfer**: too much jitter degrades useful signal. Stick with tight.
+
+# 6. Sanity check: encoder channel differentiation
+
+For each regime, is the encoder actually representing class-relevant content?
+
+```{r encoder-channels}
+per_channel_wilcox <- function(encoder, Z_list, y) {
+  feats <- extract_encoder_features(encoder, Z_list)
+  p_bh <- p.adjust(sapply(seq_len(64L), function(c)
+    suppressWarnings(wilcox.test(feats[y == 2L, c],
+                                  feats[y == 1L, c])$p.value)),
+    method = "BH")
+  tibble(n_sig_05 = sum(p_bh < 0.05),
+         n_sig_001 = sum(p_bh < 0.001))
+}
+enc_stats <- bind_rows(
+  cbind(regime = "transfer",       per_channel_wilcox(pt_transfer$encoder,       Z_list, sim$y)),
+  cbind(regime = "matched",        per_channel_wilcox(pt_matched$encoder,        Z_list, sim$y)),
+  cbind(regime = "transfer wide",  per_channel_wilcox(pt_transfer_wide$encoder,  Z_list, sim$y))
+)
+enc_stats |> knitr::kable()
+```
+
+# 7. What to do with the results
+
+Answers the two questions from the beginning:
+
+**Q1: Should we train one big encoder or per-disease?**
+
+- If `transfer` AUC is within ~0.05 of `matched` AUC → one big encoder works. Pretrain from ANY GC-DMS distribution (or a merged catalog across diseases) and apply everywhere.
+- If `transfer` AUC is well below (>0.10 gap) → the encoder is over-fitting compound positions. Either need per-disease encoders, or need to modify pretraining to be more generic (wider jitter, more diverse augmentation).
+
+**Q2: Should synthetic data be varied or close to empirical?**
+
+- If `transfer (wide jitter)` > `transfer (tight jitter)` → more variation during pretraining helps. Consider `size_jitter = 0.3–0.5` for production.
+- If `transfer (tight jitter)` > `transfer (wide jitter)` → tight-to-empirical is better. Keep `size_jitter = 0.15`.
+
+# 8. What to run next
+
+- **Cross-cohort transfer**: use a catalog from a *different disease* entirely (e.g. flu-catalog → AKI-classification) for stronger transfer test.
+- **Sweep more `size_jitter` values**: 0.1, 0.2, 0.3, 0.5, 0.8 to find the sweet spot.
+- **Pretrain on merged catalog**: `merge_catalogs(list(cat_aki, cat_chf, cat_flu))` — a universal encoder from multiple diseases.
+- **Retrain the winning configuration at larger scale** — the tutorial uses tiny pretraining (5 epochs × 40 steps × batch 8 = 1600 samples seen). Production would be ~30 epochs × 500 steps × batch 32 = ~500,000 samples.
