@@ -1,0 +1,405 @@
+---
+title: "Cross-cohort catalog comparison: AKI, CHF, asthma, respiratory"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+    fig_width: 8
+    fig_height: 4.5
+params:
+  output_root: "output"          # directory containing aki/, chf/, asthma/, respiratory/ subdirs
+  eps_rt: 0.003
+  eps_cv: 0.015
+  min_support_frac: 0.10
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      dpi = 96)
+library(classydms)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(tidyr)
+library(purrr)
+```
+
+# Purpose
+
+You have peak_params from four cohorts (AKI, CHF, asthma, respiratory) with disease/control labels. This report:
+
+1. Loads and builds a catalog per condition (9 total: 4 diseases + 4 controls + respiratory's "other")
+2. Reports a summary table for each catalog
+3. **Within-disease**: compares each disease to its matched control — biomarker candidates via prevalence delta and unique compounds
+4. **Cross-condition controls**: compares the 4 control catalogs — are "healthy human volatile signatures" consistent across cohorts?
+5. **Cross-condition diseases**: compares diseases to each other — shared vs disease-specific compounds
+6. **Universal catalog**: `merge_catalogs()` across everything, with per-source prevalence tracking
+
+Renders can take a while (each catalog is ~500k pool peaks). Cache is enabled on the expensive chunks so re-renders are fast.
+
+# 1. Load data and build catalogs
+
+```{r load-build, cache = TRUE}
+load_and_backfill <- function(cohort_name, root = params$output_root) {
+  proc <- readRDS(file.path(root, cohort_name, "processed.rds"))
+  pp   <- readRDS(file.path(root, cohort_name, "peak_params.rds"))
+  # Backfill if missing sample_idx_raw
+  if (is.null(pp$sample_idx_raw)) {
+    pp <- backfill_sample_idx_raw(pp, sample_names = proc$ids)
+  }
+  list(proc = proc, pp = pp)
+}
+
+# Load
+d_aki  <- load_and_backfill("aki")
+d_chf  <- load_and_backfill("chf")
+d_asth <- load_and_backfill("asthma")
+d_resp <- load_and_backfill("respiratory")
+
+# Subset by class and build catalogs
+build_from <- function(pp) build_peak_catalog(
+  pp,
+  eps_rt = params$eps_rt,
+  eps_cv = params$eps_cv,
+  min_support_frac = params$min_support_frac
+)
+
+cat_aki           <- build_from(subset_peak_params(d_aki$pp,  which(d_aki$proc$y  == 2)))
+cat_aki_control   <- build_from(subset_peak_params(d_aki$pp,  which(d_aki$proc$y  == 1)))
+cat_chf           <- build_from(subset_peak_params(d_chf$pp,  which(d_chf$proc$y  == 2)))
+cat_chf_control   <- build_from(subset_peak_params(d_chf$pp,  which(d_chf$proc$y  == 1)))
+cat_asthma        <- build_from(subset_peak_params(d_asth$pp, which(d_asth$proc$y == 2)))
+cat_asthma_control<- build_from(subset_peak_params(d_asth$pp, which(d_asth$proc$y == 1)))
+cat_resp_flu      <- build_from(subset_peak_params(d_resp$pp, which(d_resp$proc$y == 2)))
+cat_resp_other    <- build_from(subset_peak_params(d_resp$pp, which(d_resp$proc$y == 3)))
+cat_resp_control  <- build_from(subset_peak_params(d_resp$pp, which(d_resp$proc$y == 1)))
+
+all_cats <- list(
+  aki             = cat_aki,             aki_control    = cat_aki_control,
+  chf             = cat_chf,             chf_control    = cat_chf_control,
+  asthma          = cat_asthma,          asthma_control = cat_asthma_control,
+  resp_flu        = cat_resp_flu,        resp_other     = cat_resp_other,
+  resp_control    = cat_resp_control
+)
+```
+
+# 2. Summary table across all catalogs
+
+```{r summary-table}
+summary_row <- function(cat, name) {
+  s <- catalog_summary(cat, print = FALSE)
+  tibble(
+    catalog     = name,
+    n_samples   = s$n_samples,
+    n_pool_peaks= s$n_pool_peaks,
+    n_compounds = s$n_compounds,
+    n_singletons= s$n_singletons,
+    frac_singleton = round(s$fraction_singleton, 3),
+    median_prev = round(median(cat$compounds$prevalence), 3),
+    mean_prev   = round(mean(cat$compounds$prevalence), 3),
+    n_anchor_90pct = sum(cat$compounds$prevalence >= 0.90)
+  )
+}
+summary_df <- purrr::imap_dfr(all_cats, ~summary_row(.x, .y))
+knitr::kable(summary_df)
+```
+
+**How to read this table:**
+
+- Similar `n_pool_peaks / n_samples` across cohorts → similar peak detection settings and instrument behavior (good baseline)
+- Very different `n_compounds` → could reflect real differences OR that eps needs tuning for one cohort
+- `frac_singleton` — high (>20%) suggests eps is too tight or many compounds are truly rare; low (<10%) suggests eps is reasonable
+
+# 3. Within-disease: disease vs control per cohort
+
+For each of the 4 diseases, compare disease catalog to its matched control catalog. Focuses biomarker discovery: which compounds appear in disease but not control (or at different prevalence)?
+
+```{r within-disease-compare}
+within_pairs <- list(
+  aki    = list(disease = cat_aki,       control = cat_aki_control),
+  chf    = list(disease = cat_chf,       control = cat_chf_control),
+  asthma = list(disease = cat_asthma,    control = cat_asthma_control),
+  resp_flu   = list(disease = cat_resp_flu,   control = cat_resp_control),
+  resp_other = list(disease = cat_resp_other, control = cat_resp_control)
+)
+
+within_comparisons <- purrr::imap(within_pairs, function(pair, name) {
+  compare_catalogs(pair$disease, pair$control,
+                    name_a = "disease", name_b = "control")
+})
+
+within_summary <- purrr::imap_dfr(within_comparisons, function(comp, name) {
+  cbind(comparison = name, comp$summary)
+})
+knitr::kable(within_summary)
+```
+
+## Prevalence-delta distribution per disease
+
+```{r within-delta, fig.height = 6}
+delta_df <- purrr::imap_dfr(within_comparisons, function(comp, name) {
+  tibble(comparison = name, prevalence_delta = comp$shared$prevalence_delta)
+})
+ggplot(delta_df, aes(x = prevalence_delta)) +
+  geom_histogram(bins = 40, fill = "#B2182B") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_wrap(~ comparison, ncol = 2, scales = "free_y") +
+  labs(x = "prevalence delta (control − disease)",
+       y = "n shared compounds",
+       title = "Prevalence delta for shared compounds within each disease pair") +
+  theme_minimal()
+```
+
+**Reading**: bimodal or long-tailed distributions on either side indicate compounds systematically expressed differently between disease and control — the biomarker candidates.
+
+## Top biomarker candidates per disease
+
+For each disease, the shared compounds with the largest `|prevalence_delta|` are candidates: same (RT, CV) coordinates, very different prevalence between the two groups.
+
+```{r top-biomarkers}
+top_biom <- purrr::imap_dfr(within_comparisons, function(comp, name) {
+  comp$shared |>
+    dplyr::arrange(dplyr::desc(abs(prevalence_delta))) |>
+    head(10) |>
+    mutate(comparison = name) |>
+    select(comparison, rt_loc_disease, cv_loc_disease,
+           prevalence_disease, prevalence_control, prevalence_delta,
+           spatial_distance)
+})
+knitr::kable(top_biom, digits = 3)
+```
+
+Negative `prevalence_delta` = compound MORE prevalent in disease (candidate biomarker of the disease itself). Positive = LESS prevalent in disease (candidate for "protective" or "control-associated" compounds).
+
+## Only-in-disease and only-in-control compounds
+
+```{r unique-counts}
+unique_counts <- purrr::imap_dfr(within_comparisons, function(comp, name) {
+  tibble(
+    comparison = name,
+    only_disease = nrow(comp$only_a),
+    only_control = nrow(comp$only_b),
+    disease_top_prevalence = max(comp$only_a$prevalence, na.rm = TRUE),
+    control_top_prevalence = max(comp$only_b$prevalence, na.rm = TRUE)
+  )
+})
+knitr::kable(unique_counts)
+```
+
+Compounds only in disease that also have high prevalence within disease are the strongest biomarker candidates — same physical position doesn't exist in controls at all, AND it's consistently expressed in disease samples.
+
+# 4. Cross-condition controls: how consistent are "healthy" volatile signatures?
+
+If the 4 control catalogs represent healthy human volatile emissions from similar sample-collection protocols, we'd expect them to share most compounds. Big disagreements between controls could reflect batch/site/protocol differences.
+
+```{r control-vs-control}
+control_cats <- list(
+  aki_control    = cat_aki_control,
+  chf_control    = cat_chf_control,
+  asthma_control = cat_asthma_control,
+  resp_control   = cat_resp_control
+)
+
+# All pairwise combinations of controls
+control_pairs <- t(combn(names(control_cats), 2))
+control_comparisons <- lapply(seq_len(nrow(control_pairs)), function(i) {
+  a <- control_pairs[i, 1]; b <- control_pairs[i, 2]
+  cmp <- compare_catalogs(control_cats[[a]], control_cats[[b]],
+                           name_a = a, name_b = b)
+  list(pair = paste(a, "vs", b), summary = cmp$summary,
+       shared = cmp$shared)
+})
+ctrl_summary <- do.call(rbind, lapply(control_comparisons, function(x)
+  cbind(pair = x$pair, x$summary)))
+knitr::kable(ctrl_summary)
+```
+
+**High `frac_shared_a` and `frac_shared_b` on all pairs (say > 0.7)** → controls are consistent; healthy signature reproduces across cohorts. Low fractions suggest cohort-specific artifacts (batch effect, different equipment, different sample handling) — a red flag for cross-cohort analysis.
+
+## Prevalence-delta on controls
+
+Prevalence-delta for shared compounds between controls SHOULD be small if the cohorts are drawn from similar populations. Large deltas indicate cohort-level differences even in "baseline" volatiles.
+
+```{r control-delta-summary}
+ctrl_delta <- lapply(control_comparisons, function(x)
+  tibble(pair = x$pair, prevalence_delta = x$shared$prevalence_delta))
+ctrl_delta_df <- do.call(rbind, ctrl_delta)
+ctrl_delta_df |>
+  group_by(pair) |>
+  summarise(
+    median_abs_delta = median(abs(prevalence_delta)),
+    q75_abs_delta    = quantile(abs(prevalence_delta), 0.75),
+    max_abs_delta    = max(abs(prevalence_delta)),
+    n_delta_gt_0.20  = sum(abs(prevalence_delta) > 0.20)
+  ) |>
+  knitr::kable(digits = 3)
+```
+
+# 5. Cross-condition diseases: shared vs unique
+
+Same analysis but comparing diseases to each other. Compounds shared across multiple diseases at similar prevalence are "generic pathology" candidates; compounds unique to one disease are disease-specific candidates.
+
+```{r disease-vs-disease}
+disease_cats <- list(
+  aki      = cat_aki,
+  chf      = cat_chf,
+  asthma   = cat_asthma,
+  resp_flu = cat_resp_flu,
+  resp_other = cat_resp_other
+)
+
+disease_pairs <- t(combn(names(disease_cats), 2))
+disease_comparisons <- lapply(seq_len(nrow(disease_pairs)), function(i) {
+  a <- disease_pairs[i, 1]; b <- disease_pairs[i, 2]
+  cmp <- compare_catalogs(disease_cats[[a]], disease_cats[[b]],
+                           name_a = a, name_b = b)
+  list(pair = paste(a, "vs", b), summary = cmp$summary,
+       shared = cmp$shared)
+})
+dis_summary <- do.call(rbind, lapply(disease_comparisons, function(x)
+  cbind(pair = x$pair, x$summary)))
+knitr::kable(dis_summary)
+```
+
+## Which disease pairs have the most compound overlap?
+
+```{r disease-overlap-heatmap, fig.height = 4}
+overlap_mat <- matrix(NA_real_, nrow = length(disease_cats),
+                       ncol = length(disease_cats),
+                       dimnames = list(names(disease_cats),
+                                        names(disease_cats)))
+diag(overlap_mat) <- 1
+for (i in seq_len(nrow(disease_pairs))) {
+  a <- disease_pairs[i, 1]; b <- disease_pairs[i, 2]
+  frac_a <- disease_comparisons[[i]]$summary$frac_shared_a
+  frac_b <- disease_comparisons[[i]]$summary$frac_shared_b
+  overlap_mat[a, b] <- frac_a
+  overlap_mat[b, a] <- frac_b
+}
+overlap_df <- as_tibble(overlap_mat, rownames = "row") |>
+  pivot_longer(-row, names_to = "col", values_to = "frac_shared")
+
+ggplot(overlap_df, aes(x = col, y = row, fill = frac_shared)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", frac_shared)), size = 3) +
+  scale_fill_gradient(low = "#F7FBFF", high = "#08306B",
+                       name = "frac shared") +
+  labs(x = "col catalog (denominator)", y = "row catalog",
+       title = "Fraction of row-catalog compounds found in col-catalog") +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+Read the matrix: element `[i, j]` = fraction of compounds in disease `i` that also appear in disease `j`. Note asymmetry — smaller catalogs have higher fractions.
+
+# 6. Universal catalog across everything
+
+```{r universal, cache = TRUE}
+universal <- merge_catalogs(
+  list(cat_aki, cat_aki_control,
+       cat_chf, cat_chf_control,
+       cat_asthma, cat_asthma_control,
+       cat_resp_flu, cat_resp_other, cat_resp_control),
+  names = c("aki", "aki_ctrl",
+             "chf", "chf_ctrl",
+             "asthma", "asthma_ctrl",
+             "resp_flu", "resp_other", "resp_ctrl")
+)
+sprintf("Universal catalog: %d compounds",
+        nrow(universal$compounds))
+```
+
+## Per-source presence pattern
+
+For each merged compound, how many source catalogs contribute?
+
+```{r per-source}
+per_source_df <- do.call(rbind, universal$compounds$per_source_prevalence) |>
+  as.data.frame()
+colnames(per_source_df) <- universal$parameters$source_names
+per_source_df$n_sources_present <-
+  rowSums(per_source_df[, universal$parameters$source_names] > 0)
+per_source_df$compound_id <- universal$compounds$compound_id
+
+sprintf("Compounds present in ALL 9 sources: %d",
+        sum(per_source_df$n_sources_present == 9))
+sprintf("Compounds present in >= 5 sources:  %d",
+        sum(per_source_df$n_sources_present >= 5))
+sprintf("Compounds present in only 1 source: %d",
+        sum(per_source_df$n_sources_present == 1))
+
+ggplot(per_source_df, aes(x = n_sources_present)) +
+  geom_bar(fill = "#B2182B") +
+  scale_x_continuous(breaks = 1:9) +
+  labs(x = "n sources compound is present in",
+       y = "n compounds",
+       title = "Distribution of compound source-coverage in universal catalog") +
+  theme_minimal()
+```
+
+Compounds at `n_sources_present = 9` are candidates for "universal human volatile signature" — appear across every cohort we tested.
+
+## Compounds unique to disease groups
+
+Compounds present in disease sources but NOT in any control source:
+
+```{r disease-only-compounds}
+disease_sources <- c("aki", "chf", "asthma", "resp_flu", "resp_other")
+control_sources <- c("aki_ctrl", "chf_ctrl", "asthma_ctrl", "resp_ctrl")
+
+per_source_df$disease_hits <- rowSums(per_source_df[, disease_sources] > 0)
+per_source_df$control_hits <- rowSums(per_source_df[, control_sources] > 0)
+
+disease_only <- per_source_df[per_source_df$disease_hits > 0 &
+                                  per_source_df$control_hits == 0, ]
+control_only <- per_source_df[per_source_df$control_hits > 0 &
+                                  per_source_df$disease_hits == 0, ]
+
+sprintf("Compounds in >=1 disease source AND 0 control sources: %d",
+        nrow(disease_only))
+sprintf("Compounds in >=1 control source AND 0 disease sources: %d",
+        nrow(control_only))
+```
+
+Cross-reference these against the within-disease biomarker candidates from Section 3 — compounds hitting both lists are the strongest signal.
+
+## Multi-disease shared but control-absent compounds
+
+Compounds in ≥ 2 disease sources but 0 control sources: these are candidates for "generic pathology" biomarkers.
+
+```{r multi-disease-shared}
+multi_disease <- per_source_df[per_source_df$disease_hits >= 2 &
+                                  per_source_df$control_hits == 0, ]
+sprintf("Compounds in >= 2 disease sources but 0 controls: %d",
+        nrow(multi_disease))
+if (nrow(multi_disease) > 0) {
+  # Add compound rt/cv for reference
+  multi_disease_details <- universal$compounds[
+    match(multi_disease$compound_id, universal$compounds$compound_id),
+    c("compound_id", "rt_loc", "cv_loc", "prevalence")]
+  multi_disease_details$n_diseases_present <- multi_disease$disease_hits
+  print(knitr::kable(head(multi_disease_details, 20), digits = 3))
+}
+```
+
+# 7. Save outputs
+
+Save the universal catalog and comparison objects so downstream steps (biomarker candidate ranking, cross-cohort encoder pretraining) can pick up without recomputing.
+
+```{r save-outputs}
+outdir <- "catalog_comparison_outputs"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+saveRDS(all_cats,             file.path(outdir, "all_catalogs.rds"))
+saveRDS(within_comparisons,   file.path(outdir, "within_disease_comparisons.rds"))
+saveRDS(control_comparisons,  file.path(outdir, "control_vs_control_comparisons.rds"))
+saveRDS(disease_comparisons,  file.path(outdir, "disease_vs_disease_comparisons.rds"))
+saveRDS(universal,            file.path(outdir, "universal_catalog.rds"))
+sprintf("All comparison objects saved to %s/", outdir)
+```
+
+# What to do next
+
+- **Rank biomarker candidates**: combine the "only in disease" list (Section 3) with the "high `|prevalence_delta|`" list (Section 3) and the "cross-disease shared but control-absent" list (Section 6). Compounds hitting all three are your strongest candidates.
+- **Universal encoder pretraining**: `pretrain_denoising_online(catalog = universal, ...)` gives you an encoder trained on volatiles from all cohorts. Test whether it outperforms per-cohort encoders on any specific disease's classification task.
+- **Check the summary table (Section 2)** for anomalies: if one cohort has 10x fewer pool peaks per sample, or 10x more singletons, that cohort might have a preprocessing or peak-detection issue that should be addressed before trusting the cross-cohort analysis.
