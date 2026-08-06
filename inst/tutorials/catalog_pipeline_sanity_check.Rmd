@@ -1,0 +1,308 @@
+---
+title: "Catalog pipeline sanity check — end-to-end with shared backgrounds"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 3.5, dpi = 96)
+library(classydms)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(pROC)
+
+plot_mat <- function(mat, title = "", low = "white",
+                     high = "#B2182B", limits = NULL) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() +
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        name = "intensity", oob = scales::squish) +
+    scale_y_reverse() +
+    coord_fixed(ratio = 0.5) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank())
+}
+plot_div <- function(mat, title = "", limits = NULL) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  if (is.null(limits)) limits <- c(-1, 1) * max(abs(mat))
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                          midpoint = 0, limits = limits,
+                          oob = scales::squish, name = "saliency") +
+    scale_y_reverse() + coord_fixed(ratio = 0.5) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank())
+}
+```
+
+# Purpose
+
+The [peak_params pipeline_sanity_check](pipeline_sanity_check.html) validates the pipeline end-to-end using per-sample-random peak positions. This tutorial does the same for the **catalog** flow — where every synthetic sample draws from a shared compound catalog. Catalog-based synthetic data structurally matches real GC-DMS, so the encoder learns the right inductive bias during pretraining.
+
+Acceptance targets on sanity-max catalog scenario:
+
+- Case/control AUC ≥ 0.95
+- Biomarker recovery per-pixel AUC ≥ 0.85
+- Encoder channels significant at BH q < 0.05: ≥ 30 / 64
+
+If all three pass at toy scale, the catalog machinery works end-to-end.
+
+# 1. Toy setup
+
+```{r toy-setup}
+# Build a toy peak_params that simulates real compound structure:
+# ~20 "compounds" at fixed positions, each appearing in most samples
+# with small position jitter. Plus a smaller number of sample-specific
+# peaks to create low-prevalence catalog entries.
+set.seed(1)
+n_samples <- 20L
+n_compounds <- 20L
+comp_centers <- tibble(
+  rt = runif(n_compounds, 0.15, 0.85),
+  cv = runif(n_compounds, 0.20, 0.80),
+  base_sigma_rt = exp(rnorm(n_compounds, log(4), 0.3)),
+  base_sigma_cv = exp(rnorm(n_compounds, log(1.5), 0.2)),
+  base_intensity = exp(rnorm(n_compounds, log(0.8), 0.5)),
+  prevalence = runif(n_compounds, 0.4, 1.0)   # each compound has intrinsic prevalence
+)
+# Emit per-sample peaks: for each compound, roll Bernoulli(prevalence),
+# place a peak near center with small jitter and morphology variation
+rt_loc_raw <- c(); cv_loc_raw <- c()
+sigma_rt_raw <- c(); sigma_cv_raw <- c(); intensity_raw <- c()
+sample_idx_raw <- c()
+for (i in seq_len(n_samples)) {
+  for (k in seq_len(n_compounds)) {
+    if (runif(1) >= comp_centers$prevalence[k]) next
+    rt_loc_raw <- c(rt_loc_raw,
+                    comp_centers$rt[k] + rnorm(1, 0, 0.005))
+    cv_loc_raw <- c(cv_loc_raw,
+                    comp_centers$cv[k] + rnorm(1, 0, 0.005))
+    sigma_rt_raw <- c(sigma_rt_raw,
+                      comp_centers$base_sigma_rt[k] * exp(rnorm(1, 0, 0.1)))
+    sigma_cv_raw <- c(sigma_cv_raw,
+                      comp_centers$base_sigma_cv[k] * exp(rnorm(1, 0, 0.1)))
+    intensity_raw <- c(intensity_raw,
+                      comp_centers$base_intensity[k] * exp(rnorm(1, 0, 0.15)))
+    sample_idx_raw <- c(sample_idx_raw, i)
+  }
+  # Add a few sample-specific peaks
+  n_extra <- rpois(1, 3)
+  for (e in seq_len(n_extra)) {
+    rt_loc_raw <- c(rt_loc_raw, runif(1, 0.1, 0.9))
+    cv_loc_raw <- c(cv_loc_raw, runif(1, 0.15, 0.85))
+    sigma_rt_raw <- c(sigma_rt_raw, exp(rnorm(1, log(4), 0.3)))
+    sigma_cv_raw <- c(sigma_cv_raw, exp(rnorm(1, log(1.5), 0.2)))
+    intensity_raw <- c(intensity_raw, exp(rnorm(1, log(0.5), 0.5)))
+    sample_idx_raw <- c(sample_idx_raw, i)
+  }
+}
+n_peaks_per_sample <- as.integer(table(factor(sample_idx_raw,
+                                                levels = seq_len(n_samples))))
+toy_params <- list(
+  n_peaks_detected = length(rt_loc_raw), n_samples = n_samples,
+  n_peaks = list(mean = mean(n_peaks_per_sample),
+                 sd   = sd(n_peaks_per_sample),
+                 values = n_peaks_per_sample),
+  rt_loc = list(mean = mean(rt_loc_raw), sd = sd(rt_loc_raw)),
+  cv_loc = list(mean = mean(cv_loc_raw), sd = sd(cv_loc_raw)),
+  sigma_rt = list(meanlog = mean(log(sigma_rt_raw)),
+                   sdlog = sd(log(sigma_rt_raw))),
+  sigma_cv = list(meanlog = mean(log(sigma_cv_raw)),
+                   sdlog = sd(log(sigma_cv_raw))),
+  intensity = list(meanlog = mean(log(intensity_raw)),
+                    sdlog = sd(log(intensity_raw))),
+  noise = list(mean = 0.005, sd = 0.005),
+  rt_loc_raw     = rt_loc_raw,
+  cv_loc_raw     = cv_loc_raw,
+  sigma_rt_raw   = sigma_rt_raw,
+  sigma_cv_raw   = sigma_cv_raw,
+  intensity_raw  = intensity_raw,
+  sample_idx_raw = sample_idx_raw
+)
+
+catalog <- build_peak_catalog(toy_params,
+                               eps_rt = 0.015, eps_cv = 0.04,
+                               min_support_frac = 0.10)
+H <- 150L; W <- 30L
+sprintf("Catalog: %d compounds (from %d pool peaks, %d toy samples)",
+        nrow(catalog$compounds), length(rt_loc_raw), toy_params$n_samples)
+```
+
+# 2. Sanity-max biomarker spec
+
+```{r biom-spec}
+# On this small toy catalog the top-5% intensity filter can leave too
+# few candidates; relax to top 30% for the tutorial. Real-scale
+# catalogs (thousands of compounds) work fine with the preset default.
+biom_ids <- pick_catalog_biomarkers(catalog,
+                                     n_biomarkers = 5L,
+                                     min_prevalence = 0.3,
+                                     min_intensity_quantile = 0.70,
+                                     seed = 42L)
+biom_spec <- build_biomarker_spec_catalog(biom_ids,
+  case_prevalence = 1.0, control_prevalence = 0.0,
+  case_intensity_mult = 10.0)
+biom_spec
+```
+
+# 3. Simulate the cohort
+
+```{r simulate, cache = TRUE}
+sim <- simulate_case_control_from_catalog(
+  catalog, biomarkers = biom_spec,
+  n_cases = 40L, n_controls = 40L,
+  H = H, W = W, seed = 7L
+)
+Z_list <- lapply(sim$samples, `[[`, "Z")
+y <- sim$y
+table(y, dnn = "class")
+```
+
+Sanity of the simulation: biomarker firing rates by class
+
+```{r firing-check}
+firing <- as.data.frame(sim$per_sample_firing)
+colnames(firing) <- paste0("bio_", biom_spec$compound_id)
+firing$class <- factor(y, levels = c(1, 2), labels = c("control", "case"))
+firing |>
+  tidyr::pivot_longer(-class, names_to = "biomarker", values_to = "fired") |>
+  group_by(class, biomarker) |>
+  summarise(prevalence = mean(fired), .groups = "drop")
+```
+
+Cases should fire biomarkers at 100%, controls at 0%.
+
+# 4. Case vs control visualization
+
+```{r viz, fig.height = 4}
+case_i    <- which(y == 2)[1]; ctrl_i    <- which(y == 1)[1]
+Z_case    <- Z_list[[case_i]]; Z_control <- Z_list[[ctrl_i]]
+Z_diff    <- Z_case - Z_control
+
+biom_locs <- catalog$compounds[
+  match(biom_spec$compound_id, catalog$compounds$compound_id),
+  c("rt_loc", "cv_loc")]
+b_r <- biom_locs$rt_loc * H; b_c <- biom_locs$cv_loc * W
+
+mark <- function(p) p + annotate("point", x = b_c, y = b_r,
+  shape = 21, color = "cyan", fill = NA, size = 6, stroke = 1.2)
+
+lim <- c(0, max(c(Z_case, Z_control)))
+gridExtra::grid.arrange(
+  mark(plot_mat(Z_case,    "case",    limits = lim)),
+  mark(plot_mat(Z_control, "control", limits = lim)),
+  mark(plot_div(Z_diff, "case - control")),
+  ncol = 3
+)
+```
+
+Non-biomarker positions should look nearly identical between case and control (that's the shared background). The circles (biomarker positions) should be bright in case, absent in control.
+
+# 5. Pretrain encoder on the catalog
+
+```{r pretrain, cache = TRUE}
+pt <- pretrain_denoising_online(
+  peak_params = NULL, catalog = catalog,
+  H = H, W = W,
+  steps_per_epoch = 60L, epochs = 8L, batch_size = 16L,
+  size_jitter = 0.15, noise_scale = 3.0, val_n = 32L,
+  device = "cpu", seed = 1L, verbose = FALSE
+)
+encoder <- pt$encoder
+```
+
+# 6. Encoder-channel sanity check
+
+```{r encoder-check, fig.height = 3.5}
+feats <- extract_encoder_features(encoder, Z_list, device = "cpu")
+p_raw <- sapply(seq_len(64L), function(c)
+  suppressWarnings(wilcox.test(feats[y == 2L, c],
+                                feats[y == 1L, c])$p.value))
+p_bh <- p.adjust(p_raw, method = "BH")
+n_sig_05  <- sum(p_bh < 0.05, na.rm = TRUE)
+n_sig_001 <- sum(p_bh < 0.001, na.rm = TRUE)
+sprintf("Encoder channels significant at BH q < 0.05:  %d / 64", n_sig_05)
+sprintf("Encoder channels significant at BH q < 0.001: %d / 64", n_sig_001)
+
+ggplot(tibble(channel = seq_len(64L), p_bh = p_bh),
+       aes(x = channel, y = -log10(p_bh))) +
+  geom_col(fill = "#B2182B") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+              color = "grey40") +
+  geom_hline(yintercept = -log10(0.001), linetype = "dashed",
+              color = "grey60") +
+  labs(x = "encoder channel", y = "-log10(BH q)",
+       title = "Per-channel Wilcoxon by class") +
+  theme_minimal()
+```
+
+# 7. Classify
+
+```{r classify}
+elnet <- cv_encoder_elastic_net(encoder, Z_list, y,
+                                  k = 5L, alpha = 0.5, seed = 1L)
+sprintf("Case/control AUC (5-fold CV): %.3f", elnet$auc)
+sprintf("Non-zero elastic-net coefs: %d / 64", sum(elnet$coefs != 0))
+```
+
+# 8. Saliency + biomarker recovery
+
+```{r saliency, fig.height = 4}
+case_indices <- which(y == 2L)
+orig_dims <- lapply(sim$samples,
+                     function(s) c(H = nrow(s$Z), W = ncol(s$Z)))
+sal <- aggregate_saliency_masked(encoder, Z_list, coefs = elnet$coefs,
+                                   sample_indices = case_indices,
+                                   orig_dims = orig_dims)
+
+biom_locs <- catalog$compounds[
+  match(biom_spec$compound_id, catalog$compounds$compound_id),
+  c("rt_loc", "cv_loc")]
+recovery <- evaluate_biomarker_recovery(sal, biom_locs,
+                                         H = H, W = W,
+                                         match_radius_rt = 8L,
+                                         match_radius_cv = 2L,
+                                         top_k = nrow(biom_spec))
+sprintf("Biomarker recovery per-pixel AUC: %.3f", recovery$auc_per_pixel)
+sprintf("Recall @ top-%d: %.3f", nrow(biom_spec), recovery$recall_at_k)
+
+plot_div(sal, "aggregated saliency: cases")
+```
+
+# 9. Summary vs acceptance targets
+
+```{r summary}
+tibble(
+  metric = c("Case/control AUC",
+             "Biomarker recovery AUC",
+             "Encoder channels (BH q < 0.05)"),
+  observed = c(sprintf("%.3f", elnet$auc),
+               sprintf("%.3f", recovery$auc_per_pixel),
+               sprintf("%d / 64", n_sig_05)),
+  target = c(">= 0.95", ">= 0.85", ">= 30 / 64"),
+  pass = c(elnet$auc >= 0.95,
+           recovery$auc_per_pixel >= 0.85,
+           n_sig_05 >= 30)
+) |> knitr::kable()
+```
+
+If all three pass, the catalog pipeline works end-to-end. Ready to run at real scale via `inst/scripts/run_catalog_sanity_max.R` on your actual data.
+
+# What comes next
+
+- Try harder scenarios: realistic-intensity (`case_intensity_mult = 1.0`) with imperfect prevalence (`case_prev = 0.80, control_prev = 0.20`) — this is the honest biomarker discovery difficulty
+- Cross-cohort transfer: pretrain on one disease's catalog, classify on another. Uses `split_catalog` or per-condition catalogs.
+- Universal catalog: `merge_catalogs(list(cat_aki, cat_chf, cat_flu))` to build one encoder that works across diseases.

@@ -63,6 +63,8 @@ plot_mat_diff <- function(mat, title = "", limits = NULL,
 
 Every step of the classydms pipeline is validated in isolation (report on real cohorts, tutorial on toy params). But there's no ground truth for whether the **full pipeline** — preprocess → params → pretrain → classify → saliency — can recover a signal we *know* is there.
 
+> **This tutorial uses the peak_params flow** (each sample independently draws random peak positions from a common pool). A newer alternative — the **catalog flow** — matches real GC-DMS structure more closely (peak positions are conserved across samples, only prevalence varies). If you're building a new analysis today, prefer the catalog flow: see `catalog_pipeline_sanity_check` and `catalog_synthesis_walkthrough`. The peak_params flow documented here is still valid and useful as a reference.
+
 This tutorial injects known "biomarker" peaks into a synthetic case group and asks two questions:
 
 1. **Classification**: can the pipeline distinguish cases from controls? (Metric: cross-validated AUC.)

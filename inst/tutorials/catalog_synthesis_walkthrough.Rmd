@@ -1,0 +1,278 @@
+---
+title: "Walkthrough: catalog-based synthetic generation step by step"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 3.5, dpi = 96)
+library(classydms)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+
+plot_mat <- function(mat, title = "", low = "white",
+                     high = "#B2182B", limits = NULL, log = FALSE) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(rt = seq_len(H), cv = seq_len(W))
+  df$val <- as.vector(mat)
+  scale <- if (log) {
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        trans = "log1p", name = "log(1+I)",
+                        oob = scales::squish)
+  } else {
+    scale_fill_gradient(low = low, high = high, limits = limits,
+                        name = "intensity", oob = scales::squish)
+  }
+  ggplot(df, aes(x = cv, y = rt, fill = val)) +
+    geom_tile() + scale + scale_y_reverse() +
+    coord_fixed(ratio = 0.5) +
+    labs(x = "CV pixel", y = "RT pixel", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank())
+}
+```
+
+# Why this walkthrough exists
+
+The [synthesis walkthrough](synthesis_walkthrough.html) covers `generate_one_synthetic` — the *peak_params* flow, where every synthetic sample independently draws random peak positions from a common pool. The result: each sample looks completely different from the next.
+
+**Real GC-DMS doesn't work that way.** Subjects share the same underlying compounds — peak positions are conserved across most samples, only their presence and intensity vary. To match that, we use a **peak catalog**: a data-derived list of compound positions with per-compound prevalences.
+
+This walkthrough shows how one catalog-based synthetic sample is generated, then how many samples together produce the "shared backbone" structure that matches real data.
+
+# 0. Compact cheat sheet
+
+| Step | Distribution / operation | Source |
+|---|---|---|
+| Which compounds fire? | `Bernoulli(prevalence_i)` per compound | catalog compound `i` |
+| Peak location | `(rt_loc_i, cv_loc_i)` + jitter | catalog compound center |
+| Peak morphology | bootstrap from compound's `(sigma_rt_obs, sigma_cv_obs, intensity_obs)` | catalog |
+| Size jitter | `log-Normal(0, size_jitter²)` on top | parametric |
+| Background noise | folded `Normal(catalog$noise$mean, catalog$noise$sd)` | catalog |
+
+The key difference from `generate_one_synthetic`: compound *identities* are shared across all synthetic samples (same catalog), only which ones *fire* varies.
+
+# 1. Build a tiny catalog
+
+For a fully-visualizable canvas we hand-build a small `peak_params` (as in `synthesis_walkthrough`), then run `build_peak_catalog`.
+
+```{r toy-params}
+set.seed(1)
+N_POOL <- 200L
+peaks_obs <- tibble(
+  rt_loc    = runif(N_POOL, 0.10, 0.90),
+  cv_loc    = runif(N_POOL, 0.15, 0.85),
+  sigma_rt  = exp(rnorm(N_POOL, log(4), 0.4)),
+  sigma_cv  = exp(rnorm(N_POOL, log(1.5), 0.3)),
+  intensity = exp(rnorm(N_POOL, log(0.5), 0.7))
+)
+# Assign each pool peak to a random "sample" so we can compute prevalence
+sample_idx <- sample(1:12, size = N_POOL, replace = TRUE)
+
+toy_params <- list(
+  n_peaks_detected = nrow(peaks_obs),
+  n_samples = 12L,
+  n_peaks   = list(mean = 20, sd = 5, values = as.integer(table(factor(sample_idx, levels=1:12)))),
+  rt_loc    = list(mean = mean(peaks_obs$rt_loc), sd = sd(peaks_obs$rt_loc)),
+  cv_loc    = list(mean = mean(peaks_obs$cv_loc), sd = sd(peaks_obs$cv_loc)),
+  sigma_rt  = list(meanlog = mean(log(peaks_obs$sigma_rt)),
+                   sdlog   = sd(log(peaks_obs$sigma_rt))),
+  sigma_cv  = list(meanlog = mean(log(peaks_obs$sigma_cv)),
+                   sdlog   = sd(log(peaks_obs$sigma_cv))),
+  intensity = list(meanlog = mean(log(peaks_obs$intensity)),
+                   sdlog   = sd(log(peaks_obs$intensity))),
+  noise     = list(mean = 0.005, sd = 0.005),
+  rt_loc_raw    = peaks_obs$rt_loc,
+  cv_loc_raw    = peaks_obs$cv_loc,
+  sigma_rt_raw  = peaks_obs$sigma_rt,
+  sigma_cv_raw  = peaks_obs$sigma_cv,
+  intensity_raw = peaks_obs$intensity,
+  sample_idx_raw = sample_idx
+)
+
+catalog <- build_peak_catalog(toy_params,
+                               eps_rt = 0.02, eps_cv = 0.06,
+                               min_support_frac = 0.10)
+H <- 150L; W <- 30L
+sprintf("Toy catalog: %d compounds from %d pool peaks across %d samples",
+        nrow(catalog$compounds), N_POOL, toy_params$n_samples)
+```
+
+Wider eps than typical for real data because our toy pool is small and uniformly distributed. In production, use `eps_rt = 0.003, eps_cv = 0.015` and expect thousands of compounds.
+
+# 2. One compound → one synthetic peak
+
+Every compound in the catalog carries:
+
+- **Center**: `rt_loc, cv_loc` (fraction of image)
+- **Prevalence**: what fraction of real samples had a peak here
+- **Observed morphology**: vectors `sigma_rt_obs, sigma_cv_obs, intensity_obs` — one entry per pool peak that contributed to this compound
+
+To decide whether a compound fires in a given synthetic sample:
+
+```{r one-compound}
+compound_1 <- catalog$compounds[1, ]
+cat(sprintf(
+  "Compound 1: center=(%.3f, %.3f), prevalence=%.2f, %d observed morphologies\n",
+  compound_1$rt_loc, compound_1$cv_loc, compound_1$prevalence,
+  compound_1$n_observations))
+cat("Observed intensities:", round(compound_1$intensity_obs[[1]], 3), "\n")
+cat("Observed sigma_rt:  ", round(compound_1$sigma_rt_obs[[1]], 2), "\n")
+```
+
+To generate a peak for this compound in one sample:
+
+```{r one-peak, fig.height = 3}
+set.seed(5)
+# 1. Bernoulli roll — did it fire?
+fire <- runif(1) < compound_1$prevalence
+cat(sprintf("Roll runif(1) = %.3f, prevalence = %.2f, fired = %s\n",
+            runif(1), compound_1$prevalence, fire))
+
+# Force it to fire so we can visualize
+fire <- TRUE
+
+# 2. Bootstrap one observed morphology triple
+j <- sample.int(compound_1$n_observations, 1L)
+sig_rt   <- compound_1$sigma_rt_obs[[1]][j]
+sig_cv   <- compound_1$sigma_cv_obs[[1]][j]
+base_amp <- compound_1$intensity_obs[[1]][j]
+cat(sprintf("Bootstrap idx %d: sigma_rt=%.2f, sigma_cv=%.2f, intensity=%.3f\n",
+            j, sig_rt, sig_cv, base_amp))
+
+# 3. Place at compound center + small jitter
+location_jitter_rt <- 2; location_jitter_cv <- 1
+mu_rt <- compound_1$rt_loc * H + rnorm(1, 0, location_jitter_rt)
+mu_cv <- compound_1$cv_loc * W + rnorm(1, 0, location_jitter_cv)
+
+# 4. Size jitter and amplitude
+size_jitter <- 0.15
+scale_factor <- exp(rnorm(1, 0, size_jitter))
+sig_rt <- max(sig_rt * scale_factor, 0.8)
+sig_cv <- max(sig_cv * scale_factor, 0.8)
+amp <- base_amp * (0.5 + 0.5 * scale_factor)
+
+# 5. Rasterize
+rows <- seq_len(H); cols <- seq_len(W)
+g_rt <- exp(-0.5 * ((rows - mu_rt) / sig_rt)^2)
+g_cv <- exp(-0.5 * ((cols - mu_cv) / sig_cv)^2)
+one_peak <- amp * outer(g_rt, g_cv)
+plot_mat(one_peak,
+         title = sprintf("One compound fired: mu=(%.0f, %.0f), amp=%.2f",
+                         mu_rt, mu_cv, amp))
+```
+
+The same compound in a **different** sample would land at nearly the same (mu_rt, mu_cv) — the jitter is small — but with (potentially) different morphology (different observed triple bootstrapped) and possibly not fire at all if the Bernoulli roll says no.
+
+# 3. One sample — iterate over the whole catalog
+
+```{r one-sample, fig.height = 4}
+set.seed(1)
+sample_1 <- generate_one_synthetic_from_catalog(
+  catalog, H = H, W = W, add_noise = TRUE)
+cat(sprintf("Sample 1: %d of %d compounds fired\n",
+            sum(sample_1$fired), length(sample_1$fired)))
+plot_mat(sample_1$noisy,
+         title = sprintf("One catalog-generated sample (%d/%d compounds fired)",
+                         sum(sample_1$fired), length(sample_1$fired)))
+```
+
+Which specific compounds fired is random per sample, but the *positions* they can fire at are fixed by the catalog.
+
+# 4. Multiple samples share a backbone — the whole point
+
+Generate 6 samples from the same catalog and see the shared structure emerge:
+
+```{r many-samples, fig.height = 6.5}
+set.seed(7)
+samples <- lapply(1:6, function(i)
+  generate_one_synthetic_from_catalog(catalog, H, W, add_noise = TRUE))
+
+max_val <- max(sapply(samples, function(s) max(s$noisy)))
+plots <- lapply(seq_along(samples), function(i) {
+  plot_mat(samples[[i]]$noisy,
+           title = sprintf("Sample %d (%d fired)", i, sum(samples[[i]]$fired)),
+           limits = c(0, max_val))
+})
+gridExtra::grid.arrange(grobs = plots, ncol = 3)
+```
+
+**How to read this:** look at the same coordinates across the 6 panels. Where a compound has high prevalence (say ≥ 0.75), the peak is present in most panels. Where prevalence is lower, the peak appears in fewer panels. **All panels use the same 2D layout** — that's the "shared backbone" property.
+
+Compare to the peak_params flow (`generate_one_synthetic`), where each of these samples would have peaks at *completely different* positions because each sample independently draws random peak locations from the pool. Catalog flow → position-consistent. Peak_params flow → position-random.
+
+# 5. Averaging many samples reveals the compound landscape
+
+```{r average, fig.height = 4}
+set.seed(11)
+N <- 30
+many <- lapply(seq_len(N), function(i)
+  generate_one_synthetic_from_catalog(catalog, H, W, add_noise = FALSE))
+avg <- Reduce(`+`, lapply(many, `[[`, "clean")) / N
+
+plot_mat(avg, title = sprintf(
+  "Mean of %d catalog-generated samples", N))
+```
+
+The averaged image looks like a "prevalence-weighted heatmap" of the catalog: bright spots where high-prevalence compounds sit (they fire in ~every sample), dimmer spots where low-prevalence compounds sit (they fire less often, so their contribution to the mean is smaller). Compare this to what you'd see if you averaged real samples — you should see the same shared-compound structure.
+
+# 6. Biomarker override — case vs control
+
+Biomarkers work by *overriding* the catalog prevalence for selected compounds within each group. Everything else uses the catalog's own prevalence.
+
+```{r biomarker, fig.height = 4}
+# Pick 2 compounds as biomarkers (compound_ids 3 and 7)
+biom_ids <- c(3L, 7L)
+
+# In cases: force these compounds to always fire, boost intensity 3x
+prev_override_case <- setNames(c(1.0, 1.0), as.character(biom_ids))
+int_mult_case      <- setNames(c(3.0, 3.0), as.character(biom_ids))
+
+# In controls: force these compounds to never fire
+prev_override_ctrl <- setNames(c(0.0, 0.0), as.character(biom_ids))
+int_mult_ctrl      <- setNames(c(1.0, 1.0), as.character(biom_ids))
+
+set.seed(21)
+case_avg <- Reduce(`+`, lapply(1:30, function(i)
+  generate_one_synthetic_from_catalog(catalog, H, W, add_noise = FALSE,
+    prevalence_override = prev_override_case,
+    intensity_mult = int_mult_case)$clean)) / 30
+
+ctrl_avg <- Reduce(`+`, lapply(1:30, function(i)
+  generate_one_synthetic_from_catalog(catalog, H, W, add_noise = FALSE,
+    prevalence_override = prev_override_ctrl,
+    intensity_mult = int_mult_ctrl)$clean)) / 30
+
+biom_loc <- catalog$compounds[
+  match(biom_ids, catalog$compounds$compound_id),
+  c("rt_loc", "cv_loc")]
+b_r <- biom_loc$rt_loc * H
+b_c <- biom_loc$cv_loc * W
+mark_biom <- function(p) {
+  p + annotate("point", x = b_c, y = b_r, shape = 21,
+               color = "cyan", fill = NA, size = 6, stroke = 1.2)
+}
+
+lim <- c(0, max(c(case_avg, ctrl_avg)))
+gridExtra::grid.arrange(
+  mark_biom(plot_mat(case_avg, "case average (30 samples)", limits = lim)),
+  mark_biom(plot_mat(ctrl_avg, "control average (30 samples)", limits = lim)),
+  ncol = 2
+)
+```
+
+Cyan circles mark biomarker positions. In cases, they should be bright (always fire, 3× intensity). In controls, they should be dark (never fire). **Everything else** (non-biomarker compounds) should look nearly identical between the two panels — the shared background from the catalog.
+
+That's the whole design: shared background + differential biomarkers. Simple, honest, and matches real biomarker studies.
+
+# Where to go next
+
+- **`catalog_pipeline_sanity_check`** — end-to-end pipeline validation using this catalog approach.
+- **`catalog_transfer_experiment`** — does an encoder pretrained on catalog A generalize to catalog B?
+- **`catalog_comparison_walkthrough`** — compare catalogs across cohorts to find shared vs unique compounds.
+- **`inst/scripts/run_catalog_sanity_max.R`** — production-scale script to run on your own data.

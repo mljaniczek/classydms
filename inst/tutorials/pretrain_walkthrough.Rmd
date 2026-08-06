@@ -242,6 +242,28 @@ manifest_fields <- c(
 cat(manifest_fields, sep = "\n")
 ```
 
+# Pretraining from a peak catalog
+
+An alternative to `peak_params`-based pretraining: pass `catalog = my_catalog` and set `peak_params = NULL`. The batch generator switches to `generate_one_synthetic_from_catalog` (per-compound Bernoulli firing) instead of `generate_one_synthetic` (per-sample random peaks from pool).
+
+Why you'd prefer catalog-based pretraining: real GC-DMS samples share the same underlying compounds across subjects; the catalog preserves that shared-backbone structure so the encoder learns the correct inductive bias. See `catalog_pipeline_sanity_check` for an end-to-end example.
+
+```{r catalog-pretrain, eval = FALSE}
+# Assuming you already have a catalog:
+pretrain_result <- pretrain_denoising_online(
+  peak_params = NULL,
+  catalog     = my_catalog,
+  H = pad_dims$H, W = pad_dims$W,
+  steps_per_epoch = 500L, epochs = 30L, batch_size = 32L,
+  size_jitter = 0.15,     # still applies to per-compound morphology jitter
+  noise_scale = 3.0,      # applies to catalog$noise$sd
+  device = "mps",
+  save_path = "encoder.pt"
+)
+```
+
+Arguments that apply *only* to the peak_params flow (ignored when `catalog` is set): `location_mode`, `attribute_mode`.
+
 # Practical tips
 
 - **Always pass `val_real`** in real runs — it's the single most useful signal for whether synthetic pretraining generalizes.

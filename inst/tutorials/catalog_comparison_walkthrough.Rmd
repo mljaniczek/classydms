@@ -1,0 +1,201 @@
+---
+title: "Comparing and merging catalogs across cohorts"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.5, dpi = 96)
+library(classydms)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(purrr)
+```
+
+# Purpose
+
+Once you have peak catalogs from multiple cohorts (per-condition, per-batch, or split by any grouping), two natural questions:
+
+1. **Which compounds are shared vs unique across cohorts?** Shared compounds are the "universal volatile signature" — reference points that appear in every human. Compounds only in one cohort might be biomarker candidates or artifacts of that cohort.
+2. **Can we merge cohort-specific catalogs into a universal catalog** for cross-cohort encoder pretraining?
+
+Two functions cover both:
+
+- **`compare_catalogs(a, b)`** — pairwise comparison. Reports shared / only-A / only-B compounds and per-catalog prevalence for shared ones.
+- **`merge_catalogs(list)`** — union merge. Overlapping compounds combine into one entry with per-source prevalence tracking.
+
+This tutorial demonstrates both on the small flu subset by splitting into disease vs control catalogs.
+
+# 1. Setup — two catalogs from the same cohort split by class
+
+```{r setup-catalogs, cache = TRUE}
+disease_dir <- if (requireNamespace("here", quietly = TRUE)) {
+  here::here("sampledata", "influenza")
+} else "sampledata/influenza"
+control_dir <- if (requireNamespace("here", quietly = TRUE)) {
+  here::here("sampledata", "influenza_controls")
+} else "sampledata/influenza_controls"
+
+loaded <- load_dms_directory(disease_dir, control_dir,
+  pattern = "POS.*\\.(xls|txt|tsv|csv)$")
+samples_proc <- map(loaded$samples, ~process_one_sample(.x,
+  sg_p = 3, sg_n = 21, asls_lambda = 1e6,
+  asls_p = 0.01, asls_niter = 10))
+samples_dust <- map(samples_proc,
+                     ~baseline_basement(.x, basement_thr = 0.005))
+b_list <- map(samples_dust, ~trim_bounds_from_occupancy(.x$Z))
+R0 <- max(sapply(samples_dust, function(s) nrow(s$Z)))
+C0 <- max(sapply(samples_dust, function(s) ncol(s$Z)))
+gb <- pooled_trim_bounds(b_list, R = R0, C = C0, q_lo = 0.05, q_hi = 0.95)
+samples_trim <- map(samples_dust, ~trim_sample(.x, bounds = gb))
+Z_raw <- map(samples_trim, ~.x$Z)
+Z_pretrim <- map(samples_trim,
+                  ~if (!is.null(.x$Z_pretrim)) .x$Z_pretrim else .x$Z)
+
+pp <- estimate_peak_params(Z_raw, Z_pretrim_list = Z_pretrim,
+                            top_k = 500, verbose = FALSE)
+
+# Split by class using subset_peak_params (no need to re-run estimate).
+y <- loaded$y  # 2 = disease, 1 = control
+pp_disease <- subset_peak_params(pp, which(y == 2L))
+pp_control <- subset_peak_params(pp, which(y == 1L))
+
+cat_disease <- build_peak_catalog(pp_disease,
+                                    eps_rt = 0.003, eps_cv = 0.015)
+cat_control <- build_peak_catalog(pp_control,
+                                    eps_rt = 0.003, eps_cv = 0.015)
+
+sprintf("Disease catalog: %d compounds", nrow(cat_disease$compounds))
+sprintf("Control catalog: %d compounds", nrow(cat_control$compounds))
+```
+
+# 2. Compare the two catalogs
+
+```{r compare}
+comp <- compare_catalogs(cat_disease, cat_control,
+  name_a = "disease", name_b = "control")
+comp$summary
+```
+
+The counts show:
+
+- **`n_shared`** — compounds present in both catalogs at similar (RT, CV). These are the shared human volatile signature.
+- **`n_only_a`** — compounds only in the disease catalog. Could be disease-specific biomarkers, or compounds that happened to only get detected in the disease subgroup at this small scale.
+- **`n_only_b`** — same for controls.
+- **`frac_shared_a/b`** — fraction of each catalog that's shared. If both are high (say > 0.8), the two cohorts have very similar compound structures.
+
+## Prevalence-delta for shared compounds
+
+For each shared compound, `prevalence_delta = prevalence_control - prevalence_disease`. Positive delta = compound more prevalent in controls; negative = more prevalent in disease.
+
+```{r prevalence-delta, fig.height = 3.5}
+ggplot(comp$shared, aes(x = prevalence_delta)) +
+  geom_histogram(bins = 30, fill = "#B2182B") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "prevalence delta (control − disease)",
+       y = "n shared compounds",
+       title = "Cross-cohort prevalence delta among shared compounds") +
+  theme_minimal()
+
+sprintf("Compounds with |delta| > 0.20: %d",
+        sum(abs(comp$shared$prevalence_delta) > 0.20))
+```
+
+Compounds with large `|prevalence_delta|` are the interesting ones — same (RT, CV) location but very different fire rate between cohorts. **These are biomarker candidates** — the same compound expressed at very different rates in the two groups.
+
+## Cohort-unique compounds
+
+```{r unique-viz, fig.height = 5}
+biom_only_disease <- head(comp$only_a[order(-comp$only_a$prevalence), ], 10)
+biom_only_control <- head(comp$only_b[order(-comp$only_b$prevalence), ], 10)
+
+cat("Top 10 disease-only compounds by prevalence:\n")
+print(biom_only_disease)
+cat("\nTop 10 control-only compounds by prevalence:\n")
+print(biom_only_control)
+```
+
+On a real cohort you'd want to check these against your peak-detection parameters — very-high-prevalence "cohort-only" compounds might reflect a real biological difference OR a systematic difference in how peaks were detected between subcohorts. Cross-reference against the other cohort's raw data at those coordinates.
+
+## Spatial overlay of shared vs unique
+
+```{r spatial-overlay, fig.height = 6}
+ggplot() +
+  geom_point(data = comp$shared,
+              aes(x = cv_loc_disease, y = rt_loc_disease),
+              color = "#666666", size = 1, alpha = 0.4) +
+  geom_point(data = comp$only_a,
+              aes(x = cv_loc, y = rt_loc),
+              color = "#B2182B", size = 2.5) +
+  geom_point(data = comp$only_b,
+              aes(x = cv_loc, y = rt_loc),
+              color = "#2166AC", size = 2.5) +
+  scale_y_reverse() +
+  labs(x = "CV (fraction)", y = "RT (fraction)",
+       title = sprintf(
+         "Shared (%d, grey), only-disease (%d, red), only-control (%d, blue)",
+         nrow(comp$shared), nrow(comp$only_a), nrow(comp$only_b))) +
+  theme_minimal()
+```
+
+# 3. Merge into a universal catalog
+
+```{r merge}
+universal <- merge_catalogs(
+  list(cat_disease, cat_control),
+  names = c("disease", "control")
+)
+sprintf("Universal catalog: %d compounds (from %d + %d source compounds)",
+        nrow(universal$compounds),
+        nrow(cat_disease$compounds), nrow(cat_control$compounds))
+```
+
+Overlapping compounds from both source catalogs get combined into single entries. Compounds unique to either source pass through.
+
+## Per-source prevalence tracking
+
+Each universal-catalog compound carries a `per_source_prevalence` list-column with per-source contributions:
+
+```{r per-source}
+universal$compounds |>
+  mutate(disease_prev = sapply(per_source_prevalence, `[`, 1),
+         control_prev = sapply(per_source_prevalence, `[`, 2)) |>
+  select(compound_id, rt_loc, cv_loc, prevalence,
+         disease_prev, control_prev) |>
+  head(10) |>
+  knitr::kable(digits = 3)
+```
+
+You can filter universal-catalog compounds by their source composition:
+
+```{r filter-universal}
+per_source_df <- do.call(rbind, universal$compounds$per_source_prevalence) |>
+  as.data.frame()
+colnames(per_source_df) <- universal$parameters$source_names
+per_source_df$compound_id <- universal$compounds$compound_id
+sprintf("Compounds present in both sources: %d",
+        sum(per_source_df$disease > 0 & per_source_df$control > 0))
+sprintf("Compounds only in disease source: %d",
+        sum(per_source_df$disease > 0 & per_source_df$control == 0))
+sprintf("Compounds only in control source: %d",
+        sum(per_source_df$disease == 0 & per_source_df$control > 0))
+```
+
+# 4. Practical uses
+
+**Cross-condition biomarker discovery**: `compare_catalogs(cat_flu, cat_aki)`. Compounds present in one but not the other are disease-specific candidates. Compounds shared but with different prevalence are also candidates via delta.
+
+**Universal encoder pretraining**: `merge_catalogs(list(cat_flu, cat_aki, cat_chf))` gives one catalog capturing all compounds observed across your diseases. Pretrain the encoder on this universal catalog and it will have learned "peakiness" from a broader distribution — potentially more generalizable across new diseases.
+
+**Diagnostic**: high `frac_shared_a` and `frac_shared_b` together with small `|prevalence_delta|` on shared compounds tells you the two cohorts are almost identical at the volatile level — biology is very similar. Low shared fractions or big deltas suggest real biological difference.
+
+# What comes next
+
+- **Multi-cohort catalogs**: build one per disease, then `merge_catalogs(list(cat_a, cat_b, cat_c, ...))`.
+- **Biomarker table**: rank shared compounds by `|prevalence_delta|` for a biomarker candidate list.
+- **Test the transferability**: pretrain encoder on the universal catalog, classify each specific cohort. Does one encoder outperform per-cohort encoders?
