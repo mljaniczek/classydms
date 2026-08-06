@@ -189,6 +189,79 @@ knitr::kable(unique_counts)
 
 Compounds only in disease that also have high prevalence within disease are the strongest biomarker candidates — same physical position doesn't exist in controls at all, AND it's consistently expressed in disease samples.
 
+## Spatial view of unique compounds per disease
+
+Each panel shows one disease pair. **Grey dots** = compounds shared between disease and control (background context). **Red dots** = compounds only in disease. **Blue dots** = compounds only in control. Point size = compound prevalence within its catalog. Cluster patterns of the colored dots often reveal spatial regions of the (RT, CV) space that differentiate the classes.
+
+```{r unique-spatial, fig.height = 9, fig.width = 10}
+unique_spatial_df <- purrr::imap_dfr(within_comparisons, function(comp, name) {
+  bind_rows(
+    if (nrow(comp$shared) > 0)
+      tibble(comparison = name, group = "shared",
+             rt_loc = comp$shared$rt_loc_disease,
+             cv_loc = comp$shared$cv_loc_disease,
+             prevalence = (comp$shared$prevalence_disease +
+                             comp$shared$prevalence_control) / 2)
+    else tibble(comparison = character(0), group = character(0),
+                rt_loc = numeric(0), cv_loc = numeric(0),
+                prevalence = numeric(0)),
+    if (nrow(comp$only_a) > 0)
+      tibble(comparison = name, group = "only disease",
+             rt_loc = comp$only_a$rt_loc,
+             cv_loc = comp$only_a$cv_loc,
+             prevalence = comp$only_a$prevalence)
+    else tibble(comparison = character(0), group = character(0),
+                rt_loc = numeric(0), cv_loc = numeric(0),
+                prevalence = numeric(0)),
+    if (nrow(comp$only_b) > 0)
+      tibble(comparison = name, group = "only control",
+             rt_loc = comp$only_b$rt_loc,
+             cv_loc = comp$only_b$cv_loc,
+             prevalence = comp$only_b$prevalence)
+    else tibble(comparison = character(0), group = character(0),
+                rt_loc = numeric(0), cv_loc = numeric(0),
+                prevalence = numeric(0))
+  )
+})
+unique_spatial_df$group <- factor(unique_spatial_df$group,
+  levels = c("shared", "only disease", "only control"))
+
+ggplot(unique_spatial_df,
+       aes(x = cv_loc, y = rt_loc,
+           color = group, size = prevalence, alpha = group)) +
+  geom_point() +
+  scale_color_manual(values = c("shared"       = "grey60",
+                                  "only disease" = "#B2182B",
+                                  "only control" = "#2166AC")) +
+  scale_alpha_manual(values = c("shared" = 0.2, "only disease" = 0.85,
+                                  "only control" = 0.85), guide = "none") +
+  scale_size_continuous(range = c(0.5, 3.5)) +
+  scale_y_reverse() +
+  facet_wrap(~ comparison, ncol = 2) +
+  labs(x = "CV (fraction)", y = "RT (fraction)",
+       title = "Spatial distribution of unique vs shared compounds",
+       color = "compound group") +
+  theme_minimal() +
+  theme(panel.grid.minor = element_blank())
+```
+
+## Top only-in-disease compounds table
+
+Highest-prevalence disease-only compounds per cohort — the concrete biomarker candidates from the unique-compound analysis:
+
+```{r top-only-disease}
+top_only_disease <- purrr::imap_dfr(within_comparisons, function(comp, name) {
+  if (nrow(comp$only_a) == 0) return(NULL)
+  comp$only_a |>
+    arrange(desc(prevalence)) |>
+    head(10) |>
+    mutate(comparison = name) |>
+    select(comparison, compound_id, rt_loc, cv_loc,
+           prevalence, n_observations, n_samples)
+})
+knitr::kable(top_only_disease, digits = 3)
+```
+
 # 4. Cross-condition controls: how consistent are "healthy" volatile signatures?
 
 If the 4 control catalogs represent healthy human volatile emissions from similar sample-collection protocols, we'd expect them to share most compounds. Big disagreements between controls could reflect batch/site/protocol differences.
@@ -293,6 +366,88 @@ ggplot(overlap_df, aes(x = col, y = row, fill = frac_shared)) +
 
 Read the matrix: element `[i, j]` = fraction of compounds in disease `i` that also appear in disease `j`. Note asymmetry — smaller catalogs have higher fractions.
 
+# 5b. Catalog spatial heatmaps
+
+Faceted (RT × CV) hexbin density of compounds per catalog. Where the catalog concentrates its compounds spatially — and how much the various cohorts overlap in coverage — is easier to see side by side than one catalog at a time.
+
+## Density heatmap for each catalog
+
+```{r catalog-heatmap, fig.height = 10, fig.width = 10}
+all_compounds_df <- purrr::imap_dfr(all_cats, function(cat, name) {
+  tibble(
+    catalog    = name,
+    rt_loc     = cat$compounds$rt_loc,
+    cv_loc     = cat$compounds$cv_loc,
+    prevalence = cat$compounds$prevalence
+  )
+})
+# Consistent facet order: diseases first, controls second
+all_compounds_df$catalog <- factor(all_compounds_df$catalog,
+  levels = c("aki", "chf", "asthma", "resp_flu", "resp_other",
+              "aki_control", "chf_control", "asthma_control",
+              "resp_control"))
+
+ggplot(all_compounds_df, aes(x = cv_loc, y = rt_loc)) +
+  geom_hex(bins = c(20, 40)) +
+  scale_fill_gradient(low = "#F7FBFF", high = "#08306B",
+                       name = "n compounds") +
+  scale_y_reverse() +
+  facet_wrap(~ catalog, ncol = 3) +
+  labs(x = "CV (fraction)", y = "RT (fraction)",
+       title = "Compound density heatmap per catalog") +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+**Reading:** hotspots that appear in every panel are conserved compound regions (universal volatile signature). Panels with different hotspot patterns from the rest are potential batch effects or genuine cohort-specific chemistry.
+
+## Prevalence-weighted spatial map per catalog
+
+Same layout but each compound sized by its prevalence — highlights the anchor compounds visually.
+
+```{r catalog-prevalence-map, fig.height = 10, fig.width = 10}
+ggplot(all_compounds_df, aes(x = cv_loc, y = rt_loc,
+                              size = prevalence, color = prevalence)) +
+  geom_point(alpha = 0.5) +
+  scale_color_gradient(low = "#F7FBFF", high = "#B2182B",
+                        name = "prevalence") +
+  scale_size_continuous(range = c(0.3, 2.5), guide = "none") +
+  scale_y_reverse() +
+  facet_wrap(~ catalog, ncol = 3) +
+  labs(x = "CV (fraction)", y = "RT (fraction)",
+       title = "Compound prevalence per catalog") +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+```
+
+Bright red points (high prevalence, in most samples) that align across panels are the anchor compounds present in every cohort.
+
+## Disease-only overlay across catalogs
+
+Overlay compounds that are unique to each disease (from within-disease comparisons) on a single plot — reveals whether disease-only compounds cluster in different regions per disease.
+
+```{r disease-only-overlay, fig.height = 6, fig.width = 8}
+disease_only_all <- purrr::imap_dfr(within_comparisons, function(comp, name) {
+  if (nrow(comp$only_a) == 0) return(NULL)
+  tibble(disease = name,
+          rt_loc = comp$only_a$rt_loc,
+          cv_loc = comp$only_a$cv_loc,
+          prevalence = comp$only_a$prevalence)
+})
+
+ggplot(disease_only_all,
+       aes(x = cv_loc, y = rt_loc, color = disease, size = prevalence)) +
+  geom_point(alpha = 0.7) +
+  scale_y_reverse() +
+  scale_size_continuous(range = c(0.5, 3.5)) +
+  labs(x = "CV (fraction)", y = "RT (fraction)",
+       title = "All disease-only compounds overlaid",
+       color = "disease") +
+  theme_minimal()
+```
+
+Regions of the plot where colors mix are areas multiple diseases have unique compounds — could reflect "generic pathology" positions. Regions dominated by one color are disease-specific spatial signatures.
+
 # 6. Universal catalog across everything
 
 ```{r universal, cache = TRUE}
@@ -337,6 +492,44 @@ ggplot(per_source_df, aes(x = n_sources_present)) +
        title = "Distribution of compound source-coverage in universal catalog") +
   theme_minimal()
 ```
+
+## Spatial map of universal catalog by source coverage
+
+Where in (RT, CV) space do universally-present compounds sit vs disease-specific compounds?
+
+```{r universal-spatial, fig.height = 5.5, fig.width = 8}
+uni_map <- tibble(
+  rt_loc = universal$compounds$rt_loc,
+  cv_loc = universal$compounds$cv_loc,
+  n_sources = per_source_df$n_sources_present,
+  prevalence = universal$compounds$prevalence
+) |> mutate(coverage_bin = case_when(
+  n_sources == 9 ~ "9 sources (universal)",
+  n_sources >= 5 ~ "5-8 sources",
+  n_sources >= 2 ~ "2-4 sources",
+  TRUE ~ "1 source only"
+))
+uni_map$coverage_bin <- factor(uni_map$coverage_bin,
+  levels = c("1 source only", "2-4 sources",
+              "5-8 sources", "9 sources (universal)"))
+
+ggplot(uni_map, aes(x = cv_loc, y = rt_loc, color = coverage_bin,
+                     size = prevalence)) +
+  geom_point(alpha = 0.55) +
+  scale_color_manual(values = c(
+    "1 source only"          = "#B2182B",
+    "2-4 sources"            = "#EF8A62",
+    "5-8 sources"            = "#67A9CF",
+    "9 sources (universal)"  = "#08306B")) +
+  scale_size_continuous(range = c(0.3, 3), guide = "none") +
+  scale_y_reverse() +
+  labs(x = "CV (fraction)", y = "RT (fraction)",
+       title = "Universal catalog compounds by source-coverage",
+       color = "source coverage") +
+  theme_minimal()
+```
+
+Dark-blue points (universal) show the "shared backbone" position across all cohorts. Red points (single-source) are cohort-specific compound positions — a filter for cohort-effect diagnosis: if red points cluster in the (RT, CV) neighborhood of universal compounds, they might be jitter-affected duplicates; if they sit far from any universal compound, they're distinctively new positions.
 
 Compounds at `n_sources_present = 9` are candidates for "universal human volatile signature" — appear across every cohort we tested.
 
