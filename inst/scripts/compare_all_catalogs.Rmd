@@ -27,12 +27,21 @@ library(purrr)
 
 # Purpose
 
-You have peak_params from four cohorts (AKI, CHF, asthma, respiratory) with disease/control labels. This report:
+You have peak_params from four cohorts (AKI, CHF, asthma, respiratory) with disease/control labels.
+
+> **Note on "control" labels in this study.** In each cohort the "control" group consists of subjects who presented with **similar symptoms as cases but were later found not to have the specific disease** being studied. Controls are therefore themselves symptomatic and produce disease-like volatile profiles from whatever else is going on; they are NOT healthy volunteers. This means:
+>
+> - Case-vs-control comparisons within a cohort are testing "disease X vs a mixed similarly-sick reference population", not "disease X vs healthy baseline"
+> - The disease-specific signal is expected to be small — a modest perturbation on a large shared "sick person" volatile background
+> - High case-control overlap and small prevalence deltas are expected, not evidence that the pipeline is broken
+> - The `only_a` (disease-unique) compounds are the strongest biomarker candidates precisely because they distinguish the specific disease from other similar illnesses
+
+This report:
 
 1. Loads and builds a catalog per condition (9 total: 4 diseases + 4 controls + respiratory's "other")
 2. Reports a summary table for each catalog
 3. **Within-disease**: compares each disease to its matched control — biomarker candidates via prevalence delta and unique compounds
-4. **Cross-condition controls**: compares the 4 control catalogs — are "healthy human volatile signatures" consistent across cohorts?
+4. **Cross-condition controls**: compares the 4 control catalogs. **Important:** in this study "controls" are NOT healthy — they are subjects with similar symptoms who were later found NOT to have the specific disease being studied. So the controls are themselves a heterogeneous "similarly-symptomatic" population, and the comparison asks whether these similarly-sick reference populations look alike across cohorts, not whether the healthy-human volatile signature is stable.
 5. **Cross-condition diseases**: compares diseases to each other — shared vs disease-specific compounds
 6. **Universal catalog**: `merge_catalogs()` across everything, with per-source prevalence tracking
 
@@ -262,9 +271,11 @@ top_only_disease <- purrr::imap_dfr(within_comparisons, function(comp, name) {
 knitr::kable(top_only_disease, digits = 3)
 ```
 
-# 4. Cross-condition controls: how consistent are "healthy" volatile signatures?
+# 4. Cross-condition controls: how consistent are the "study-defined control" volatile signatures?
 
-If the 4 control catalogs represent healthy human volatile emissions from similar sample-collection protocols, we'd expect them to share most compounds. Big disagreements between controls could reflect batch/site/protocol differences.
+**Note on the "control" label:** in this study, controls are NOT healthy volunteers. They are subjects who presented with similar symptoms as the case group but were later found not to have the specific disease of interest. Controls therefore have their own (heterogeneous) underlying illnesses producing volatiles — the comparison here asks whether these similarly-symptomatic reference populations look alike across the 4 studies, not whether a healthy baseline reproduces.
+
+If the 4 control catalogs share most compounds despite being drawn from different studies of different diseases, that tells us the "similarly-symptomatic ill" population has a recognizable common volatile profile — which is useful for interpreting biomarker signal in the case-vs-control comparisons of Section 3, because it means the "control" background is fairly stable across studies. Big disagreements between controls could reflect either genuine differences in the underlying illness mix per study, or batch/site/protocol differences.
 
 ```{r control-vs-control}
 control_cats <- list(
@@ -288,11 +299,11 @@ ctrl_summary <- do.call(rbind, lapply(control_comparisons, function(x)
 knitr::kable(ctrl_summary)
 ```
 
-**High `frac_shared_a` and `frac_shared_b` on all pairs (say > 0.7)** → controls are consistent; healthy signature reproduces across cohorts. Low fractions suggest cohort-specific artifacts (batch effect, different equipment, different sample handling) — a red flag for cross-cohort analysis.
+**High `frac_shared_a` and `frac_shared_b` on all pairs (say > 0.7)** → controls are consistent; the "similarly-symptomatic-but-disease-negative" reference population has a reproducible volatile profile across studies. Low fractions suggest cohort-specific artifacts (batch effect, different equipment, different sample handling) OR genuine differences in the underlying illnesses in each study's control arm — worth investigating either way before trusting cross-cohort analysis.
 
 ## Prevalence-delta on controls
 
-Prevalence-delta for shared compounds between controls SHOULD be small if the cohorts are drawn from similar populations. Large deltas indicate cohort-level differences even in "baseline" volatiles.
+Prevalence-delta for shared compounds between controls SHOULD be small if the study-defined control populations are drawn from similar underlying-illness distributions. Large deltas indicate cohort-level differences in the reference-population volatile profile — could be batch effects OR real differences in the case-mix in each study's control arm.
 
 ```{r control-delta-summary}
 ctrl_delta <- lapply(control_comparisons, function(x)
