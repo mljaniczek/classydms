@@ -497,6 +497,139 @@ catalog_compactness <- function(catalog,
   out
 }
 
+#' Merge multiple peak_params objects into a single super-cohort
+#'
+#' Concatenates all `_raw` vectors across the input peak_params
+#' objects with globally-unique `sample_idx_raw`. Useful for building
+#' a universal catalog from all cohorts jointly.
+#'
+#' Each returned merged sample's original cohort is recorded in the
+#' `sample_cohort` field, which is a character vector of length
+#' `n_samples` giving the input list's name for each sample.
+#'
+#' @param pp_list Named list of `peak_params` objects. All must have
+#'   `sample_idx_raw`. Names become cohort labels.
+#' @return A single `peak_params`-shaped list with concatenated
+#'   `_raw` vectors, renumbered `sample_idx_raw`, `sample_cohort`
+#'   giving per-sample cohort membership, and `cohort_names` (input
+#'   names).
+#' @export
+merge_peak_params <- function(pp_list) {
+  stopifnot(is.list(pp_list), length(pp_list) >= 1L)
+  if (is.null(names(pp_list)))
+    names(pp_list) <- paste0("cohort_", seq_along(pp_list))
+  for (i in seq_along(pp_list)) {
+    if (is.null(pp_list[[i]]$sample_idx_raw)) {
+      stop("pp_list[[", i, "]] (", names(pp_list)[i],
+           ") is missing sample_idx_raw. ",
+           "Call backfill_sample_idx_raw() first.")
+    }
+  }
+
+  cohort_n_samples <- vapply(pp_list, `[[`, integer(1), "n_samples")
+  cohort_offsets   <- c(0L, cumsum(cohort_n_samples)[-length(pp_list)])
+  total_n_samples  <- sum(cohort_n_samples)
+
+  merged <- list(
+    rt_loc_raw    = unlist(lapply(pp_list, `[[`, "rt_loc_raw"),   use.names = FALSE),
+    cv_loc_raw    = unlist(lapply(pp_list, `[[`, "cv_loc_raw"),   use.names = FALSE),
+    sigma_rt_raw  = unlist(lapply(pp_list, `[[`, "sigma_rt_raw"), use.names = FALSE),
+    sigma_cv_raw  = unlist(lapply(pp_list, `[[`, "sigma_cv_raw"), use.names = FALSE),
+    intensity_raw = unlist(lapply(pp_list, `[[`, "intensity_raw"),use.names = FALSE),
+    n_samples     = total_n_samples,
+    noise         = pp_list[[1]]$noise
+  )
+  # Global sample indices
+  new_sidx <- integer(0)
+  for (i in seq_along(pp_list)) {
+    new_sidx <- c(new_sidx,
+                  pp_list[[i]]$sample_idx_raw + cohort_offsets[i])
+  }
+  merged$sample_idx_raw <- new_sidx
+  merged$n_peaks_detected <- length(merged$rt_loc_raw)
+
+  # Per-sample counts
+  merged$n_peaks <- list(
+    values = as.integer(unlist(lapply(pp_list, function(pp) {
+      if (!is.null(pp$n_peaks$values)) pp$n_peaks$values
+      else tabulate(pp$sample_idx_raw, nbins = pp$n_samples)
+    })))
+  )
+  merged$n_peaks$mean <- mean(merged$n_peaks$values)
+  merged$n_peaks$sd   <- if (length(merged$n_peaks$values) > 1L)
+                          stats::sd(merged$n_peaks$values) else 0
+
+  # Cohort membership: which cohort does each sample belong to?
+  merged$sample_cohort <- unlist(mapply(
+    function(name, n) rep(name, n),
+    names(pp_list), cohort_n_samples,
+    SIMPLIFY = FALSE), use.names = FALSE)
+  merged$cohort_names <- names(pp_list)
+
+  merged
+}
+
+#' Build a universal catalog by pooling all samples from multiple cohorts
+#'
+#' Unlike [merge_catalogs()], which reconciles already-built per-cohort
+#' catalogs, this function pools raw peaks from all cohorts BEFORE
+#' clustering. Every peak from every sample contributes directly to
+#' catalog construction, so systematic per-cohort offsets get absorbed
+#' into the compound centroids rather than producing duplicate entries.
+#'
+#' Each catalog compound gets an extra list-column
+#' `per_source_prevalence` recording the fraction of each input
+#' cohort's samples in which the compound was observed. This mirrors
+#' [merge_catalogs()]'s output for downstream compatibility.
+#'
+#' @param pp_list Named list of `peak_params` objects.
+#' @param eps_rt,eps_cv Catalog clustering eps (fraction of image).
+#' @param min_support_frac Support threshold. Applies to the combined
+#'   sample set — a compound must span at least this fraction of the
+#'   total N samples.
+#' @param min_cluster_size Minimum peaks per cluster.
+#' @return A `peak_catalog` object with a `per_source_prevalence`
+#'   list-column on `compounds` giving cohort-level prevalence, and
+#'   `source_names` / `source_n_samples` fields in `parameters`.
+#' @export
+build_universal_catalog <- function(pp_list,
+                                     eps_rt = 0.01, eps_cv = 0.05,
+                                     min_support_frac = 0.10,
+                                     min_cluster_size = 2L) {
+  merged <- merge_peak_params(pp_list)
+  cat <- build_peak_catalog(merged,
+    eps_rt = eps_rt, eps_cv = eps_cv,
+    min_support_frac = min_support_frac,
+    min_cluster_size = min_cluster_size)
+
+  # Attach per-cohort prevalence for each compound
+  n_cohorts <- length(pp_list)
+  cohort_names <- merged$cohort_names
+  cohort_n_samples <- vapply(pp_list, `[[`, integer(1), "n_samples")
+  cohort_offsets   <- c(0L, cumsum(cohort_n_samples)[-length(pp_list)])
+  # For each sample_idx in merged, which cohort?
+  sample_to_cohort <- rep(cohort_names,
+                           cohort_n_samples)
+
+  per_source_prev <- vector("list", nrow(cat$compounds))
+  for (i in seq_len(nrow(cat$compounds))) {
+    members <- cat$compounds$member_indices[[i]]
+    unique_samples <- unique(merged$sample_idx_raw[members])
+    cohorts_of_samples <- sample_to_cohort[unique_samples]
+    n_per_cohort <- table(factor(cohorts_of_samples,
+                                   levels = cohort_names))
+    prev_vec <- as.numeric(n_per_cohort) / cohort_n_samples
+    names(prev_vec) <- cohort_names
+    per_source_prev[[i]] <- prev_vec
+  }
+  cat$compounds$per_source_prevalence <- per_source_prev
+
+  # Update parameters
+  cat$parameters$source_names       <- cohort_names
+  cat$parameters$source_n_samples   <- cohort_n_samples
+  cat
+}
+
 #' Split a catalog into two disjoint sub-catalogs by compound
 #'
 #' Randomly partitions the catalog's compounds into two sets. Useful

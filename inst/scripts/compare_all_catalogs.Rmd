@@ -355,70 +355,98 @@ knitr::kable(three_way,
 
 ## Universal catalog spatial check — is the vertical-stripe pattern reduced?
 
-The most direct test of whether cross-cohort alignment worked. Rebuild the universal catalog on cross-aligned data and re-plot.
+The direct test of whether cross-cohort alignment worked. Build **two** universal catalogs — one from un-cross-aligned peak_params, one from cross-aligned — using `build_universal_catalog()` which pools ALL cohorts' samples and runs clustering once. This is the correct comparison: if drift was fragmenting compounds across cohorts, alignment should produce fewer, tighter clusters.
 
-```{r universal-cross, cache = TRUE, eval = params$do_cross_cohort_alignment}
-universal_cross <- merge_catalogs(
-  list(cat_aki_cross, cat_aki_control_cross,
-       cat_chf_cross, cat_chf_control_cross,
-       cat_asthma_cross, cat_asthma_control_cross,
-       cat_resp_flu_cross, cat_resp_other_cross, cat_resp_control_cross),
-  names = c("aki", "aki_ctrl",
-             "chf", "chf_ctrl",
-             "asthma", "asthma_ctrl",
-             "resp_flu", "resp_other", "resp_ctrl")
+```{r universal-cross-preview, cache = TRUE, eval = params$do_cross_cohort_alignment}
+# Un-cross-aligned universal (built from cohort-aligned OR original pp)
+pp_source_before <- list(
+  aki = subset_peak_params(input_pp$aki,         seq_len(input_pp$aki$n_samples)),
+  aki_ctrl = NULL,                                # placeholder, dropped below
+  chf = subset_peak_params(input_pp$chf,         seq_len(input_pp$chf$n_samples)),
+  chf_ctrl = NULL,
+  asthma = subset_peak_params(input_pp$asthma,   seq_len(input_pp$asthma$n_samples)),
+  asthma_ctrl = NULL,
+  resp = subset_peak_params(input_pp$respiratory, seq_len(input_pp$respiratory$n_samples)),
+  resp_ctrl = NULL
 )
-sprintf("Universal catalog (cross-aligned): %d compounds",
-        nrow(universal_cross$compounds))
+# Actually simpler: just pass the 4 whole-cohort pps (they already contain all classes)
+preview_pp_before <- list(
+  aki         = input_pp$aki,
+  chf         = input_pp$chf,
+  asthma      = input_pp$asthma,
+  respiratory = input_pp$respiratory
+)
+preview_pp_after <- list(
+  aki         = cross_aligned$aki,
+  chf         = cross_aligned$chf,
+  asthma      = cross_aligned$asthma,
+  respiratory = cross_aligned$respiratory
+)
+
+universal_before_cross <- build_universal_catalog(preview_pp_before,
+  eps_rt = params$eps_rt, eps_cv = params$eps_cv,
+  min_support_frac = params$min_support_frac)
+universal_after_cross  <- build_universal_catalog(preview_pp_after,
+  eps_rt = params$eps_rt, eps_cv = params$eps_cv,
+  min_support_frac = params$min_support_frac)
+
+sprintf("Universal (before cross-align): %d compounds",
+        nrow(universal_before_cross$compounds))
+sprintf("Universal (after  cross-align): %d compounds",
+        nrow(universal_after_cross$compounds))
 ```
 
-```{r universal-cross-spatial, eval = params$do_cross_cohort_alignment, fig.height = 6, fig.width = 8}
-per_source_cross <- do.call(rbind, universal_cross$compounds$per_source_prevalence) |>
-  as.data.frame()
-colnames(per_source_cross) <- universal_cross$parameters$source_names
-per_source_cross$n_sources_present <-
-  rowSums(per_source_cross[, universal_cross$parameters$source_names] > 0)
-
-uni_cross_map <- tibble(
-  rt_loc = universal_cross$compounds$rt_loc,
-  cv_loc = universal_cross$compounds$cv_loc,
-  n_sources = per_source_cross$n_sources_present,
-  prevalence = universal_cross$compounds$prevalence
-) |> mutate(coverage_bin = case_when(
-  n_sources == 9 ~ "9 sources (universal)",
-  n_sources >= 5 ~ "5-8 sources",
-  n_sources >= 2 ~ "2-4 sources",
-  TRUE ~ "1 source only"
-))
-uni_cross_map$coverage_bin <- factor(uni_cross_map$coverage_bin,
-  levels = c("1 source only", "2-4 sources",
-              "5-8 sources", "9 sources (universal)"))
-
-ggplot(uni_cross_map, aes(x = cv_loc, y = rt_loc, color = coverage_bin,
-                          size = prevalence)) +
-  geom_point(alpha = 0.55) +
-  scale_color_manual(values = c(
-    "1 source only"          = "#B2182B",
-    "2-4 sources"            = "#EF8A62",
-    "5-8 sources"            = "#67A9CF",
-    "9 sources (universal)"  = "#08306B")) +
-  scale_size_continuous(range = c(0.3, 3), guide = "none") +
-  scale_y_reverse() +
-  labs(x = "CV (fraction)", y = "RT (fraction)",
-       title = "Universal catalog AFTER cross-cohort alignment",
-       subtitle = sprintf("%d compounds (was %d before alignment)",
-                          nrow(universal_cross$compounds),
-                          nrow(universal$compounds)),
-       color = "source coverage") +
-  theme_minimal()
+```{r universal-cross-spatial, eval = params$do_cross_cohort_alignment, fig.height = 6, fig.width = 10}
+render_universal_map <- function(uni, title_suffix) {
+  n_cohorts <- length(uni$parameters$source_names)
+  per_src <- do.call(rbind, uni$compounds$per_source_prevalence) |>
+    as.data.frame()
+  colnames(per_src) <- uni$parameters$source_names
+  n_sources <- rowSums(per_src > 0)
+  map_df <- tibble(
+    rt_loc = uni$compounds$rt_loc,
+    cv_loc = uni$compounds$cv_loc,
+    n_sources = n_sources,
+    prevalence = uni$compounds$prevalence
+  ) |> mutate(coverage_bin = case_when(
+    n_sources == n_cohorts ~ sprintf("%d sources (universal)", n_cohorts),
+    n_sources >= max(2, n_cohorts - 1) ~ sprintf(">= %d sources",
+                                                    max(2, n_cohorts - 1)),
+    n_sources >= 2 ~ "2 sources",
+    TRUE ~ "1 source only"
+  ))
+  map_df$coverage_bin <- factor(map_df$coverage_bin,
+    levels = c("1 source only", "2 sources",
+                sprintf(">= %d sources", max(2, n_cohorts - 1)),
+                sprintf("%d sources (universal)", n_cohorts)))
+  ggplot(map_df, aes(x = cv_loc, y = rt_loc, color = coverage_bin,
+                     size = prevalence)) +
+    geom_point(alpha = 0.55) +
+    scale_color_manual(values = c(
+      "1 source only" = "#B2182B", "2 sources" = "#EF8A62"),
+      limits = levels(map_df$coverage_bin),
+      guide = guide_legend(override.aes = list(size = 3))) +
+    scale_size_continuous(range = c(0.3, 3), guide = "none") +
+    scale_y_reverse() +
+    labs(x = "CV (fraction)", y = "RT (fraction)",
+         title = paste("Universal catalog —", title_suffix),
+         subtitle = sprintf("%d compounds", nrow(uni$compounds)),
+         color = "source coverage") +
+    theme_minimal()
+}
+gridExtra::grid.arrange(
+  render_universal_map(universal_before_cross, "before cross-align"),
+  render_universal_map(universal_after_cross,  "after cross-align"),
+  ncol = 2
+)
 ```
 
-**How to read this vs the un-aligned universal spatial map (Section 6):**
+**How to read this side-by-side:**
 
-- **Fewer red points (1-source-only)** → alignment merged compounds that were previously split across cohorts. Good.
-- **More dark-blue points (9-source universal)** → previously-split compounds now count as universal. Good.
-- **Vertical-stripe pattern reduced** → the RT drift between cohorts is being corrected.
-- **Same or worse pattern** → drift isn't the main story; other factors (e.g., real per-cohort chemistry differences) may be at play.
+- **Fewer red points (1-source-only) after alignment** → compounds that were previously split across cohorts merged into cross-cohort ones. Good.
+- **More dark-blue points (all-source) after alignment** → previously-split compounds now count as universal. Good.
+- **Vertical-stripe pattern reduced after alignment** → the RT drift between cohorts is being corrected.
+- **Same or worse pattern** → drift isn't the main story; other factors (real per-cohort chemistry differences, or clustering artifacts) may be at play.
 
 ## Use cross-aligned catalogs for downstream analysis?
 
@@ -805,19 +833,55 @@ Regions of the plot where colors mix are areas multiple diseases have unique com
 
 # 6. Universal catalog across everything
 
+Uses `build_universal_catalog()` to pool ALL samples from all cohorts and cluster once, rather than merging pre-built catalogs. This is the correct approach because it lets systematic per-cohort offsets get absorbed into cluster centroids instead of producing duplicate entries.
+
+The nine "sources" here are the 9 disease/control groups (5 disease groups + 4 controls). Each compound's `per_source_prevalence` is the fraction of that source's samples in which the compound appeared.
+
 ```{r universal, cache = TRUE}
-universal <- merge_catalogs(
-  list(cat_aki, cat_aki_control,
-       cat_chf, cat_chf_control,
-       cat_asthma, cat_asthma_control,
-       cat_resp_flu, cat_resp_other, cat_resp_control),
-  names = c("aki", "aki_ctrl",
-             "chf", "chf_ctrl",
-             "asthma", "asthma_ctrl",
-             "resp_flu", "resp_other", "resp_ctrl")
+# Build per-condition pp objects to serve as sources for the universal
+uni_pp_sources <- list(
+  aki            = subset_peak_params(if (params$do_cross_cohort_alignment) cross_aligned$aki
+                                      else if (params$do_alignment)         d_aki$pp_aligned
+                                      else                                    d_aki$pp,
+                                      which(d_aki$proc$y == 2)),
+  aki_ctrl       = subset_peak_params(if (params$do_cross_cohort_alignment) cross_aligned$aki
+                                      else if (params$do_alignment)         d_aki$pp_aligned
+                                      else                                    d_aki$pp,
+                                      which(d_aki$proc$y == 1)),
+  chf            = subset_peak_params(if (params$do_cross_cohort_alignment) cross_aligned$chf
+                                      else if (params$do_alignment)         d_chf$pp_aligned
+                                      else                                    d_chf$pp,
+                                      which(d_chf$proc$y == 2)),
+  chf_ctrl       = subset_peak_params(if (params$do_cross_cohort_alignment) cross_aligned$chf
+                                      else if (params$do_alignment)         d_chf$pp_aligned
+                                      else                                    d_chf$pp,
+                                      which(d_chf$proc$y == 1)),
+  asthma         = subset_peak_params(if (params$do_cross_cohort_alignment) cross_aligned$asthma
+                                      else if (params$do_alignment)         d_asth$pp_aligned
+                                      else                                    d_asth$pp,
+                                      which(d_asth$proc$y == 2)),
+  asthma_ctrl    = subset_peak_params(if (params$do_cross_cohort_alignment) cross_aligned$asthma
+                                      else if (params$do_alignment)         d_asth$pp_aligned
+                                      else                                    d_asth$pp,
+                                      which(d_asth$proc$y == 1)),
+  resp_flu       = subset_peak_params(if (params$do_cross_cohort_alignment) cross_aligned$respiratory
+                                      else if (params$do_alignment)         d_resp$pp_aligned
+                                      else                                    d_resp$pp,
+                                      which(d_resp$proc$y == 2)),
+  resp_other     = subset_peak_params(if (params$do_cross_cohort_alignment) cross_aligned$respiratory
+                                      else if (params$do_alignment)         d_resp$pp_aligned
+                                      else                                    d_resp$pp,
+                                      which(d_resp$proc$y == 3)),
+  resp_ctrl      = subset_peak_params(if (params$do_cross_cohort_alignment) cross_aligned$respiratory
+                                      else if (params$do_alignment)         d_resp$pp_aligned
+                                      else                                    d_resp$pp,
+                                      which(d_resp$proc$y == 1))
 )
-sprintf("Universal catalog: %d compounds",
-        nrow(universal$compounds))
+
+universal <- build_universal_catalog(uni_pp_sources,
+  eps_rt = params$eps_rt, eps_cv = params$eps_cv,
+  min_support_frac = params$min_support_frac)
+sprintf("Universal catalog: %d compounds", nrow(universal$compounds))
 ```
 
 ## Per-source presence pattern
