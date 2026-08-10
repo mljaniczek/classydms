@@ -221,7 +221,9 @@ subset_peak_params <- function(peak_params, sample_indices) {
 build_peak_catalog <- function(peak_params,
                                 eps_rt = 0.01, eps_cv = 0.05,
                                 min_support_frac = 0.10,
-                                min_cluster_size = 2L) {
+                                min_cluster_size = 2L,
+                                coord_mode = c("fraction", "physical")) {
+  coord_mode <- match.arg(coord_mode)
   needed <- c("rt_loc_raw", "cv_loc_raw", "sample_idx_raw",
               "sigma_rt_raw", "sigma_cv_raw", "intensity_raw",
               "n_samples")
@@ -232,9 +234,25 @@ build_peak_catalog <- function(peak_params,
          paste(missing, collapse = ", "), ". Ensure sample_idx_raw ",
          "was added by a recent version of estimate_peak_params().")
   }
+  if (coord_mode == "physical") {
+    if (is.null(peak_params$rt_seconds_raw) ||
+        is.null(peak_params$cv_volts_raw)) {
+      stop("coord_mode = 'physical' requires peak_params to have ",
+           "rt_seconds_raw and cv_volts_raw fields. Re-run ",
+           "estimate_peak_params() passing time_axes and cv_axes.")
+    }
+  }
 
-  rt         <- peak_params$rt_loc_raw
-  cv         <- peak_params$cv_loc_raw
+  # Choose coordinate vectors: physical (seconds / volts) or fraction.
+  # Only the clustering itself is affected — the returned catalog stores
+  # BOTH sets so downstream tools can use whichever they want.
+  rt <- if (coord_mode == "physical") peak_params$rt_seconds_raw
+        else                          peak_params$rt_loc_raw
+  cv <- if (coord_mode == "physical") peak_params$cv_volts_raw
+        else                          peak_params$cv_loc_raw
+  # Preserve the alternate representation for storage
+  rt_frac_ref <- peak_params$rt_loc_raw
+  cv_frac_ref <- peak_params$cv_loc_raw
   intensity  <- peak_params$intensity_raw
   sample_idx <- peak_params$sample_idx_raw
   n_peaks    <- length(rt)
@@ -282,7 +300,9 @@ build_peak_catalog <- function(peak_params,
     members <- cluster_members[[as.character(cid)]]
     unique_samples <- unique(sample_idx[members])
     n_uniq <- length(unique_samples)
-    tibble::tibble(
+    # Build the base row using the CLUSTERING coordinate system as
+    # rt_loc / cv_loc (fraction OR physical depending on coord_mode).
+    row <- tibble::tibble(
       compound_id     = cid,
       rt_loc          = stats::median(rt[members]),
       cv_loc          = stats::median(cv[members]),
@@ -298,6 +318,20 @@ build_peak_catalog <- function(peak_params,
       intensity_obs   = list(intensity[members]),
       member_indices  = list(members)
     )
+    # If both physical + fraction are available, also store the OTHER
+    # representation as rt_seconds / cv_volts (or rt_frac / cv_frac).
+    if (coord_mode == "physical") {
+      row$rt_seconds <- row$rt_loc   # already in seconds
+      row$cv_volts   <- row$cv_loc   # already in volts
+      row$rt_frac    <- stats::median(rt_frac_ref[members])
+      row$cv_frac    <- stats::median(cv_frac_ref[members])
+    } else if (!is.null(peak_params$rt_seconds_raw)) {
+      row$rt_frac    <- row$rt_loc   # already in fraction
+      row$cv_frac    <- row$cv_loc   # already in fraction
+      row$rt_seconds <- stats::median(peak_params$rt_seconds_raw[members])
+      row$cv_volts   <- stats::median(peak_params$cv_volts_raw[members])
+    }
+    row
   })
   clusters_df <- dplyr::bind_rows(cluster_rows)
 
@@ -331,7 +365,8 @@ build_peak_catalog <- function(peak_params,
         min_cluster_size    = min_cluster_size,
         n_pool_peaks        = n_peaks,
         n_samples           = n_samples,
-        n_total_clusters    = n_clusters
+        n_total_clusters    = n_clusters,
+        coord_mode          = coord_mode
       )
     ),
     class = "peak_catalog"
@@ -595,12 +630,24 @@ merge_peak_params <- function(pp_list) {
 build_universal_catalog <- function(pp_list,
                                      eps_rt = 0.01, eps_cv = 0.05,
                                      min_support_frac = 0.10,
-                                     min_cluster_size = 2L) {
+                                     min_cluster_size = 2L,
+                                     coord_mode = c("fraction", "physical")) {
+  coord_mode <- match.arg(coord_mode)
   merged <- merge_peak_params(pp_list)
+  # Also merge physical fields if all sources have them
+  if (coord_mode == "physical" ||
+      all(vapply(pp_list, function(p) !is.null(p$rt_seconds_raw),
+                  logical(1)))) {
+    merged$rt_seconds_raw <- unlist(lapply(pp_list, `[[`, "rt_seconds_raw"),
+                                     use.names = FALSE)
+    merged$cv_volts_raw   <- unlist(lapply(pp_list, `[[`, "cv_volts_raw"),
+                                     use.names = FALSE)
+  }
   cat <- build_peak_catalog(merged,
     eps_rt = eps_rt, eps_cv = eps_cv,
     min_support_frac = min_support_frac,
-    min_cluster_size = min_cluster_size)
+    min_cluster_size = min_cluster_size,
+    coord_mode = coord_mode)
 
   # Attach per-cohort prevalence for each compound
   n_cohorts <- length(pp_list)

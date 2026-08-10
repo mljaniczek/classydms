@@ -34,6 +34,8 @@
 #' @export
 estimate_peak_params <- function(Z_list,
                                   Z_pretrim_list = NULL,
+                                  time_axes = NULL,
+                                  cv_axes   = NULL,
                                   top_k = 150,
                                   frac_height = 0.25,
                                   min_sep_rt = 8,
@@ -43,7 +45,32 @@ estimate_peak_params <- function(Z_list,
   use_pretrim <- !is.null(Z_pretrim_list) &&
     length(Z_pretrim_list) == length(Z_list)
 
+  # Physical-units path: when time/cv axes are supplied, we ALSO store
+  # peak positions as RT seconds and CV volts alongside the fraction
+  # coordinates. This is essential for cross-sample alignment when
+  # samples have different truncation lengths or non-uniform sampling
+  # rates — same physical time maps to the same numerical value across
+  # every sample regardless of row index.
+  use_physical <- !is.null(time_axes) && !is.null(cv_axes)
+  if (use_physical) {
+    stopifnot(length(time_axes) == length(Z_list),
+              length(cv_axes)   == length(Z_list))
+    for (i in seq_along(Z_list)) {
+      if (length(time_axes[[i]]) < nrow(Z_list[[i]])) {
+        stop("time_axes[[", i, "]] has ", length(time_axes[[i]]),
+             " entries but Z_list[[", i, "]] has ", nrow(Z_list[[i]]),
+             " rows. Axes must be at least as long as their matrices.")
+      }
+      if (length(cv_axes[[i]]) < ncol(Z_list[[i]])) {
+        stop("cv_axes[[", i, "]] has ", length(cv_axes[[i]]),
+             " entries but Z_list[[", i, "]] has ", ncol(Z_list[[i]]),
+             " columns.")
+      }
+    }
+  }
+
   all_rt_loc <- c(); all_cv_loc <- c()
+  all_rt_seconds <- c(); all_cv_volts <- c()
   all_sigma_rt <- c(); all_sigma_cv <- c()
   all_intensity <- c(); all_n_peaks <- c()
   all_sample_idx <- c()
@@ -132,6 +159,10 @@ estimate_peak_params <- function(Z_list,
           all_sigma_cv <- c(all_sigma_cv, w_cv * fwhm_to_sigma)
           all_intensity <- c(all_intensity, h0)
           all_sample_idx <- c(all_sample_idx, i)
+          if (use_physical) {
+            all_rt_seconds <- c(all_rt_seconds, time_axes[[i]][r0])
+            all_cv_volts   <- c(all_cv_volts,   cv_axes[[i]][c0])
+          }
         }
       }
     }
@@ -233,6 +264,19 @@ estimate_peak_params <- function(Z_list,
     sample_idx_raw = all_sample_idx,
     sample_names   = names(Z_list)
   )
+  if (use_physical) {
+    result$rt_seconds_raw <- all_rt_seconds
+    result$cv_volts_raw   <- all_cv_volts
+    result$coord_mode     <- "physical"
+    # Also record the RT/CV axis ranges per sample so downstream tools
+    # can convert physical -> row/col for generation.
+    result$time_ranges <- do.call(rbind, lapply(time_axes, function(t) {
+      c(min = min(t), max = max(t), n = length(t))
+    }))
+    result$cv_ranges <- do.call(rbind, lapply(cv_axes, function(c) {
+      c(min = min(c), max = max(c), n = length(c))
+    }))
+  }
   if (verbose && result$n_peaks_detected == 0) {
     warning("estimate_peak_params: 0 peaks detected.")
   }

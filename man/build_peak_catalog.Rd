@@ -9,7 +9,8 @@ build_peak_catalog(
   eps_rt = 0.01,
   eps_cv = 0.05,
   min_support_frac = 0.1,
-  min_cluster_size = 2L
+  min_cluster_size = 2L,
+  coord_mode = c("fraction", "physical")
 )
 }
 \arguments{

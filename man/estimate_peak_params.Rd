@@ -7,6 +7,8 @@
 estimate_peak_params(
   Z_list,
   Z_pretrim_list = NULL,
+  time_axes = NULL,
+  cv_axes = NULL,
   top_k = 150,
   frac_height = 0.25,
   min_sep_rt = 8,
