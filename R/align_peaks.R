@@ -4,6 +4,202 @@
 # Improves catalog compactness — otherwise even small instrument drift
 # can push peaks into different catalog clusters than they should be.
 
+#' Align samples via cluster-membership offsets
+#'
+#' Alternative alignment approach that avoids the distance-matching
+#' fragility of [align_peak_params()]. Steps:
+#'
+#' \enumerate{
+#'   \item Build a preliminary catalog with **loose** eps (large enough
+#'     to capture drifted peaks in the same cluster as un-drifted ones)
+#'   \item For each anchor compound with sufficient sample support,
+#'     each member peak has a known offset from the cluster centroid
+#'   \item For each sample, aggregate its member-peak offsets across all
+#'     anchor compounds — the median gives that sample's drift estimate
+#'   \item Apply per-sample shifts to all peaks
+#'   \item Optionally iterate: rebuild catalog on aligned peaks and
+#'     refine
+#' }
+#'
+#' Why this is more robust than distance-matching: peak-to-anchor
+#' correspondences are established by the preliminary clustering, not
+#' by nearest-neighbor search. In dense peak clouds where many
+#' unrelated peaks fall near each anchor, distance-matching gets
+#' confused; cluster-membership does not.
+#'
+#' Signals that this alignment is helping (after building the final
+#' catalog on aligned peaks vs original): `n_compounds` decreases
+#' (fragments consolidate), `n_singletons` decreases, `median_prevalence`
+#' increases, and `n_anchor_90pct` increases.
+#'
+#' @param peak_params `peak_params` object with `sample_idx_raw`.
+#' @param eps_rt_loose,eps_cv_loose Preliminary-catalog clustering eps.
+#'   Must be **larger than the expected drift magnitude** so drifted
+#'   samples' peaks join the same cluster as un-drifted samples' peaks.
+#'   Defaults `(0.03, 0.08)` accommodate up to ~3% RT drift.
+#' @param min_support_frac Support fraction for the preliminary catalog.
+#' @param min_samples_per_anchor A compound must have at least this
+#'   many unique samples to serve as an alignment anchor. `NULL`
+#'   (default) sets it to `max(3, floor(0.30 * n_samples))` so only
+#'   well-supported compounds contribute offsets.
+#' @param min_anchors_per_sample A sample won't be shifted if fewer
+#'   anchor compounds contain a peak from it.
+#' @param iterate Whether to rebuild catalog on aligned peaks and
+#'   re-align. Default `TRUE`.
+#' @param max_iter Maximum iterations.
+#' @param verbose Whether to print progress.
+#' @return Updated `peak_params` with aligned `rt_loc_raw`,
+#'   `cv_loc_raw`, and an `alignment` field with method =
+#'   `"cluster_membership"`, `shifts_rt`, `shifts_cv`,
+#'   `n_anchors_matched` (per sample), `n_anchors_total`, `iterations`,
+#'   `converged`.
+#' @export
+align_via_catalog <- function(peak_params,
+                               eps_rt_loose = 0.03,
+                               eps_cv_loose = 0.08,
+                               min_support_frac = 0.10,
+                               min_samples_per_anchor = NULL,
+                               min_anchors_per_sample = 5L,
+                               iterate = TRUE,
+                               max_iter = 3L,
+                               verbose = TRUE) {
+  needed <- c("rt_loc_raw", "cv_loc_raw", "sample_idx_raw",
+              "sigma_rt_raw", "sigma_cv_raw", "intensity_raw", "n_samples")
+  missing <- needed[vapply(needed, function(nm) is.null(peak_params[[nm]]),
+                            logical(1))]
+  if (length(missing)) {
+    stop("align_via_catalog: peak_params is missing ",
+         paste(missing, collapse = ", "),
+         ". Call backfill_sample_idx_raw() if needed.")
+  }
+  n_samples <- peak_params$n_samples
+  if (is.null(min_samples_per_anchor)) {
+    min_samples_per_anchor <- max(3L, floor(0.30 * n_samples))
+  }
+
+  total_shift_rt <- numeric(n_samples)
+  total_shift_cv <- numeric(n_samples)
+  converged <- FALSE
+  iterations_run <- 0L
+  current_pp <- peak_params
+  n_anchors_final <- 0L
+  n_matched <- integer(n_samples)
+
+  for (iter in seq_len(max_iter)) {
+    iterations_run <- iter
+
+    # Build preliminary catalog with loose eps
+    cat_prelim <- build_peak_catalog(current_pp,
+      eps_rt = eps_rt_loose,
+      eps_cv = eps_cv_loose,
+      min_support_frac = min_support_frac)
+
+    # Filter to well-supported anchor compounds
+    anchor_mask <- cat_prelim$compounds$n_samples >= min_samples_per_anchor
+    anchors <- cat_prelim$compounds[anchor_mask, ]
+    n_anchors_final <- nrow(anchors)
+
+    if (n_anchors_final < 3L) {
+      if (verbose) {
+        message("  Only ", n_anchors_final,
+                " anchor compounds meet the min_samples_per_anchor",
+                " threshold. Stopping.")
+      }
+      break
+    }
+    if (verbose) {
+      message(sprintf(
+        "  Iter %d: using %d anchor compounds (>= %d samples support)",
+        iter, n_anchors_final, min_samples_per_anchor))
+    }
+
+    # Collect offsets per sample: for each anchor's members, offset =
+    # member_position - anchor_centroid
+    offsets_rt_by_sample <- vector("list", n_samples)
+    offsets_cv_by_sample <- vector("list", n_samples)
+    for (a in seq_len(n_anchors_final)) {
+      members  <- anchors$member_indices[[a]]
+      cent_rt  <- anchors$rt_loc[a]
+      cent_cv  <- anchors$cv_loc[a]
+      dr <- current_pp$rt_loc_raw[members] - cent_rt
+      dc <- current_pp$cv_loc_raw[members] - cent_cv
+      sidx <- current_pp$sample_idx_raw[members]
+      for (i in seq_along(members)) {
+        s <- sidx[i]
+        offsets_rt_by_sample[[s]] <- c(offsets_rt_by_sample[[s]], dr[i])
+        offsets_cv_by_sample[[s]] <- c(offsets_cv_by_sample[[s]], dc[i])
+      }
+    }
+
+    # Compute per-sample median offsets and apply as shifts
+    shifts_rt <- numeric(n_samples)
+    shifts_cv <- numeric(n_samples)
+    for (s in seq_len(n_samples)) {
+      n_matched[s] <- length(offsets_rt_by_sample[[s]])
+      if (n_matched[s] >= min_anchors_per_sample) {
+        shifts_rt[s] <- stats::median(offsets_rt_by_sample[[s]])
+        shifts_cv[s] <- stats::median(offsets_cv_by_sample[[s]])
+      }
+    }
+
+    # Apply shifts (this is what makes iteration meaningful — next iter
+    # sees improved clustering)
+    for (s in seq_len(n_samples)) {
+      mask <- current_pp$sample_idx_raw == s
+      if (!any(mask)) next
+      current_pp$rt_loc_raw[mask] <- current_pp$rt_loc_raw[mask] - shifts_rt[s]
+      current_pp$cv_loc_raw[mask] <- current_pp$cv_loc_raw[mask] - shifts_cv[s]
+    }
+    total_shift_rt <- total_shift_rt + shifts_rt
+    total_shift_cv <- total_shift_cv + shifts_cv
+
+    max_delta <- max(abs(shifts_rt), abs(shifts_cv))
+    if (verbose) {
+      message(sprintf(
+        "    max |shift| this iter: %.5f", max_delta))
+    }
+    if (!iterate) break
+    if (max_delta < min(eps_rt_loose, eps_cv_loose) / 50) {
+      converged <- TRUE
+      if (verbose) message("    converged")
+      break
+    }
+  }
+
+  # Update derived summary stats
+  current_pp$rt_loc <- list(
+    values = current_pp$rt_loc_raw,
+    mean = mean(current_pp$rt_loc_raw),
+    sd = stats::sd(current_pp$rt_loc_raw))
+  current_pp$cv_loc <- list(
+    values = current_pp$cv_loc_raw,
+    mean = mean(current_pp$cv_loc_raw),
+    sd = stats::sd(current_pp$cv_loc_raw))
+
+  current_pp$alignment <- list(
+    method = "cluster_membership",
+    shifts_rt = total_shift_rt,
+    shifts_cv = total_shift_cv,
+    n_anchors_matched = n_matched,
+    n_anchors_total = n_anchors_final,
+    iterations = iterations_run,
+    converged = converged
+  )
+
+  if (verbose) {
+    cat(sprintf(
+      "align_via_catalog: %d samples aligned via %d anchor compounds, %d iters\n",
+      n_samples, n_anchors_final, iterations_run))
+    cat(sprintf(
+      "  total shift: median RT = %.4f, CV = %.4f\n",
+      stats::median(total_shift_rt), stats::median(total_shift_cv)))
+    cat(sprintf(
+      "  max |total shift|: RT = %.4f, CV = %.4f\n",
+      max(abs(total_shift_rt)), max(abs(total_shift_cv))))
+  }
+  current_pp
+}
+
 #' Align samples to anchor peak positions
 #'
 #' Corrects per-sample systematic shifts in `(rt_loc, cv_loc)`. If no
