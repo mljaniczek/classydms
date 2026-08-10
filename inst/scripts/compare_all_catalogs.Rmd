@@ -12,6 +12,9 @@ params:
   eps_rt: 0.003
   eps_cv: 0.015
   min_support_frac: 0.10
+  do_alignment: true             # if TRUE, run align_via_catalog before building catalogs
+  align_eps_rt_loose: 0.03
+  align_eps_cv_loose: 0.08
 ---
 
 ```{r setup, include = FALSE}
@@ -91,6 +94,146 @@ all_cats <- list(
   resp_flu        = cat_resp_flu,        resp_other     = cat_resp_other,
   resp_control    = cat_resp_control
 )
+```
+
+# 1b. Alignment (optional) and its effect on catalog compactness
+
+Systematic per-sample drift in instrument-detected peak positions can fragment true underlying compounds into multiple catalog entries. We use `align_via_catalog()` to correct drift per cohort before catalog building, then rebuild catalogs on aligned data and compare against the un-aligned baseline.
+
+**Method** (from `align_via_catalog`): build a preliminary catalog with loose eps, use each anchor compound's cluster centroid + member-peak offsets to derive per-sample shifts, iterate.
+
+```{r alignment, cache = TRUE, eval = params$do_alignment}
+align_one <- function(pp, name, tag = "") {
+  message(sprintf("Aligning %s%s", name, tag))
+  align_via_catalog(pp,
+    eps_rt_loose = params$align_eps_rt_loose,
+    eps_cv_loose = params$align_eps_cv_loose,
+    min_support_frac = params$min_support_frac,
+    iterate = TRUE, max_iter = 3L, verbose = FALSE)
+}
+
+# Align each cohort's full peak_params, then subset by class
+d_aki$pp_aligned  <- align_one(d_aki$pp,  "aki")
+d_chf$pp_aligned  <- align_one(d_chf$pp,  "chf")
+d_asth$pp_aligned <- align_one(d_asth$pp, "asthma")
+d_resp$pp_aligned <- align_one(d_resp$pp, "respiratory")
+
+# Rebuild catalogs on aligned peak_params
+cat_aki_aligned            <- build_from(subset_peak_params(d_aki$pp_aligned,  which(d_aki$proc$y  == 2)))
+cat_aki_control_aligned    <- build_from(subset_peak_params(d_aki$pp_aligned,  which(d_aki$proc$y  == 1)))
+cat_chf_aligned            <- build_from(subset_peak_params(d_chf$pp_aligned,  which(d_chf$proc$y  == 2)))
+cat_chf_control_aligned    <- build_from(subset_peak_params(d_chf$pp_aligned,  which(d_chf$proc$y  == 1)))
+cat_asthma_aligned         <- build_from(subset_peak_params(d_asth$pp_aligned, which(d_asth$proc$y == 2)))
+cat_asthma_control_aligned <- build_from(subset_peak_params(d_asth$pp_aligned, which(d_asth$proc$y == 1)))
+cat_resp_flu_aligned       <- build_from(subset_peak_params(d_resp$pp_aligned, which(d_resp$proc$y == 2)))
+cat_resp_other_aligned     <- build_from(subset_peak_params(d_resp$pp_aligned, which(d_resp$proc$y == 3)))
+cat_resp_control_aligned   <- build_from(subset_peak_params(d_resp$pp_aligned, which(d_resp$proc$y == 1)))
+
+all_cats_aligned <- list(
+  aki             = cat_aki_aligned,             aki_control    = cat_aki_control_aligned,
+  chf             = cat_chf_aligned,             chf_control    = cat_chf_control_aligned,
+  asthma          = cat_asthma_aligned,          asthma_control = cat_asthma_control_aligned,
+  resp_flu        = cat_resp_flu_aligned,        resp_other     = cat_resp_other_aligned,
+  resp_control    = cat_resp_control_aligned
+)
+```
+
+## Per-sample shift magnitudes across cohorts
+
+Distribution of the RT and CV shifts each sample received from alignment. Bimodal or long-tailed distributions suggest date/batch structure. A tight peak near 0 means alignment didn't detect meaningful drift.
+
+```{r shift-histograms, eval = params$do_alignment, fig.height = 6}
+shifts_df <- bind_rows(
+  data.frame(cohort = "aki",         shift_rt = d_aki$pp_aligned$alignment$shifts_rt,
+                                     shift_cv = d_aki$pp_aligned$alignment$shifts_cv),
+  data.frame(cohort = "chf",         shift_rt = d_chf$pp_aligned$alignment$shifts_rt,
+                                     shift_cv = d_chf$pp_aligned$alignment$shifts_cv),
+  data.frame(cohort = "asthma",      shift_rt = d_asth$pp_aligned$alignment$shifts_rt,
+                                     shift_cv = d_asth$pp_aligned$alignment$shifts_cv),
+  data.frame(cohort = "respiratory", shift_rt = d_resp$pp_aligned$alignment$shifts_rt,
+                                     shift_cv = d_resp$pp_aligned$alignment$shifts_cv)
+)
+shifts_long <- shifts_df %>%
+  tidyr::pivot_longer(cols = c(shift_rt, shift_cv),
+                       names_to = "axis", values_to = "shift")
+ggplot(shifts_long, aes(x = shift)) +
+  geom_histogram(bins = 40, fill = "#B2182B") +
+  facet_grid(cohort ~ axis, scales = "free") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "shift (fraction of image)", y = "n samples",
+       title = "Per-sample alignment shifts by cohort and axis") +
+  theme_minimal()
+```
+
+## Catalog compactness: unaligned vs aligned
+
+Six key metrics per cohort. Alignment is helping when: n_compounds decreases, n_singletons decreases, median_prevalence increases, n_anchor_90pct increases, median_obs_per_sample stays near 1.
+
+```{r compactness-compare, eval = params$do_alignment}
+compact_row <- function(cat, name, method) {
+  c <- catalog_compactness(cat)
+  tibble(
+    catalog = name, method = method,
+    n_compounds = c$n_compounds,
+    n_singletons = nrow(cat$singletons),
+    median_obs_per_sample = round(c$median_obs_per_sample, 3),
+    median_loc_sd_rt_px = round(c$median_loc_sd_rt_px, 2),
+    median_prevalence = round(median(cat$compounds$prevalence), 3),
+    n_anchor_90pct = sum(cat$compounds$prevalence >= 0.9)
+  )
+}
+compactness_before <- purrr::imap_dfr(all_cats,          ~compact_row(.x, .y, "unaligned"))
+compactness_after  <- purrr::imap_dfr(all_cats_aligned,  ~compact_row(.x, .y, "aligned"))
+compactness_compare <- bind_rows(compactness_before, compactness_after) %>%
+  arrange(catalog, method)
+knitr::kable(compactness_compare)
+```
+
+## Delta table: is alignment helping per cohort?
+
+```{r delta-table, eval = params$do_alignment}
+delta_df <- inner_join(
+  compactness_before %>% rename_with(~paste0(., "_before"), -c(catalog, method)) %>%
+    select(-method),
+  compactness_after %>% rename_with(~paste0(., "_after"),  -c(catalog, method)) %>%
+    select(-method),
+  by = "catalog"
+) %>%
+  mutate(
+    delta_n_compounds     = n_compounds_after - n_compounds_before,
+    delta_n_singletons    = n_singletons_after - n_singletons_before,
+    delta_median_prev     = median_prevalence_after - median_prevalence_before,
+    delta_n_anchor_90pct  = n_anchor_90pct_after - n_anchor_90pct_before
+  ) %>%
+  select(catalog, delta_n_compounds, delta_n_singletons,
+         delta_median_prev, delta_n_anchor_90pct)
+knitr::kable(delta_df,
+             caption = "Change from alignment: negative delta on compounds/singletons = better; positive delta on prevalence/anchor = better")
+```
+
+**Interpretation guide:**
+
+- **All deltas in expected direction across cohorts** → alignment is helping generally; use aligned catalogs going forward
+- **Some cohorts help, some don't** → drift is cohort-specific; consider aligning only the cohorts that benefit
+- **All deltas near zero** → cohorts have minimal drift; alignment is safe to skip
+- **Deltas in wrong direction** → alignment is over-correcting; loosen `eps_rt_loose` or increase `min_samples_per_anchor`
+
+## Which catalog to use downstream
+
+```{r select-catalogs, eval = params$do_alignment}
+# Use aligned catalogs for all downstream analyses if alignment helped.
+# You can override here by setting to `all_cats` (unaligned) if the
+# delta table above shows alignment isn't helping.
+all_cats <- all_cats_aligned
+cat_aki             <- cat_aki_aligned
+cat_aki_control     <- cat_aki_control_aligned
+cat_chf             <- cat_chf_aligned
+cat_chf_control     <- cat_chf_control_aligned
+cat_asthma          <- cat_asthma_aligned
+cat_asthma_control  <- cat_asthma_control_aligned
+cat_resp_flu        <- cat_resp_flu_aligned
+cat_resp_other      <- cat_resp_other_aligned
+cat_resp_control    <- cat_resp_control_aligned
 ```
 
 # 2. Summary table across all catalogs
