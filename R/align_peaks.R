@@ -4,6 +4,176 @@
 # Improves catalog compactness — otherwise even small instrument drift
 # can push peaks into different catalog clusters than they should be.
 
+#' Align samples across multiple cohorts jointly
+#'
+#' Extends [align_via_catalog()] across cohorts. Merges all
+#' `peak_params` objects into one super-cohort with globally-unique
+#' sample indices, aligns using cluster-membership offsets, then
+#' splits the aligned peaks back into per-cohort `peak_params`.
+#'
+#' This corrects **cross-cohort drift** — the situation where samples
+#' within any single cohort are well-aligned relative to each other,
+#' but different cohorts' compound positions sit at systematically
+#' different `(rt_loc, cv_loc)` because of instrument drift over
+#' months or between studies. Intra-cohort alignment cannot detect
+#' or fix this because there's no drift signal within each cohort's
+#' own samples.
+#'
+#' When alignment is run across cohorts jointly, the preliminary
+#' catalog sees compound positions across ALL sources at once, so the
+#' cluster centroids reflect the average position across cohorts.
+#' Each cohort's samples then get shifted to that shared reference,
+#' collapsing the cross-cohort duplication in the universal catalog.
+#'
+#' @param pp_list Named list of `peak_params` objects (one per
+#'   cohort). All must have `sample_idx_raw`. Names become cohort
+#'   labels in the returned alignment metadata.
+#' @param eps_rt_loose,eps_cv_loose Preliminary catalog eps. Must be
+#'   larger than the expected drift magnitude across cohorts. Default
+#'   `(0.04, 0.10)` is looser than the intra-cohort version because
+#'   inter-cohort drift is often larger.
+#' @param min_support_frac Support threshold for the merged catalog.
+#'   Kept low (default `0.10`) because merged sample counts are large.
+#' @param min_samples_per_anchor Minimum unique samples an anchor
+#'   compound must span. `NULL` (default) sets to
+#'   `max(5, floor(0.20 * total_n_samples))`.
+#' @param min_anchors_per_sample Minimum anchor compounds a sample
+#'   must contribute to for a shift to be computed.
+#' @param iterate,max_iter,verbose Same as [align_via_catalog()].
+#'
+#' @return A named list of aligned `peak_params` objects (same names
+#'   as `pp_list`). Each carries an `alignment` field with method =
+#'   `"cross_cohort"` plus the per-sample shifts, iteration count, and
+#'   the number of anchor compounds used.
+#' @export
+align_across_cohorts <- function(pp_list,
+                                   eps_rt_loose = 0.04,
+                                   eps_cv_loose = 0.10,
+                                   min_support_frac = 0.10,
+                                   min_samples_per_anchor = NULL,
+                                   min_anchors_per_sample = 5L,
+                                   iterate = TRUE,
+                                   max_iter = 3L,
+                                   verbose = TRUE) {
+  stopifnot(is.list(pp_list), length(pp_list) >= 2L)
+  if (is.null(names(pp_list)))
+    names(pp_list) <- paste0("cohort_", seq_along(pp_list))
+  n_cohorts <- length(pp_list)
+
+  # Validate and record per-cohort sizes
+  cohort_n_samples <- integer(n_cohorts)
+  cohort_offsets   <- integer(n_cohorts)
+  for (i in seq_len(n_cohorts)) {
+    pp <- pp_list[[i]]
+    if (is.null(pp$sample_idx_raw)) {
+      stop("Cohort ", names(pp_list)[i],
+           " is missing sample_idx_raw. Call backfill_sample_idx_raw().")
+    }
+    cohort_n_samples[i] <- pp$n_samples
+    cohort_offsets[i]   <- if (i == 1L) 0L
+                            else sum(cohort_n_samples[seq_len(i - 1L)])
+  }
+  total_n_samples <- sum(cohort_n_samples)
+  if (is.null(min_samples_per_anchor)) {
+    min_samples_per_anchor <- max(5L, floor(0.20 * total_n_samples))
+  }
+
+  if (verbose) {
+    message(sprintf(
+      "align_across_cohorts: merging %d cohorts, %d samples total",
+      n_cohorts, total_n_samples))
+    for (i in seq_len(n_cohorts)) {
+      message(sprintf("  %s: %d samples, %d peaks",
+                       names(pp_list)[i], cohort_n_samples[i],
+                       length(pp_list[[i]]$rt_loc_raw)))
+    }
+  }
+
+  # Build merged peak_params
+  merged <- list(
+    rt_loc_raw    = unlist(lapply(pp_list, `[[`, "rt_loc_raw")),
+    cv_loc_raw    = unlist(lapply(pp_list, `[[`, "cv_loc_raw")),
+    sigma_rt_raw  = unlist(lapply(pp_list, `[[`, "sigma_rt_raw")),
+    sigma_cv_raw  = unlist(lapply(pp_list, `[[`, "sigma_cv_raw")),
+    intensity_raw = unlist(lapply(pp_list, `[[`, "intensity_raw")),
+    n_samples     = total_n_samples,
+    noise         = pp_list[[1]]$noise
+  )
+  # Renumber sample_idx_raw to be globally unique
+  new_sample_idx <- integer(0)
+  for (i in seq_len(n_cohorts)) {
+    new_sample_idx <- c(new_sample_idx,
+                        pp_list[[i]]$sample_idx_raw + cohort_offsets[i])
+  }
+  merged$sample_idx_raw <- new_sample_idx
+  merged$n_peaks_detected <- length(merged$rt_loc_raw)
+  # Per-sample counts for backfill compatibility
+  merged$n_peaks <- list(
+    values = as.integer(unlist(lapply(pp_list, function(pp) {
+      if (!is.null(pp$n_peaks$values)) pp$n_peaks$values
+      else tabulate(pp$sample_idx_raw, nbins = pp$n_samples)
+    }))),
+    mean = 0, sd = 0)
+  merged$n_peaks$mean <- mean(merged$n_peaks$values)
+  merged$n_peaks$sd   <- if (length(merged$n_peaks$values) > 1L)
+                          stats::sd(merged$n_peaks$values) else 0
+
+  # Align merged
+  aligned <- align_via_catalog(merged,
+    eps_rt_loose = eps_rt_loose,
+    eps_cv_loose = eps_cv_loose,
+    min_support_frac = min_support_frac,
+    min_samples_per_anchor = min_samples_per_anchor,
+    min_anchors_per_sample = min_anchors_per_sample,
+    iterate = iterate,
+    max_iter = max_iter,
+    verbose = verbose)
+
+  # Split back into per-cohort peak_params
+  out <- vector("list", n_cohorts)
+  names(out) <- names(pp_list)
+  for (i in seq_len(n_cohorts)) {
+    orig <- pp_list[[i]]
+    off <- cohort_offsets[i]
+    n_s <- cohort_n_samples[i]
+
+    # Peaks belonging to this cohort in the merged coordinates
+    peak_mask <- aligned$sample_idx_raw > off &
+                  aligned$sample_idx_raw <= off + n_s
+
+    new_pp <- orig
+    new_pp$rt_loc_raw    <- aligned$rt_loc_raw[peak_mask]
+    new_pp$cv_loc_raw    <- aligned$cv_loc_raw[peak_mask]
+    new_pp$sigma_rt_raw  <- aligned$sigma_rt_raw[peak_mask]
+    new_pp$sigma_cv_raw  <- aligned$sigma_cv_raw[peak_mask]
+    new_pp$intensity_raw <- aligned$intensity_raw[peak_mask]
+    new_pp$sample_idx_raw <- aligned$sample_idx_raw[peak_mask] - off
+
+    # Recompute derived summaries
+    new_pp$rt_loc <- list(
+      values = new_pp$rt_loc_raw,
+      mean = mean(new_pp$rt_loc_raw),
+      sd = stats::sd(new_pp$rt_loc_raw))
+    new_pp$cv_loc <- list(
+      values = new_pp$cv_loc_raw,
+      mean = mean(new_pp$cv_loc_raw),
+      sd = stats::sd(new_pp$cv_loc_raw))
+
+    cohort_samples <- (off + 1L):(off + n_s)
+    new_pp$alignment <- list(
+      method             = "cross_cohort",
+      shifts_rt          = aligned$alignment$shifts_rt[cohort_samples],
+      shifts_cv          = aligned$alignment$shifts_cv[cohort_samples],
+      n_anchors_matched  = aligned$alignment$n_anchors_matched[cohort_samples],
+      n_anchors_total    = aligned$alignment$n_anchors_total,
+      iterations         = aligned$alignment$iterations,
+      cohort             = names(pp_list)[i]
+    )
+    out[[i]] <- new_pp
+  }
+  out
+}
+
 #' Align samples via cluster-membership offsets
 #'
 #' Alternative alignment approach that avoids the distance-matching

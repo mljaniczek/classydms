@@ -8,13 +8,16 @@ output:
     fig_width: 8
     fig_height: 4.5
 params:
-  output_root: "output"          # directory containing aki/, chf/, asthma/, respiratory/ subdirs
+  output_root: "output"
   eps_rt: 0.003
   eps_cv: 0.015
   min_support_frac: 0.10
-  do_alignment: true             # if TRUE, run align_via_catalog before building catalogs
+  do_alignment: true             # if TRUE, run intra-cohort alignment
+  do_cross_cohort_alignment: true # if TRUE, also do cross-cohort alignment (recommended)
   align_eps_rt_loose: 0.03
   align_eps_cv_loose: 0.08
+  cross_align_eps_rt_loose: 0.04
+  cross_align_eps_cv_loose: 0.10
 ---
 
 ```{r setup, include = FALSE}
@@ -221,9 +224,8 @@ knitr::kable(delta_df,
 ## Which catalog to use downstream
 
 ```{r select-catalogs, eval = params$do_alignment}
-# Use aligned catalogs for all downstream analyses if alignment helped.
-# You can override here by setting to `all_cats` (unaligned) if the
-# delta table above shows alignment isn't helping.
+# Intra-cohort aligned catalogs — may be overridden by cross-cohort
+# alignment in the next section.
 all_cats <- all_cats_aligned
 cat_aki             <- cat_aki_aligned
 cat_aki_control     <- cat_aki_control_aligned
@@ -234,6 +236,205 @@ cat_asthma_control  <- cat_asthma_control_aligned
 cat_resp_flu        <- cat_resp_flu_aligned
 cat_resp_other      <- cat_resp_other_aligned
 cat_resp_control    <- cat_resp_control_aligned
+```
+
+# 1c. Cross-cohort alignment
+
+Intra-cohort alignment (Section 1b) corrects drift **within** each cohort — samples run close together in time drifting together. But if different cohorts were run months apart on the same instrument, or on different service periods, the cohorts themselves can sit at systematically-different `(rt_loc, cv_loc)` positions from each other. Intra-cohort alignment can't detect that.
+
+This section runs `align_across_cohorts()` — merges all cohorts' peak_params into one super-cohort, aligns via cluster-membership, then splits back. Each cohort's samples get shifted to a shared reference so their compound positions line up.
+
+**Diagnostic value**: if intra-cohort shifts were tiny but the universal catalog still shows vertical stripes with many "1-source-only" compounds, cross-cohort drift is the likely culprit and this section will fix it.
+
+```{r cross-alignment, cache = TRUE, eval = params$do_cross_cohort_alignment}
+# Use intra-cohort aligned peak_params (if available) as input
+input_pp <- list(
+  aki         = if (params$do_alignment) d_aki$pp_aligned  else d_aki$pp,
+  chf         = if (params$do_alignment) d_chf$pp_aligned  else d_chf$pp,
+  asthma      = if (params$do_alignment) d_asth$pp_aligned else d_asth$pp,
+  respiratory = if (params$do_alignment) d_resp$pp_aligned else d_resp$pp
+)
+
+cross_aligned <- align_across_cohorts(input_pp,
+  eps_rt_loose = params$cross_align_eps_rt_loose,
+  eps_cv_loose = params$cross_align_eps_cv_loose,
+  min_support_frac = params$min_support_frac,
+  iterate = TRUE, max_iter = 3L, verbose = TRUE)
+
+# Rebuild catalogs on cross-aligned peak_params
+cat_aki_cross            <- build_from(subset_peak_params(cross_aligned$aki,         which(d_aki$proc$y  == 2)))
+cat_aki_control_cross    <- build_from(subset_peak_params(cross_aligned$aki,         which(d_aki$proc$y  == 1)))
+cat_chf_cross            <- build_from(subset_peak_params(cross_aligned$chf,         which(d_chf$proc$y  == 2)))
+cat_chf_control_cross    <- build_from(subset_peak_params(cross_aligned$chf,         which(d_chf$proc$y  == 1)))
+cat_asthma_cross         <- build_from(subset_peak_params(cross_aligned$asthma,      which(d_asth$proc$y == 2)))
+cat_asthma_control_cross <- build_from(subset_peak_params(cross_aligned$asthma,      which(d_asth$proc$y == 1)))
+cat_resp_flu_cross       <- build_from(subset_peak_params(cross_aligned$respiratory, which(d_resp$proc$y == 2)))
+cat_resp_other_cross     <- build_from(subset_peak_params(cross_aligned$respiratory, which(d_resp$proc$y == 3)))
+cat_resp_control_cross   <- build_from(subset_peak_params(cross_aligned$respiratory, which(d_resp$proc$y == 1)))
+
+all_cats_cross <- list(
+  aki             = cat_aki_cross,             aki_control    = cat_aki_control_cross,
+  chf             = cat_chf_cross,             chf_control    = cat_chf_control_cross,
+  asthma          = cat_asthma_cross,          asthma_control = cat_asthma_control_cross,
+  resp_flu        = cat_resp_flu_cross,        resp_other     = cat_resp_other_cross,
+  resp_control    = cat_resp_control_cross
+)
+```
+
+## Cross-cohort shifts by cohort
+
+Distribution of shifts each sample received from the cross-cohort alignment. If intra-cohort alignment already happened, these are ADDITIONAL shifts on top. Look for cohort-level offsets — if all samples in one cohort shifted by ~+0.005 and all in another by ~-0.005, the cross-cohort drift signal is real.
+
+```{r cross-shift-histograms, eval = params$do_cross_cohort_alignment, fig.height = 6}
+cross_shifts_df <- bind_rows(
+  data.frame(cohort = "aki",         shift_rt = cross_aligned$aki$alignment$shifts_rt,
+                                     shift_cv = cross_aligned$aki$alignment$shifts_cv),
+  data.frame(cohort = "chf",         shift_rt = cross_aligned$chf$alignment$shifts_rt,
+                                     shift_cv = cross_aligned$chf$alignment$shifts_cv),
+  data.frame(cohort = "asthma",      shift_rt = cross_aligned$asthma$alignment$shifts_rt,
+                                     shift_cv = cross_aligned$asthma$alignment$shifts_cv),
+  data.frame(cohort = "respiratory", shift_rt = cross_aligned$respiratory$alignment$shifts_rt,
+                                     shift_cv = cross_aligned$respiratory$alignment$shifts_cv)
+)
+cross_shifts_long <- cross_shifts_df %>%
+  tidyr::pivot_longer(cols = c(shift_rt, shift_cv),
+                       names_to = "axis", values_to = "shift")
+ggplot(cross_shifts_long, aes(x = shift, fill = cohort)) +
+  geom_histogram(bins = 40, position = "identity", alpha = 0.5) +
+  facet_wrap(~ axis, scales = "free", ncol = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(x = "shift (fraction of image)", y = "n samples",
+       title = "Cross-cohort shifts (with cohort overlay)",
+       subtitle = "If cohort colors separate along the x-axis, cross-cohort drift is real") +
+  theme_minimal()
+```
+
+## Median shift by cohort — quick summary
+
+```{r cross-cohort-shift-summary, eval = params$do_cross_cohort_alignment}
+cross_shifts_df %>%
+  group_by(cohort) %>%
+  summarise(
+    median_shift_rt = round(median(shift_rt), 5),
+    median_shift_cv = round(median(shift_cv), 5),
+    max_abs_rt      = round(max(abs(shift_rt)), 5),
+    max_abs_cv      = round(max(abs(shift_cv)), 5),
+    n_samples       = n(),
+    .groups = "drop"
+  ) %>% knitr::kable(caption = "Cross-cohort shift magnitudes per cohort")
+```
+
+**How to read this table:**
+
+- **Median shifts near 0** with **max_abs small** → cohorts are already well-aligned to each other; cross-cohort alignment isn't needed.
+- **Median shifts differ between cohorts** (e.g., one cohort's median is +0.005, another's is -0.005) → real cross-cohort drift; alignment is fixing it.
+- **Large max_abs but median near 0** → some individual samples had large shifts (potential outliers) but most cohort samples were fine.
+
+## Compactness: unaligned vs intra-cohort aligned vs cross-cohort aligned
+
+```{r cross-compactness-compare, eval = params$do_cross_cohort_alignment}
+compact_row_cross <- function(cat, name, method) {
+  c <- catalog_compactness(cat)
+  tibble(
+    catalog = name, method = method,
+    n_compounds = c$n_compounds,
+    n_singletons = nrow(cat$singletons),
+    median_prevalence = round(median(cat$compounds$prevalence), 3),
+    n_anchor_90pct = sum(cat$compounds$prevalence >= 0.9)
+  )
+}
+compactness_cross <- purrr::imap_dfr(all_cats_cross, ~compact_row_cross(.x, .y, "cross_aligned"))
+
+three_way <- bind_rows(
+  purrr::imap_dfr(all_cats,         ~compact_row_cross(.x, .y, "aligned_intra")),
+  compactness_cross
+) %>% arrange(catalog, method)
+knitr::kable(three_way,
+             caption = "Compactness after intra-cohort vs cross-cohort alignment")
+```
+
+## Universal catalog spatial check — is the vertical-stripe pattern reduced?
+
+The most direct test of whether cross-cohort alignment worked. Rebuild the universal catalog on cross-aligned data and re-plot.
+
+```{r universal-cross, cache = TRUE, eval = params$do_cross_cohort_alignment}
+universal_cross <- merge_catalogs(
+  list(cat_aki_cross, cat_aki_control_cross,
+       cat_chf_cross, cat_chf_control_cross,
+       cat_asthma_cross, cat_asthma_control_cross,
+       cat_resp_flu_cross, cat_resp_other_cross, cat_resp_control_cross),
+  names = c("aki", "aki_ctrl",
+             "chf", "chf_ctrl",
+             "asthma", "asthma_ctrl",
+             "resp_flu", "resp_other", "resp_ctrl")
+)
+sprintf("Universal catalog (cross-aligned): %d compounds",
+        nrow(universal_cross$compounds))
+```
+
+```{r universal-cross-spatial, eval = params$do_cross_cohort_alignment, fig.height = 6, fig.width = 8}
+per_source_cross <- do.call(rbind, universal_cross$compounds$per_source_prevalence) |>
+  as.data.frame()
+colnames(per_source_cross) <- universal_cross$parameters$source_names
+per_source_cross$n_sources_present <-
+  rowSums(per_source_cross[, universal_cross$parameters$source_names] > 0)
+
+uni_cross_map <- tibble(
+  rt_loc = universal_cross$compounds$rt_loc,
+  cv_loc = universal_cross$compounds$cv_loc,
+  n_sources = per_source_cross$n_sources_present,
+  prevalence = universal_cross$compounds$prevalence
+) |> mutate(coverage_bin = case_when(
+  n_sources == 9 ~ "9 sources (universal)",
+  n_sources >= 5 ~ "5-8 sources",
+  n_sources >= 2 ~ "2-4 sources",
+  TRUE ~ "1 source only"
+))
+uni_cross_map$coverage_bin <- factor(uni_cross_map$coverage_bin,
+  levels = c("1 source only", "2-4 sources",
+              "5-8 sources", "9 sources (universal)"))
+
+ggplot(uni_cross_map, aes(x = cv_loc, y = rt_loc, color = coverage_bin,
+                          size = prevalence)) +
+  geom_point(alpha = 0.55) +
+  scale_color_manual(values = c(
+    "1 source only"          = "#B2182B",
+    "2-4 sources"            = "#EF8A62",
+    "5-8 sources"            = "#67A9CF",
+    "9 sources (universal)"  = "#08306B")) +
+  scale_size_continuous(range = c(0.3, 3), guide = "none") +
+  scale_y_reverse() +
+  labs(x = "CV (fraction)", y = "RT (fraction)",
+       title = "Universal catalog AFTER cross-cohort alignment",
+       subtitle = sprintf("%d compounds (was %d before alignment)",
+                          nrow(universal_cross$compounds),
+                          nrow(universal$compounds)),
+       color = "source coverage") +
+  theme_minimal()
+```
+
+**How to read this vs the un-aligned universal spatial map (Section 6):**
+
+- **Fewer red points (1-source-only)** → alignment merged compounds that were previously split across cohorts. Good.
+- **More dark-blue points (9-source universal)** → previously-split compounds now count as universal. Good.
+- **Vertical-stripe pattern reduced** → the RT drift between cohorts is being corrected.
+- **Same or worse pattern** → drift isn't the main story; other factors (e.g., real per-cohort chemistry differences) may be at play.
+
+## Use cross-aligned catalogs for downstream analysis?
+
+```{r select-cross-catalogs, eval = params$do_cross_cohort_alignment}
+# Swap in the cross-aligned catalogs. Comment these lines out to
+# revert to intra-cohort aligned if the cross-alignment doesn't help.
+all_cats <- all_cats_cross
+cat_aki             <- cat_aki_cross
+cat_aki_control     <- cat_aki_control_cross
+cat_chf             <- cat_chf_cross
+cat_chf_control     <- cat_chf_control_cross
+cat_asthma          <- cat_asthma_cross
+cat_asthma_control  <- cat_asthma_control_cross
+cat_resp_flu        <- cat_resp_flu_cross
+cat_resp_other      <- cat_resp_other_cross
+cat_resp_control    <- cat_resp_control_cross
 ```
 
 # 2. Summary table across all catalogs
