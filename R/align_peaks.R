@@ -99,6 +99,23 @@ align_across_cohorts <- function(pp_list,
     n_samples     = total_n_samples,
     noise         = pp_list[[1]]$noise
   )
+  # Also merge physical fields + per-sample ranges when ALL cohorts have
+  # them. Without these, align_via_catalog can't back-sync the physical
+  # coordinates and downstream physical-mode catalog will see zero effect
+  # from alignment (see the corresponding note in align_via_catalog).
+  all_have_phys <- all(vapply(pp_list, function(pp) {
+    !is.null(pp$rt_seconds_raw) && !is.null(pp$cv_volts_raw) &&
+    !is.null(pp$time_ranges) && !is.null(pp$cv_ranges)
+  }, logical(1)))
+  if (all_have_phys) {
+    merged$rt_seconds_raw <- unlist(lapply(pp_list, `[[`, "rt_seconds_raw"))
+    merged$cv_volts_raw   <- unlist(lapply(pp_list, `[[`, "cv_volts_raw"))
+    merged$time_ranges    <- do.call(rbind, lapply(pp_list, `[[`,
+                                                     "time_ranges"))
+    merged$cv_ranges      <- do.call(rbind, lapply(pp_list, `[[`,
+                                                     "cv_ranges"))
+    merged$coord_mode     <- "physical"
+  }
   # Renumber sample_idx_raw to be globally unique
   new_sample_idx <- integer(0)
   for (i in seq_len(n_cohorts)) {
@@ -148,6 +165,10 @@ align_across_cohorts <- function(pp_list,
     new_pp$sigma_cv_raw  <- aligned$sigma_cv_raw[peak_mask]
     new_pp$intensity_raw <- aligned$intensity_raw[peak_mask]
     new_pp$sample_idx_raw <- aligned$sample_idx_raw[peak_mask] - off
+    if (all_have_phys) {
+      new_pp$rt_seconds_raw <- aligned$rt_seconds_raw[peak_mask]
+      new_pp$cv_volts_raw   <- aligned$cv_volts_raw[peak_mask]
+    }
 
     # Recompute derived summaries
     new_pp$rt_loc <- list(
