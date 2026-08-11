@@ -93,6 +93,104 @@ pretrain_autoencoder <- function(peak_params, H, W,
 #' @export
 pretrain_denoising <- pretrain_autoencoder
 
+#' Pre-train the encoder from a peak catalog
+#'
+#' Same idea as [pretrain_autoencoder()] but generates the synthetic
+#' pretraining set via [generate_one_synthetic_from_catalog()]. Use
+#' this when you have a catalog (perhaps loaded from disk) but not the
+#' original `peak_params` object.
+#'
+#' @param catalog A `peak_catalog` object.
+#' @param H,W Synthetic image dimensions.
+#' @param n_synthetic Number of synthetic samples to generate.
+#' @param epochs,batch_size,lr,weight_decay Optimization parameters.
+#' @param add_noise If TRUE, denoising autoencoder; if FALSE,
+#'   reconstruction.
+#' @param stem_stride_rt,stem_stride_cv Encoder stem strides.
+#' @param device "cpu" or "cuda".
+#' @param seed RNG seed.
+#' @return List with `encoder`, `autoencoder`, `loss_history`.
+#' @export
+pretrain_autoencoder_from_catalog <- function(catalog, H, W,
+                                                n_synthetic = 2000L,
+                                                epochs = 30L,
+                                                batch_size = 32L,
+                                                lr = 1e-3,
+                                                weight_decay = 1e-4,
+                                                add_noise = TRUE,
+                                                stem_stride_rt = 4L,
+                                                stem_stride_cv = 1L,
+                                                device = if (torch::cuda_is_available()) "cuda" else "cpu",
+                                                seed = 42L) {
+  set.seed(seed); torch::torch_manual_seed(seed)
+  stopifnot(inherits(catalog, "peak_catalog"))
+  message("Generating ", n_synthetic, " catalog-based synthetic samples ",
+          "(", H, "x", W, ")...")
+
+  # Generate stack of clean + noisy
+  clean_arr <- array(0, dim = c(n_synthetic, 1L, H, W))
+  noisy_arr <- array(0, dim = c(n_synthetic, 1L, H, W))
+  for (i in seq_len(n_synthetic)) {
+    res <- generate_one_synthetic_from_catalog(catalog, H = H, W = W,
+                                                 add_noise = add_noise)
+    clean_arr[i, 1L, , ] <- res$clean
+    noisy_arr[i, 1L, , ] <- if (add_noise) res$noisy else res$clean
+    if (i %% 200L == 0L) message("  generated ", i, "/", n_synthetic)
+  }
+  # Log-quantile normalize using the same convention as the peak_params path.
+  # pmax(0, x) collapses dims when one arg is scalar, so clamp in-place instead.
+  q_clean <- as.numeric(stats::quantile(clean_arr[clean_arr > 0], 0.95,
+                                          na.rm = TRUE))
+  if (!is.finite(q_clean) || q_clean == 0) q_clean <- 1
+  clean_arr[clean_arr < 0] <- 0
+  noisy_arr[noisy_arr < 0] <- 0
+  clean_arr <- log1p(clean_arr) / log1p(q_clean)
+  noisy_arr <- log1p(noisy_arr) / log1p(q_clean)
+
+  clean_t <- torch::torch_tensor(clean_arr, dtype = torch::torch_float())
+  noisy_t <- torch::torch_tensor(noisy_arr, dtype = torch::torch_float())
+
+  ds_class <- torch::dataset(
+    name = "catalog_pretrain_ds",
+    initialize = function() {},
+    .getitem = function(i) list(input = noisy_t[i, ..],
+                                 target = clean_t[i, ..]),
+    .length = function() clean_t$size()[1]
+  )
+  dl <- torch::dataloader(ds_class(), batch_size = batch_size,
+                            shuffle = TRUE)
+
+  model <- dms_denoising_autoencoder(target_H = H, target_W = W,
+                                       stem_stride_rt = stem_stride_rt,
+                                       stem_stride_cv = stem_stride_cv)
+  model$to(device = device)
+  opt <- torch::optim_adam(model$parameters, lr = lr,
+                            weight_decay = weight_decay)
+  loss_fn <- torch::nn_mse_loss()
+  loss_history <- numeric(epochs)
+
+  for (ep in seq_len(epochs)) {
+    model$train(); epoch_loss <- 0; n_batches <- 0
+    coro::loop(for (batch in dl) {
+      input <- batch$input$to(device = device)
+      target <- batch$target$to(device = device)
+      opt$zero_grad()
+      recon <- model(input)
+      loss <- loss_fn(recon, target)
+      loss$backward(); opt$step()
+      epoch_loss <- epoch_loss + as.numeric(loss$item())
+      n_batches <- n_batches + 1
+    })
+    loss_history[ep] <- epoch_loss / max(1, n_batches)
+    if (ep %% 10 == 0 || ep == 1) {
+      message("Epoch ", ep, "/", epochs, " | MSE: ",
+              round(loss_history[ep], 6))
+    }
+  }
+  list(encoder = model$encoder, autoencoder = model,
+       loss_history = loss_history)
+}
+
 #' Pre-train the encoder via online denoising autoencoder
 #'
 #' Generates fresh synthetic batches on-the-fly during training, giving

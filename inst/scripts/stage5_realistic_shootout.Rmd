@@ -1,0 +1,304 @@
+---
+title: "Stage 5: Realistic-preset model shootout"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+params:
+  catalog_path: "catalog_comparison_outputs_physical/all_catalogs.rds"
+  catalog_name: "aki"          # which cohort catalog to build simulations from
+  H: 1200
+  W: 40
+  # Universal-backdrop preset knobs
+  n_biomarkers: 5
+  anchor_prevalence_threshold: 0.9
+  min_intensity_quantile: 0.95
+  case_prevalence: 0.9
+  control_prevalence: 0.1
+  case_intensity_mult: 1.2
+  # Cohort size sweep
+  n_per_class_grid: "100,200"  # comma-separated
+  n_seeds: 3                    # repeated simulations per grid point
+  # Pretraining
+  n_pretrain_samples: 400
+  pretrain_epochs: 20
+  # Classification
+  cv_k: 5
+  cnn_epochs: 15
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(classydms)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(purrr)
+library(pROC)
+library(glmnet)
+library(torch)
+```
+
+# Purpose
+
+For each of two cohort sizes (100/100 and 200/200), simulate a case/control study using the `catalog_biomarkers_universal_backdrop` preset, then benchmark four classifiers on 5-fold CV out-of-fold AUC:
+
+1. **Elastic net on flattened pixels** — no peak knowledge, sees the raw resampled Z. Baseline.
+2. **Elastic net on catalog-compound amplitudes** — uses the catalog to sum intensity at each compound's neighborhood. "If we had perfect peaks" upper bound for interpretable ML.
+3. **Encoder features + elastic net** — pretrain a denoising encoder on synthetic data from the same catalog, extract 64-dim features, then elastic net.
+4. **Pretrained CNN classifier** — fine-tune the encoder + a linear head end-to-end.
+
+Repeat each condition `n_seeds` times to get AUC ± SD.
+
+# 1. Load catalog and prepare simulation harness
+
+```{r load-catalog}
+all_cats <- readRDS(params$catalog_path)
+if (!params$catalog_name %in% names(all_cats)) {
+  stop("catalog_name '", params$catalog_name, "' not found in ",
+       params$catalog_path, ". Available: ",
+       paste(names(all_cats), collapse = ", "))
+}
+cat_use <- all_cats[[params$catalog_name]]
+sprintf("Loaded %s catalog: %d compounds, %d singletons, coord_mode = %s",
+        params$catalog_name,
+        nrow(cat_use$compounds),
+        nrow(cat_use$singletons),
+        cat_use$parameters$coord_mode %||% "fraction")
+```
+
+```{r biomarker-spec}
+spec <- catalog_biomarkers_universal_backdrop(cat_use,
+  n_biomarkers = params$n_biomarkers,
+  anchor_prevalence_threshold = params$anchor_prevalence_threshold,
+  min_intensity_quantile = params$min_intensity_quantile,
+  case_prevalence = params$case_prevalence,
+  control_prevalence = params$control_prevalence,
+  case_intensity_mult = params$case_intensity_mult,
+  seed = 20260810
+)
+
+sprintf("Anchor layer: %d compounds (invariant backdrop across all samples)",
+        attr(spec, "n_anchors"))
+sprintf("Biomarker layer: %d non-anchor compounds",
+        nrow(spec))
+sprintf("Signal: case_prev=%.2f vs control_prev=%.2f, intensity_mult=%.2fx",
+        params$case_prevalence, params$control_prevalence,
+        params$case_intensity_mult)
+
+# Biomarker positions
+biom_pos <- cat_use$compounds[match(spec$compound_id,
+                                       cat_use$compounds$compound_id),
+                                 c("compound_id", "rt_loc", "cv_loc",
+                                    "prevalence")]
+knitr::kable(biom_pos, digits = 3, caption = "Injected biomarker compounds")
+```
+
+# 2. Pretrain encoder on synthetic-from-catalog
+
+```{r pretrain-encoder, cache = TRUE}
+enc_res <- pretrain_autoencoder_from_catalog(cat_use,
+  H = params$H, W = params$W,
+  n_synthetic = params$n_pretrain_samples,
+  epochs = params$pretrain_epochs,
+  batch_size = 16,
+  device = "cpu",
+  seed = 1)
+encoder <- enc_res$encoder
+sprintf("Encoder pretrained: final MSE = %.5f",
+        tail(enc_res$loss_history, 1))
+```
+
+# 3. Simulate a cohort and evaluate all four models
+
+```{r shootout-helper}
+# Given a simulated cohort, run all four models and return AUCs
+run_all_models <- function(sim, catalog, encoder, cv_k = 5, cnn_epochs = 15,
+                            seed = 1) {
+  Z_list <- lapply(sim$samples, `[[`, "Z")
+  y <- sim$y
+  set.seed(seed)
+
+  # Model 1: pixel elastic net
+  X_pix <- do.call(rbind, lapply(Z_list, function(Z) as.vector(Z)))
+  auc_pix <- tryCatch({
+    fold_id <- sample(rep(seq_len(cv_k), length.out = length(y)))
+    oof <- numeric(length(y))
+    for (k in seq_len(cv_k)) {
+      tr <- fold_id != k; te <- !tr
+      fit <- glmnet::cv.glmnet(X_pix[tr, ], y[tr], family = "binomial",
+                                alpha = 0.5, nfolds = 3)
+      oof[te] <- as.numeric(predict(fit, newx = X_pix[te, ], s = "lambda.min",
+                                       type = "response"))
+    }
+    as.numeric(pROC::auc(pROC::roc(y, oof, quiet = TRUE)))
+  }, error = function(e) NA_real_)
+
+  # Model 2: catalog-amplitude elastic net (per-compound intensity)
+  # For each compound, sum intensity in a small neighborhood at (rt_loc, cv_loc)
+  auc_amp <- tryCatch({
+    row_range <- function(rt) {
+      i0 <- max(1, floor(rt * nrow(Z_list[[1]])) - 3)
+      i1 <- min(nrow(Z_list[[1]]), floor(rt * nrow(Z_list[[1]])) + 3)
+      seq(i0, i1)
+    }
+    col_range <- function(cv) {
+      i0 <- max(1, floor(cv * ncol(Z_list[[1]])) - 2)
+      i1 <- min(ncol(Z_list[[1]]), floor(cv * ncol(Z_list[[1]])) + 2)
+      seq(i0, i1)
+    }
+    # If catalog is physical, convert to fraction on the fly using H/W
+    cmp <- catalog$compounds
+    if ("rt_frac" %in% names(cmp)) {
+      rt_use <- cmp$rt_frac; cv_use <- cmp$cv_frac
+    } else {
+      rt_use <- cmp$rt_loc; cv_use <- cmp$cv_loc
+    }
+    X_amp <- do.call(rbind, lapply(Z_list, function(Z) {
+      vapply(seq_len(nrow(cmp)), function(i) {
+        sum(Z[row_range(rt_use[i]), col_range(cv_use[i])])
+      }, numeric(1))
+    }))
+    fold_id <- sample(rep(seq_len(cv_k), length.out = length(y)))
+    oof <- numeric(length(y))
+    for (k in seq_len(cv_k)) {
+      tr <- fold_id != k; te <- !tr
+      fit <- glmnet::cv.glmnet(X_amp[tr, ], y[tr], family = "binomial",
+                                alpha = 0.5, nfolds = 3)
+      oof[te] <- as.numeric(predict(fit, newx = X_amp[te, ], s = "lambda.min",
+                                       type = "response"))
+    }
+    as.numeric(pROC::auc(pROC::roc(y, oof, quiet = TRUE)))
+  }, error = function(e) NA_real_)
+
+  # Model 3: encoder features + elastic net
+  auc_enc <- tryCatch({
+    res <- cv_encoder_elastic_net(encoder, Z_list, y,
+                                    k = cv_k, alpha = 0.5, seed = seed)
+    res$auc
+  }, error = function(e) NA_real_)
+
+  # Model 4: pretrained CNN
+  auc_cnn <- tryCatch({
+    res <- cv_pretrained_oof(Z_list, y, encoder,
+                              k = cv_k, epochs = cnn_epochs,
+                              seed = seed)
+    res$auc
+  }, error = function(e) NA_real_)
+
+  tibble(
+    model = c("pixel_enet", "amp_enet", "encoder_enet", "pretrained_cnn"),
+    auc   = c(auc_pix, auc_amp, auc_enc, auc_cnn)
+  )
+}
+```
+
+```{r shootout-run, cache = TRUE}
+n_per_class_vals <- as.integer(strsplit(params$n_per_class_grid, ",")[[1]])
+n_seeds <- params$n_seeds
+
+grid <- expand.grid(
+  n_per_class = n_per_class_vals,
+  seed = seq_len(n_seeds),
+  KEEP.OUT.ATTRS = FALSE
+)
+
+results <- purrr::map2_dfr(grid$n_per_class, grid$seed, function(npc, sd) {
+  message(sprintf("Simulating n=%d/%d, seed=%d ...", npc, npc, sd))
+  sim <- simulate_case_control_from_catalog(cat_use, spec,
+    n_cases = npc, n_controls = npc,
+    H = params$H, W = params$W,
+    seed = sd * 1000 + 1)
+  m <- run_all_models(sim, cat_use, encoder,
+                       cv_k = params$cv_k,
+                       cnn_epochs = params$cnn_epochs, seed = sd)
+  m$n_per_class <- npc
+  m$sim_seed <- sd
+  m
+})
+results
+```
+
+# 4. Bar chart of AUC by model and cohort size
+
+```{r shootout-plot, fig.width = 8, fig.height = 5}
+summary_df <- results |>
+  group_by(model, n_per_class) |>
+  summarise(auc_mean = mean(auc, na.rm = TRUE),
+             auc_sd   = sd(auc,   na.rm = TRUE),
+             n_reps   = sum(!is.na(auc)),
+             .groups = "drop")
+
+# Order models by mean AUC on largest cohort (most stable)
+big_n <- max(summary_df$n_per_class)
+model_order <- summary_df |> filter(n_per_class == big_n) |>
+  arrange(auc_mean) |> pull(model)
+summary_df$model <- factor(summary_df$model, levels = model_order)
+results$model    <- factor(results$model,    levels = model_order)
+
+ggplot(summary_df, aes(x = model, y = auc_mean,
+                        fill = factor(n_per_class))) +
+  geom_col(position = position_dodge(width = 0.9),
+            width = 0.85, alpha = 0.85) +
+  geom_errorbar(aes(ymin = auc_mean - auc_sd,
+                     ymax = pmin(1, auc_mean + auc_sd)),
+                 position = position_dodge(width = 0.9),
+                 width = 0.25) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+  scale_fill_brewer(palette = "RdBu", name = "n per class") +
+  coord_cartesian(ylim = c(0.4, 1.0)) +
+  labs(x = NULL, y = "OOF AUC (mean ± SD)",
+       title = sprintf(
+         "Model shootout on universal-backdrop preset (%s catalog)",
+         params$catalog_name),
+       subtitle = sprintf(
+         "case_prev=%.2f vs control_prev=%.2f, intensity_mult=%.2fx, %d biomarkers",
+         params$case_prevalence, params$control_prevalence,
+         params$case_intensity_mult, params$n_biomarkers),
+       caption = sprintf("%d simulation seeds per cohort size", n_seeds)) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.x = element_blank(),
+        legend.position = "top")
+```
+
+# 5. Per-seed strip plot
+
+Shows all individual runs, not just means. Reveals whether models are stable across simulation seeds or highly variable.
+
+```{r strip-plot, fig.width = 8, fig.height = 4}
+ggplot(results, aes(x = model, y = auc,
+                     color = factor(n_per_class))) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+  geom_jitter(width = 0.15, height = 0, size = 2.5, alpha = 0.8) +
+  scale_color_brewer(palette = "RdBu", name = "n per class") +
+  coord_cartesian(ylim = c(0.4, 1.0)) +
+  labs(x = NULL, y = "OOF AUC",
+       title = "Individual seed AUCs — spread indicates seed sensitivity") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.x = element_blank(),
+        legend.position = "top")
+```
+
+# 6. Numeric summary
+
+```{r summary-table}
+knitr::kable(summary_df |>
+  select(model, n_per_class, auc_mean, auc_sd, n_reps) |>
+  mutate(across(c(auc_mean, auc_sd), ~round(., 3))),
+  caption = "Mean OOF AUC per model per cohort size")
+```
+
+# What to read
+
+- **`pixel_enet` doing well** → the classifier is memorizing pixel patterns; may not generalize. If it beats `amp_enet` significantly, either the amplitude extraction is buggy or the injected signal is very geometrically strong.
+- **`amp_enet` doing well** → the peak positions are recoverable; a classical interpretable pipeline can work if peaks are found reliably.
+- **`encoder_enet` matching `pretrained_cnn`** → the learned features are doing the heavy lifting; the CNN head adds little. Prefer `encoder_enet` for interpretability.
+- **`pretrained_cnn` clearly winning** → end-to-end fine-tuning is finding structure the fixed encoder features miss.
+- **200/200 significantly better than 100/100** → cohort size matters; consider aggregation or transfer learning.
+- **200/200 same as 100/100** → the pipeline is signal-limited, not sample-limited.
+
+# What's next
+
+- **Stage 1 (prevalence ladder)**: sweep `case_prevalence` in {0.8, 0.9, 1.0} with `control_prevalence` = 1 − case_prevalence. See how AUC degrades as signal weakens.
+- **Stage 7 (biomarker recovery)**: for the best model, run saliency and measure whether the 5 injected biomarkers' RT/CV positions match the top-K saliency hotspots.
