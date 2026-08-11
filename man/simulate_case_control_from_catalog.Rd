@@ -16,6 +16,8 @@ simulate_case_control_from_catalog(
   location_jitter_cv = 1,
   add_noise = TRUE,
   noise_scale = 1,
+  cofire = NULL,
+  off_catalog_peaks = NULL,
   seed = NULL
 )
 }
@@ -35,12 +37,54 @@ jitter parameters, forwarded to the underlying generator.}
 
 \item{noise_scale}{Multiplier on catalog noise SD.}
 
+\item{cofire}{Optional list of dependency groups modelling co-firing
+structure between compounds. Each element is a list with EITHER
+\code{anchor} (a single \code{compound_id}), \code{dependents} (integer vector of
+\code{compound_id}s), and \code{p_dependent_given_anchor} (scalar in \verb{[0,1]}
+— probability each dependent fires when the anchor does), OR
+\code{members} (integer vector of \code{compound_id}s) and \code{p_joint} (scalar
+in \verb{[0,1]} — probability the whole clique fires together). Applied
+as post-processing on top of the independent Bernoulli firing:
+\itemize{
+\item Dependency group: if anchor did not fire, every dependent that
+independently fired is REMOVED (its Gaussian subtracted). If the
+anchor fired, every dependent that did not fire independently gets
+an additional Bernoulli(\code{p_dependent_given_anchor}) roll; on
+success the compound fires and its Gaussian is added.
+\item Symmetric clique: one joint Bernoulli(\code{p_joint}) roll decides the
+whole group. On success every non-fired member is added; on
+failure every fired member is removed.
+The final \code{per_sample_firing} matrix reflects the post-cofire state.
+}}
+
+\item{off_catalog_peaks}{Optional list controlling injection of random
+peaks NOT present in the catalog. Fields:
+\itemize{
+\item \code{n_cases}, \code{n_controls}: integer peaks to inject per case /
+control sample.
+\item \code{rt_range}, \code{cv_range}: length-2 numerics in \link{0,1} giving the
+fractional (RT, CV) placement region.
+\item \code{intensity_range}: length-2 numeric giving uniform bounds for
+the injected peak amplitude.
+\item \code{exclusion_eps_rt}, \code{exclusion_eps_cv}: fractional radius; a
+candidate position is rejected if within this box of any catalog
+compound. Defaults \verb{(0.02, 0.05)}.
+Sigmas are drawn from the pooled catalog sigma distribution so peak
+shapes match the catalog's morphology. Used for stress-testing an
+encoder / classifier on peaks the pretraining never saw. Peak
+positions are recorded on the returned \code{off_catalog_positions}
+list (one entry per sample).
+}}
+
 \item{seed}{Optional RNG seed.}
 }
 \value{
 List with \code{samples}, \code{y}, \code{ground_truth} (the biomarker
-spec), and \code{per_sample_firing} (logical matrix of \code{n_samples} x
-\code{n_biomarkers}; whether each biomarker fired in each sample).
+spec), \code{per_sample_firing} (logical matrix of \code{n_samples} x
+\code{n_biomarkers}; whether each biomarker fired in each sample AFTER
+any cofire post-processing), \code{cofire} (the cofire spec that was
+applied, or \code{NULL}), and \code{off_catalog_positions} (list of length
+\code{n_samples} recording injected positions, or \code{NULL}).
 \code{samples} matches \code{\link[=load_dms_directory]{load_dms_directory()}}'s shape so downstream
 pipeline steps work unchanged.
 }

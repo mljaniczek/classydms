@@ -83,6 +83,14 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
   clean  <- matrix(0, nrow = H, ncol = W)
   rows   <- seq_len(H); cols <- seq_len(W)
   fired  <- logical(n_compounds)
+  # Track per-fired-compound placement so downstream code can subtract or
+  # add peaks by exact morphology (used for cofire post-processing).
+  placements_cid   <- integer(0)
+  placements_mu_rt <- numeric(0)
+  placements_mu_cv <- numeric(0)
+  placements_sig_rt <- numeric(0)
+  placements_sig_cv <- numeric(0)
+  placements_amp   <- numeric(0)
 
   # Precompute lookup tables for override vectors
   po_names <- if (!is.null(prevalence_override))
@@ -126,17 +134,32 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
     g_rt <- exp(-0.5 * ((rows - mu_rt) / sig_rt)^2)
     g_cv <- exp(-0.5 * ((cols - mu_cv) / sig_cv)^2)
     clean <- clean + amp * outer(g_rt, g_cv)
+    placements_cid    <- c(placements_cid,    compounds$compound_id[i])
+    placements_mu_rt  <- c(placements_mu_rt,  mu_rt)
+    placements_mu_cv  <- c(placements_mu_cv,  mu_cv)
+    placements_sig_rt <- c(placements_sig_rt, sig_rt)
+    placements_sig_cv <- c(placements_sig_cv, sig_cv)
+    placements_amp    <- c(placements_amp,    amp)
   }
+
+  placements <- tibble::tibble(
+    compound_id = placements_cid,
+    mu_rt = placements_mu_rt, mu_cv = placements_mu_cv,
+    sig_rt = placements_sig_rt, sig_cv = placements_sig_cv,
+    amp = placements_amp
+  )
 
   if (!add_noise || is.null(catalog$noise) ||
       !is.finite(catalog$noise$mean) || !is.finite(catalog$noise$sd)) {
-    return(list(clean = clean, noisy = clean, fired = fired))
+    return(list(clean = clean, noisy = clean, fired = fired,
+                placements = placements))
   }
   noise_sd <- max(1e-8, catalog$noise$sd * noise_scale)
   noise <- matrix(abs(stats::rnorm(H * W, mean = catalog$noise$mean,
                                     sd = noise_sd)),
                    nrow = H, ncol = W)
-  list(clean = clean, noisy = clean + noise, fired = fired)
+  list(clean = clean, noisy = clean + noise, fired = fired,
+       placements = placements)
 }
 
 #' Pick a set of catalog compounds as biomarkers
@@ -260,11 +283,47 @@ build_biomarker_spec_catalog <- function(compound_ids,
 #'   jitter parameters, forwarded to the underlying generator.
 #' @param add_noise Whether to add background noise.
 #' @param noise_scale Multiplier on catalog noise SD.
+#' @param cofire Optional list of dependency groups modelling co-firing
+#'   structure between compounds. Each element is a list with EITHER
+#'   `anchor` (a single `compound_id`), `dependents` (integer vector of
+#'   `compound_id`s), and `p_dependent_given_anchor` (scalar in `[0,1]`
+#'   — probability each dependent fires when the anchor does), OR
+#'   `members` (integer vector of `compound_id`s) and `p_joint` (scalar
+#'   in `[0,1]` — probability the whole clique fires together). Applied
+#'   as post-processing on top of the independent Bernoulli firing:
+#'   - Dependency group: if anchor did not fire, every dependent that
+#'     independently fired is REMOVED (its Gaussian subtracted). If the
+#'     anchor fired, every dependent that did not fire independently gets
+#'     an additional Bernoulli(`p_dependent_given_anchor`) roll; on
+#'     success the compound fires and its Gaussian is added.
+#'   - Symmetric clique: one joint Bernoulli(`p_joint`) roll decides the
+#'     whole group. On success every non-fired member is added; on
+#'     failure every fired member is removed.
+#'   The final `per_sample_firing` matrix reflects the post-cofire state.
+#' @param off_catalog_peaks Optional list controlling injection of random
+#'   peaks NOT present in the catalog. Fields:
+#'   - `n_cases`, `n_controls`: integer peaks to inject per case /
+#'     control sample.
+#'   - `rt_range`, `cv_range`: length-2 numerics in [0,1] giving the
+#'     fractional (RT, CV) placement region.
+#'   - `intensity_range`: length-2 numeric giving uniform bounds for
+#'     the injected peak amplitude.
+#'   - `exclusion_eps_rt`, `exclusion_eps_cv`: fractional radius; a
+#'     candidate position is rejected if within this box of any catalog
+#'     compound. Defaults `(0.02, 0.05)`.
+#'   Sigmas are drawn from the pooled catalog sigma distribution so peak
+#'   shapes match the catalog's morphology. Used for stress-testing an
+#'   encoder / classifier on peaks the pretraining never saw. Peak
+#'   positions are recorded on the returned `off_catalog_positions`
+#'   list (one entry per sample).
 #' @param seed Optional RNG seed.
 #'
 #' @return List with `samples`, `y`, `ground_truth` (the biomarker
-#'   spec), and `per_sample_firing` (logical matrix of `n_samples` x
-#'   `n_biomarkers`; whether each biomarker fired in each sample).
+#'   spec), `per_sample_firing` (logical matrix of `n_samples` x
+#'   `n_biomarkers`; whether each biomarker fired in each sample AFTER
+#'   any cofire post-processing), `cofire` (the cofire spec that was
+#'   applied, or `NULL`), and `off_catalog_positions` (list of length
+#'   `n_samples` recording injected positions, or `NULL`).
 #'   `samples` matches [load_dms_directory()]'s shape so downstream
 #'   pipeline steps work unchanged.
 #' @export
@@ -277,6 +336,8 @@ simulate_case_control_from_catalog <- function(catalog,
                                                  location_jitter_cv = 1,
                                                  add_noise = TRUE,
                                                  noise_scale = 1.0,
+                                                 cofire = NULL,
+                                                 off_catalog_peaks = NULL,
                                                  seed = NULL) {
   stopifnot(inherits(catalog, "peak_catalog"))
   needed <- c("compound_id", "case_prevalence", "control_prevalence",
@@ -293,6 +354,60 @@ simulate_case_control_from_catalog <- function(catalog,
   sample_names <- c(sprintf("case_%03d", seq_len(n_cases)),
                     sprintf("control_%03d", seq_len(n_controls)))
   names(y) <- sample_names
+
+  # ---- cofire validation ----
+  if (!is.null(cofire)) {
+    if (!is.list(cofire) || !all(vapply(cofire, is.list, logical(1)))) {
+      stop("cofire must be a list of lists (one per group).")
+    }
+    for (g_idx in seq_along(cofire)) {
+      g <- cofire[[g_idx]]
+      is_dep_group <- !is.null(g$anchor)
+      is_clique    <- !is.null(g$members)
+      if (is_dep_group + is_clique != 1L) {
+        stop("cofire[[", g_idx, "]] must have EITHER anchor+dependents ",
+             "OR members (not both, not neither).")
+      }
+      if (is_dep_group) {
+        if (is.null(g$dependents) || is.null(g$p_dependent_given_anchor))
+          stop("cofire[[", g_idx,
+               "]] dependency group requires anchor, dependents, ",
+               "p_dependent_given_anchor.")
+        cids <- c(g$anchor, g$dependents)
+      } else {
+        if (is.null(g$p_joint))
+          stop("cofire[[", g_idx, "]] clique requires members, p_joint.")
+        cids <- g$members
+      }
+      if (!all(cids %in% catalog$compounds$compound_id)) {
+        bad <- setdiff(cids, catalog$compounds$compound_id)
+        stop("cofire[[", g_idx,
+             "]] references compound_id(s) not in the catalog: ",
+             paste(bad, collapse = ", "))
+      }
+    }
+  }
+
+  # ---- off_catalog_peaks validation + preparation ----
+  if (!is.null(off_catalog_peaks)) {
+    ocp <- off_catalog_peaks
+    ocp$exclusion_eps_rt <- ocp$exclusion_eps_rt %||% 0.02
+    ocp$exclusion_eps_cv <- ocp$exclusion_eps_cv %||% 0.05
+    for (nm in c("n_cases", "n_controls", "rt_range", "cv_range",
+                  "intensity_range")) {
+      if (is.null(ocp[[nm]]))
+        stop("off_catalog_peaks$", nm, " is required.")
+    }
+    # Pool sigma distributions
+    ocp$sigma_rt_pool <- unlist(catalog$compounds$sigma_rt_obs)
+    ocp$sigma_cv_pool <- unlist(catalog$compounds$sigma_cv_obs)
+    # Catalog compound positions in fraction space (for exclusion)
+    cmp <- catalog$compounds
+    ocp$cat_rt_frac <- if (!is.null(cmp$rt_frac)) cmp$rt_frac else cmp$rt_loc
+    ocp$cat_cv_frac <- if (!is.null(cmp$cv_frac)) cmp$cv_frac else cmp$cv_loc
+  } else {
+    ocp <- NULL
+  }
 
   # Precompute the per-group overrides once
   cid_chr <- as.character(biomarkers$compound_id)
@@ -320,6 +435,17 @@ simulate_case_control_from_catalog <- function(catalog,
          paste(bad, collapse = ", "))
   }
 
+  # Coord-mode-aware placement columns (same convention as
+  # generate_one_synthetic_from_catalog).
+  coord_mode <- catalog$parameters$coord_mode %||% "fraction"
+  cmp <- catalog$compounds
+  rt_place <- if (coord_mode == "physical") cmp$rt_frac else cmp$rt_loc
+  cv_place <- if (coord_mode == "physical") cmp$cv_frac else cmp$cv_loc
+
+  off_catalog_positions <- if (!is.null(ocp)) vector("list", N) else NULL
+  if (!is.null(off_catalog_positions))
+    names(off_catalog_positions) <- sample_names
+
   for (i in seq_len(N)) {
     is_case <- y[i] == 2L
     prev_override <- if (is_case) case_prev_override
@@ -338,23 +464,180 @@ simulate_case_control_from_catalog <- function(catalog,
       intensity_mult      = int_mult
     )
 
-    # Record biomarker firing status for this sample
-    firing[i, ] <- result$fired[biom_rows]
+    Z <- result$clean          # work on clean, add noise last
+    fired <- result$fired
+    placements <- result$placements
+
+    # ---- cofire post-processing ----
+    if (!is.null(cofire)) {
+      cid_to_row <- match(catalog$compounds$compound_id,
+                           catalog$compounds$compound_id)
+      # Rebuild the row-lookup fresh (identity mapping over sorted ids)
+      cid_to_row <- stats::setNames(seq_len(nrow(catalog$compounds)),
+                                     as.character(catalog$compounds$compound_id))
+      # Fast index into placements by compound_id (may hold >1 hit if
+      # generator was called with duplicates; here always 1 or 0).
+      placements_by_cid <- split(seq_len(nrow(placements)),
+                                   placements$compound_id)
+
+      subtract_compound <- function(cid) {
+        idxs <- placements_by_cid[[as.character(cid)]]
+        if (is.null(idxs)) return()
+        for (p in idxs) {
+          g_rt <- exp(-0.5 * ((seq_len(H) - placements$mu_rt[p]) /
+                                placements$sig_rt[p])^2)
+          g_cv <- exp(-0.5 * ((seq_len(W) - placements$mu_cv[p]) /
+                                placements$sig_cv[p])^2)
+          Z <<- Z - placements$amp[p] * outer(g_rt, g_cv)
+        }
+      }
+      add_compound <- function(cid) {
+        crow <- cid_to_row[[as.character(cid)]]
+        if (is.na(crow)) return()
+        # Draw fresh morphology (same convention as generator)
+        obs_intensity <- catalog$compounds$intensity_obs[[crow]]
+        n_obs <- length(obs_intensity)
+        j <- sample.int(n_obs, size = 1L)
+        sig_rt <- catalog$compounds$sigma_rt_obs[[crow]][j]
+        sig_cv <- catalog$compounds$sigma_cv_obs[[crow]][j]
+        base_amp <- obs_intensity[j]
+        mult <- if (as.character(cid) %in% names(int_mult))
+                  int_mult[[as.character(cid)]] else 1.0
+        mu_rt <- rt_place[crow] * H + stats::rnorm(1, 0, location_jitter_rt)
+        mu_cv <- cv_place[crow] * W + stats::rnorm(1, 0, location_jitter_cv)
+        mu_rt <- max(1, min(H, mu_rt))
+        mu_cv <- max(1, min(W, mu_cv))
+        scale_factor <- exp(stats::rnorm(1, 0, size_jitter))
+        sig_rt <- max(sig_rt * scale_factor, 0.8)
+        sig_cv <- max(sig_cv * scale_factor, 0.8)
+        amp <- base_amp * mult * (0.5 + 0.5 * scale_factor)
+        g_rt <- exp(-0.5 * ((seq_len(H) - mu_rt) / sig_rt)^2)
+        g_cv <- exp(-0.5 * ((seq_len(W) - mu_cv) / sig_cv)^2)
+        Z <<- Z + amp * outer(g_rt, g_cv)
+      }
+
+      for (g in cofire) {
+        if (!is.null(g$anchor)) {
+          # Dependency group
+          anchor_row <- cid_to_row[[as.character(g$anchor)]]
+          anchor_fired <- fired[anchor_row]
+          for (dcid in g$dependents) {
+            drow <- cid_to_row[[as.character(dcid)]]
+            if (is.na(drow)) next
+            if (!anchor_fired && fired[drow]) {
+              subtract_compound(dcid); fired[drow] <- FALSE
+            } else if (anchor_fired && !fired[drow]) {
+              if (stats::runif(1) < g$p_dependent_given_anchor) {
+                add_compound(dcid); fired[drow] <- TRUE
+              }
+            }
+          }
+        } else {
+          # Symmetric clique
+          fire_all <- stats::runif(1) < g$p_joint
+          for (mcid in g$members) {
+            mrow <- cid_to_row[[as.character(mcid)]]
+            if (is.na(mrow)) next
+            if (fire_all && !fired[mrow]) {
+              add_compound(mcid); fired[mrow] <- TRUE
+            } else if (!fire_all && fired[mrow]) {
+              subtract_compound(mcid); fired[mrow] <- FALSE
+            }
+          }
+        }
+      }
+    }
+
+    # ---- off-catalog injection ----
+    if (!is.null(ocp)) {
+      n_inj <- if (is_case) ocp$n_cases else ocp$n_controls
+      if (n_inj > 0L) {
+        pos_df <- inject_off_catalog(Z, ocp, H, W, n_inj,
+                                       size_jitter,
+                                       location_jitter_rt,
+                                       location_jitter_cv)
+        Z <- pos_df$Z
+        off_catalog_positions[[i]] <- pos_df$positions
+      } else {
+        off_catalog_positions[[i]] <- data.frame(
+          mu_rt = numeric(0), mu_cv = numeric(0),
+          sig_rt = numeric(0), sig_cv = numeric(0), amp = numeric(0))
+      }
+    }
+
+    # Re-apply noise last (subtract old noise, add fresh) so injections
+    # don't leave stale noise unrelated to the modified peaks.
+    if (add_noise && !is.null(catalog$noise) &&
+        is.finite(catalog$noise$mean) && is.finite(catalog$noise$sd)) {
+      noise_sd <- max(1e-8, catalog$noise$sd * noise_scale)
+      noise <- matrix(abs(stats::rnorm(H * W,
+                                        mean = catalog$noise$mean,
+                                        sd = noise_sd)),
+                       nrow = H, ncol = W)
+      Z <- Z + noise
+    }
+
+    firing[i, ] <- fired[biom_rows]
 
     samples[[i]] <- list(
       path = paste0("simulated/", sample_names[i]),
       time = seq_len(H),
       cv   = seq_len(W),
-      Z    = result$noisy
+      Z    = Z
     )
   }
 
   list(
-    samples           = samples,
-    y                 = y,
-    ground_truth      = biomarkers,
-    per_sample_firing = firing
+    samples               = samples,
+    y                     = y,
+    ground_truth          = biomarkers,
+    per_sample_firing     = firing,
+    cofire                = cofire,
+    off_catalog_positions = off_catalog_positions
   )
+}
+
+# Internal helper: inject n random off-catalog peaks and return updated Z
+# plus a positions data frame.
+inject_off_catalog <- function(Z, ocp, H, W, n,
+                                 size_jitter,
+                                 location_jitter_rt,
+                                 location_jitter_cv) {
+  max_attempts <- 50L
+  positions <- data.frame(mu_rt = numeric(0), mu_cv = numeric(0),
+                           sig_rt = numeric(0), sig_cv = numeric(0),
+                           amp = numeric(0))
+  for (k in seq_len(n)) {
+    accepted <- FALSE
+    for (attempt in seq_len(max_attempts)) {
+      rt_frac <- stats::runif(1, ocp$rt_range[1], ocp$rt_range[2])
+      cv_frac <- stats::runif(1, ocp$cv_range[1], ocp$cv_range[2])
+      # Reject if within exclusion box of any catalog compound
+      within_rt <- abs(ocp$cat_rt_frac - rt_frac) < ocp$exclusion_eps_rt
+      within_cv <- abs(ocp$cat_cv_frac - cv_frac) < ocp$exclusion_eps_cv
+      if (!any(within_rt & within_cv)) {
+        accepted <- TRUE; break
+      }
+    }
+    if (!accepted) next   # give up on this peak; sparse catalog corners rare
+    sig_rt <- sample(ocp$sigma_rt_pool, size = 1L)
+    sig_cv <- sample(ocp$sigma_cv_pool, size = 1L)
+    scale_factor <- exp(stats::rnorm(1, 0, size_jitter))
+    sig_rt <- max(sig_rt * scale_factor, 0.8)
+    sig_cv <- max(sig_cv * scale_factor, 0.8)
+    mu_rt <- rt_frac * H + stats::rnorm(1, 0, location_jitter_rt)
+    mu_cv <- cv_frac * W + stats::rnorm(1, 0, location_jitter_cv)
+    mu_rt <- max(1, min(H, mu_rt))
+    mu_cv <- max(1, min(W, mu_cv))
+    amp <- stats::runif(1, ocp$intensity_range[1], ocp$intensity_range[2])
+    g_rt <- exp(-0.5 * ((seq_len(H) - mu_rt) / sig_rt)^2)
+    g_cv <- exp(-0.5 * ((seq_len(W) - mu_cv) / sig_cv)^2)
+    Z <- Z + amp * outer(g_rt, g_cv)
+    positions <- rbind(positions,
+      data.frame(mu_rt = mu_rt, mu_cv = mu_cv,
+                  sig_rt = sig_rt, sig_cv = sig_cv, amp = amp))
+  }
+  list(Z = Z, positions = positions)
 }
 
 #' Sanity-max scenario for catalog-based case/control simulation
