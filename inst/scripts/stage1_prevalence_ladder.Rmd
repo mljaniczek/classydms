@@ -1,0 +1,243 @@
+---
+title: "Stage 1: Prevalence ladder"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+params:
+  catalog_path: "catalog_comparison_outputs_physical/all_catalogs.rds"
+  catalog_name: "aki"
+  H: 1200
+  W: 40
+  # Fixed simulation knobs (from Stage 5 realistic-preset defaults)
+  n_biomarkers: 5
+  anchor_prevalence_threshold: 0.9
+  min_intensity_quantile: 0.95
+  case_intensity_mult: 1.2
+  n_per_class: 200
+  n_seeds: 5
+  # Prevalence ladder: comma-separated case_prevalence values;
+  # control_prevalence = 1 - case_prevalence.
+  case_prevalence_grid: "0.7,0.8,0.9,1.0"
+  # Pretraining (shared across all rungs — encoder is signal-agnostic)
+  n_pretrain_samples: 400
+  pretrain_epochs: 20
+  # Classification — Model to run at each rung. Fastest is encoder_enet.
+  model: "encoder_enet"       # one of: pixel_enet, amp_enet, encoder_enet, pretrained_cnn
+  cv_k: 5
+  cnn_epochs: 15
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(classydms)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(purrr)
+library(pROC)
+library(glmnet)
+library(torch)
+```
+
+# Purpose
+
+Fix everything except case/control prevalence. Sweep `case_prevalence` and set `control_prevalence = 1 - case_prevalence` (symmetric ladder). Record AUC per condition, averaged across seeds.
+
+**Answers:** what is the smallest prevalence delta at which the pipeline reliably detects the signal?
+
+```{r knobs-echo, results = "asis"}
+cp_grid <- as.numeric(strsplit(params$case_prevalence_grid, ",")[[1]])
+n_seeds <- params$n_seeds
+cat(sprintf(
+"| knob | value |\n|---|---|\n| catalog | %s |\n| n_biomarkers | %d |\n| min_intensity_quantile | %.2f |\n| case_intensity_mult | %.2f |\n| n_per_class | %d |\n| n_seeds | %d |\n| ladder (case_prevalence values) | %s |\n| model | %s |\n",
+  params$catalog_name, params$n_biomarkers, params$min_intensity_quantile,
+  params$case_intensity_mult, params$n_per_class, n_seeds,
+  paste(cp_grid, collapse = ", "), params$model))
+```
+
+# 1. Load catalog and pretrain encoder
+
+```{r load-catalog}
+all_cats <- readRDS(params$catalog_path)
+cat_use <- all_cats[[params$catalog_name]]
+sprintf("Loaded %s catalog: %d compounds",
+        params$catalog_name, nrow(cat_use$compounds))
+```
+
+```{r pretrain, cache = TRUE, eval = params$model %in% c("encoder_enet","pretrained_cnn")}
+enc_res <- pretrain_autoencoder_from_catalog(cat_use,
+  H = params$H, W = params$W,
+  n_synthetic = params$n_pretrain_samples,
+  epochs = params$pretrain_epochs,
+  batch_size = 16, device = "cpu", seed = 1)
+encoder <- enc_res$encoder
+sprintf("Encoder pretrained: final MSE = %.5f",
+        tail(enc_res$loss_history, 1))
+```
+
+# 2. Run the ladder
+
+```{r ladder-helper}
+run_one <- function(sim, catalog, encoder, model, cv_k, cnn_epochs, seed) {
+  Z_list <- lapply(sim$samples, `[[`, "Z")
+  y <- sim$y
+  set.seed(seed)
+  if (model == "pixel_enet") {
+    X <- do.call(rbind, lapply(Z_list, as.vector))
+    fold_id <- sample(rep(seq_len(cv_k), length.out = length(y)))
+    oof <- numeric(length(y))
+    for (k in seq_len(cv_k)) {
+      tr <- fold_id != k; te <- !tr
+      fit <- glmnet::cv.glmnet(X[tr,], y[tr], family="binomial",
+                                alpha=0.5, nfolds=3)
+      oof[te] <- as.numeric(predict(fit, newx=X[te,], s="lambda.min",
+                                       type="response"))
+    }
+    return(as.numeric(pROC::auc(pROC::roc(y, oof, quiet=TRUE))))
+  }
+  if (model == "amp_enet") {
+    cmp <- catalog$compounds
+    rt_use <- if ("rt_frac" %in% names(cmp)) cmp$rt_frac else cmp$rt_loc
+    cv_use <- if ("cv_frac" %in% names(cmp)) cmp$cv_frac else cmp$cv_loc
+    H <- nrow(Z_list[[1]]); W <- ncol(Z_list[[1]])
+    row_range <- function(rt) {
+      i0 <- max(1, floor(rt * H) - 3); i1 <- min(H, floor(rt * H) + 3)
+      seq(i0, i1)
+    }
+    col_range <- function(cv) {
+      i0 <- max(1, floor(cv * W) - 2); i1 <- min(W, floor(cv * W) + 2)
+      seq(i0, i1)
+    }
+    X <- do.call(rbind, lapply(Z_list, function(Z) {
+      vapply(seq_len(nrow(cmp)), function(i) {
+        sum(Z[row_range(rt_use[i]), col_range(cv_use[i])])
+      }, numeric(1))
+    }))
+    fold_id <- sample(rep(seq_len(cv_k), length.out = length(y)))
+    oof <- numeric(length(y))
+    for (k in seq_len(cv_k)) {
+      tr <- fold_id != k; te <- !tr
+      fit <- glmnet::cv.glmnet(X[tr,], y[tr], family="binomial",
+                                alpha=0.5, nfolds=3)
+      oof[te] <- as.numeric(predict(fit, newx=X[te,], s="lambda.min",
+                                       type="response"))
+    }
+    return(as.numeric(pROC::auc(pROC::roc(y, oof, quiet=TRUE))))
+  }
+  if (model == "encoder_enet") {
+    return(cv_encoder_elastic_net(encoder, Z_list, y,
+                                    k=cv_k, alpha=0.5, seed=seed)$auc)
+  }
+  if (model == "pretrained_cnn") {
+    return(cv_pretrained_oof(Z_list, y, encoder,
+                              k=cv_k, epochs=cnn_epochs, seed=seed)$auc)
+  }
+  stop("Unknown model: ", model)
+}
+```
+
+```{r ladder-run, cache = TRUE}
+grid <- expand.grid(
+  case_prevalence = cp_grid,
+  sim_seed = seq_len(n_seeds),
+  KEEP.OUT.ATTRS = FALSE
+)
+
+results <- purrr::pmap_dfr(grid, function(case_prevalence, sim_seed) {
+  message(sprintf("Rung: case_prev=%.2f, seed=%d",
+                  case_prevalence, sim_seed))
+  spec <- catalog_biomarkers_universal_backdrop(cat_use,
+    n_biomarkers = params$n_biomarkers,
+    anchor_prevalence_threshold = params$anchor_prevalence_threshold,
+    min_intensity_quantile = params$min_intensity_quantile,
+    case_prevalence = case_prevalence,
+    control_prevalence = 1 - case_prevalence,
+    case_intensity_mult = params$case_intensity_mult,
+    seed = sim_seed * 1000 + 7)
+  sim <- simulate_case_control_from_catalog(cat_use, spec,
+    n_cases = params$n_per_class,
+    n_controls = params$n_per_class,
+    H = params$H, W = params$W,
+    seed = sim_seed * 1000 + 8)
+  auc <- run_one(sim, cat_use,
+                  if (params$model %in% c("encoder_enet","pretrained_cnn"))
+                    encoder else NULL,
+                  params$model, params$cv_k, params$cnn_epochs, sim_seed)
+  tibble(case_prevalence = case_prevalence,
+          delta = 2 * case_prevalence - 1,
+          sim_seed = sim_seed,
+          auc = auc)
+})
+results
+```
+
+# 3. AUC vs prevalence delta
+
+```{r plot-ladder, fig.width = 8, fig.height = 5}
+summary_df <- results |>
+  group_by(case_prevalence, delta) |>
+  summarise(auc_mean = mean(auc, na.rm = TRUE),
+             auc_sd   = sd(auc,   na.rm = TRUE),
+             n_reps   = sum(!is.na(auc)),
+             .groups = "drop")
+
+ggplot(summary_df, aes(x = delta, y = auc_mean)) +
+  geom_ribbon(aes(ymin = pmax(0, auc_mean - auc_sd),
+                   ymax = pmin(1, auc_mean + auc_sd)),
+               alpha = 0.25, fill = "#B2182B") +
+  geom_line(color = "#B2182B", linewidth = 1) +
+  geom_point(size = 3, color = "#B2182B") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = 0.7, linetype = "dotted", color = "grey60") +
+  scale_x_continuous(
+    breaks = summary_df$delta,
+    labels = sprintf("%.2f/%.2f (Δ=%.2f)",
+                      summary_df$case_prevalence,
+                      1 - summary_df$case_prevalence,
+                      summary_df$delta)) +
+  coord_cartesian(ylim = c(0.4, 1.0)) +
+  labs(x = "case_prevalence / control_prevalence (delta)",
+       y = "OOF AUC (mean ± SD)",
+       title = sprintf("Prevalence-ladder AUC (%s, %s)",
+                        params$catalog_name, params$model),
+       subtitle = sprintf(
+         "n=%d/%d, intensity_mult=%.2fx, %d biomarkers, %d seeds",
+         params$n_per_class, params$n_per_class,
+         params$case_intensity_mult, params$n_biomarkers, n_seeds)) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+```
+
+# 4. Individual seed strip plot
+
+```{r strip, fig.width = 7, fig.height = 4}
+ggplot(results, aes(x = factor(case_prevalence), y = auc)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey40") +
+  geom_jitter(width = 0.15, height = 0, size = 2.5, alpha = 0.8,
+               color = "#B2182B") +
+  coord_cartesian(ylim = c(0.4, 1.0)) +
+  labs(x = "case_prevalence",
+       y = "OOF AUC (individual seeds)",
+       title = "Per-seed AUC — spread indicates within-condition variability") +
+  theme_minimal(base_size = 12)
+```
+
+# 5. Numeric table
+
+```{r summary-table}
+knitr::kable(summary_df |>
+  mutate(across(c(auc_mean, auc_sd), ~round(., 3))),
+  caption = sprintf("AUC by rung, %s model, n=%d per class",
+                     params$model, params$n_per_class))
+```
+
+# Reading
+
+- **AUC monotonically rises with delta** → the pipeline is signal-limited; larger effects are easier.
+- **AUC saturates at some rung** → beyond that delta the model has learned the compound positions.
+- **AUC drops below 0.7 at some rung** → practical detection limit for this cohort size / catalog / model combination.
+- **Wide SD ribbon** → seed-sensitivity; increase `n_seeds`.
+
+Once you have the ladder, sweep `n_per_class` (100 vs 200) or `n_biomarkers` (3 vs 5 vs 10) to see how sensitivity depends on sample count and signal spread.
