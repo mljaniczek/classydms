@@ -61,6 +61,25 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
   }
   n_compounds <- nrow(compounds)
 
+  # Placement uses FRACTION coordinates so peaks land at fraction * H / W.
+  # For physical-mode catalogs, rt_loc / cv_loc are in seconds / volts and
+  # rt_frac / cv_frac carry the fraction. Read coord_mode to pick the
+  # right columns. Older catalogs (no coord_mode field) are treated as
+  # fraction for backward compatibility.
+  coord_mode <- catalog$parameters$coord_mode %||% "fraction"
+  if (coord_mode == "physical") {
+    if (is.null(compounds$rt_frac) || is.null(compounds$cv_frac)) {
+      stop("generate_one_synthetic_from_catalog: physical-mode catalog ",
+           "must carry rt_frac and cv_frac columns. Rebuild the catalog ",
+           "with a recent build_peak_catalog().")
+    }
+    rt_place <- compounds$rt_frac
+    cv_place <- compounds$cv_frac
+  } else {
+    rt_place <- compounds$rt_loc
+    cv_place <- compounds$cv_loc
+  }
+
   clean  <- matrix(0, nrow = H, ncol = W)
   rows   <- seq_len(H); cols <- seq_len(W)
   fired  <- logical(n_compounds)
@@ -88,10 +107,11 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
     sig_cv   <- compounds$sigma_cv_obs[[i]][j]
     base_amp <- obs_intensity[j]
 
-    # Place with location jitter
-    mu_rt <- compounds$rt_loc[i] * H +
+    # Place with location jitter (rt_place / cv_place are always in
+    # fraction — see coord_mode branch above).
+    mu_rt <- rt_place[i] * H +
                stats::rnorm(1, 0, location_jitter_rt)
-    mu_cv <- compounds$cv_loc[i] * W +
+    mu_cv <- cv_place[i] * W +
                stats::rnorm(1, 0, location_jitter_cv)
     mu_rt <- max(1, min(H, mu_rt))
     mu_cv <- max(1, min(W, mu_cv))
