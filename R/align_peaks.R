@@ -346,10 +346,42 @@ align_via_catalog <- function(peak_params,
     mean = mean(current_pp$cv_loc_raw),
     sd = stats::sd(current_pp$cv_loc_raw))
 
+  # Back-sync physical fields if they exist. Alignment runs on fraction
+  # fields (rt_loc_raw / cv_loc_raw), but downstream physical-mode catalog
+  # building uses rt_seconds_raw / cv_volts_raw — without this sync, the
+  # physical catalog is built from un-shifted positions and alignment
+  # appears to do nothing.
+  has_physical <- !is.null(current_pp$rt_seconds_raw) &&
+                  !is.null(current_pp$cv_volts_raw)
+  has_ranges   <- !is.null(current_pp$time_ranges) &&
+                  !is.null(current_pp$cv_ranges)
+  if (has_physical && has_ranges) {
+    tr <- current_pp$time_ranges
+    cr <- current_pp$cv_ranges
+    for (s in seq_len(n_samples)) {
+      mask <- current_pp$sample_idx_raw == s
+      if (!any(mask)) next
+      # Fraction is (physical - min) / (max - min), so a fraction shift
+      # Δfrac maps to a physical shift of Δfrac * (max - min).
+      rt_range <- tr[s, "max"] - tr[s, "min"]
+      cv_range <- cr[s, "max"] - cr[s, "min"]
+      current_pp$rt_seconds_raw[mask] <- current_pp$rt_seconds_raw[mask] -
+                                          total_shift_rt[s] * rt_range
+      current_pp$cv_volts_raw[mask]   <- current_pp$cv_volts_raw[mask] -
+                                          total_shift_cv[s] * cv_range
+    }
+  } else if (has_physical && !has_ranges) {
+    warning("align_via_catalog: peak_params has physical fields ",
+            "(rt_seconds_raw / cv_volts_raw) but no time_ranges / ",
+            "cv_ranges, so physical fields cannot be back-synced. ",
+            "Downstream physical-mode catalog will not see alignment shifts.")
+  }
+
   current_pp$alignment <- list(
     method = "cluster_membership",
     shifts_rt = total_shift_rt,
     shifts_cv = total_shift_cv,
+    physical_synced = has_physical && has_ranges,
     n_anchors_matched = n_matched,
     n_anchors_total = n_anchors_final,
     iterations = iterations_run,
