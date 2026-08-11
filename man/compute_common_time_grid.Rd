@@ -2,7 +2,7 @@
 % Please edit documentation in R/preprocess.R
 \name{compute_common_time_grid}
 \alias{compute_common_time_grid}
-\title{Center-pad a matrix to target dimensions}
+\title{Compute a common regular time grid across a cohort of samples}
 \usage{
 compute_common_time_grid(samples, step = 1, t_max = NULL)
 }
@@ -12,22 +12,31 @@ compute_common_time_grid(samples, step = 1, t_max = NULL)
 \item{step}{Grid step in seconds. See details.}
 
 \item{t_max}{Maximum RT for the grid (seconds). See details.}
-
-\item{Z}{A 2-D numeric matrix.}
-
-\item{target_H, target_W}{Target row and column counts.}
-
-\item{pad_value}{Fill value for the padded margins (default 0).}
 }
 \value{
-A \verb{target_H x target_W} matrix.
-
 Numeric vector of RT positions in seconds, evenly spaced by
 \code{step}, starting at 0, ending at \verb{>= max sample time}.
 }
 \description{
-Pads \code{Z} with \code{pad_value} so the result has dimensions
-\verb{target_H x target_W}. The original matrix is placed in the
-center of the padded canvas. Errors if \code{Z} is already larger than
-the target along either axis.
+Chooses a regular RT grid suitable for resampling every sample
+onto shared row indices. Row \code{i} in the resampled Z always
+corresponds to physical time \code{target_time[i]} regardless of which
+sample the row came from — the prerequisite for pixel-consistent
+cross-sample encoder input.
+}
+\details{
+Grid choice:
+\itemize{
+\item \code{step}: distance in seconds between consecutive rows. Default
+\code{1.0} — physically meaningful (row index = seconds), adequate
+for typical GC-DMS peak FWHM (~2-5 s), and roughly matches
+current native RT dimensions (~1500 rows). Common alternatives:
+\code{0.5} (double resolution), \code{median(diff(time))} from the cohort,
+or \code{"median"} / \code{"mean"} which computes the median / mean per-row
+time delta across all samples.
+\item \code{t_max}: maximum RT (seconds) on the returned grid. Default
+\code{NULL} uses \verb{max(unlist(lapply(samples, }[[\verb{, "time")))} — the
+longest sample's endpoint, so no sample is truncated. Rounded up
+to the nearest integer multiple of \code{step}.
+}
 }

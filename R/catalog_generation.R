@@ -373,3 +373,82 @@ catalog_biomarkers_sanity_max <- function(catalog,
     control_intensity_mult = 1.0
   )
 }
+
+#' Universal-backdrop biomarker preset for catalog simulation
+#'
+#' Two-tier sample composition. Anchor layer: catalog compounds with
+#' prevalence at or above `anchor_prevalence_threshold` (default 0.9)
+#' are treated as universal-backdrop and appear in every simulated
+#' sample at their catalog prevalence (typically ~1.0). Biomarker
+#' layer: `n_biomarkers` non-anchor compounds are picked from the top
+#' intensity quantile and given case/control Bernoulli prevalence
+#' overrides, providing the classifier signal.
+#'
+#' Non-biomarker, non-anchor compounds keep their catalog empirical
+#' prevalence (heterogeneous — some rare, some moderately common).
+#'
+#' Biomarkers are picked from BELOW the anchor threshold so the signal
+#' stands out against the invariant backdrop. Filtering to top
+#' `min_intensity_quantile` (default 0.95) ensures they are strong
+#' enough to be reliably detected.
+#'
+#' @param catalog A `peak_catalog` object.
+#' @param n_biomarkers Number of biomarker compounds. Default `5L`.
+#' @param anchor_prevalence_threshold Compounds with catalog prevalence
+#'   `>=` this are anchors and excluded from the biomarker pool.
+#'   Default `0.9`. On a universal catalog (built via
+#'   `build_universal_catalog()`) this typically selects the ~150
+#'   compounds present across all sources.
+#' @param biomarker_min_prevalence Minimum catalog prevalence for a
+#'   non-anchor compound to be eligible as a biomarker. Default `0.05`
+#'   — screens out ultra-rare compounds that may be jitter artifacts.
+#' @param min_intensity_quantile Intensity quantile threshold applied
+#'   to the compound's median observed intensity. Default `0.95`.
+#' @param case_prevalence,control_prevalence Bernoulli firing
+#'   probability of each biomarker in case / control samples.
+#'   Defaults: `0.9` / `0.1`.
+#' @param case_intensity_mult,control_intensity_mult Amplitude
+#'   multiplier applied to biomarker peaks. Defaults: `1.2` / `1.0`.
+#' @param seed Optional RNG seed.
+#' @return A biomarker spec tibble (as
+#'   [build_biomarker_spec_catalog()]) plus a `"n_anchors"` attribute
+#'   recording how many anchor compounds were identified. Pass to
+#'   [simulate_case_control_from_catalog()].
+#' @export
+catalog_biomarkers_universal_backdrop <- function(
+  catalog,
+  n_biomarkers = 5L,
+  anchor_prevalence_threshold = 0.9,
+  biomarker_min_prevalence = 0.05,
+  min_intensity_quantile = 0.95,
+  case_prevalence = 0.9,
+  control_prevalence = 0.1,
+  case_intensity_mult = 1.2,
+  control_intensity_mult = 1.0,
+  seed = NULL
+) {
+  stopifnot(inherits(catalog, "peak_catalog"))
+  n_anchors <- sum(catalog$compounds$prevalence >=
+                    anchor_prevalence_threshold)
+
+  compound_ids <- pick_catalog_biomarkers(
+    catalog,
+    n_biomarkers = n_biomarkers,
+    min_prevalence = biomarker_min_prevalence,
+    # Strict inequality-lite: biomarkers must be BELOW the anchor
+    # threshold so they aren't already always-on.
+    max_prevalence = anchor_prevalence_threshold - 1e-9,
+    min_intensity_quantile = min_intensity_quantile,
+    seed = seed
+  )
+  spec <- build_biomarker_spec_catalog(
+    compound_ids,
+    case_prevalence        = case_prevalence,
+    control_prevalence     = control_prevalence,
+    case_intensity_mult    = case_intensity_mult,
+    control_intensity_mult = control_intensity_mult
+  )
+  attr(spec, "n_anchors") <- n_anchors
+  attr(spec, "anchor_prevalence_threshold") <- anchor_prevalence_threshold
+  spec
+}

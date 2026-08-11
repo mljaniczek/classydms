@@ -414,18 +414,6 @@ compute_pad_targets <- function(Z_list, multiple = 32L) {
        range_H = range(dims[, 1]), range_W = range(dims[, 2]))
 }
 
-#' Center-pad a matrix to target dimensions
-#'
-#' Pads `Z` with `pad_value` so the result has dimensions
-#' `target_H x target_W`. The original matrix is placed in the
-#' center of the padded canvas. Errors if `Z` is already larger than
-#' the target along either axis.
-#'
-#' @param Z A 2-D numeric matrix.
-#' @param target_H,target_W Target row and column counts.
-#' @param pad_value Fill value for the padded margins (default 0).
-#' @return A `target_H x target_W` matrix.
-#' @export
 #' Compute a common regular time grid across a cohort of samples
 #'
 #' Chooses a regular RT grid suitable for resampling every sample
