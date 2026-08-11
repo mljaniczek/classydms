@@ -1,0 +1,277 @@
+---
+title: "Physical-units preprocessing: resample, physical peak_params, physical catalog"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4, dpi = 96)
+library(classydms)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(purrr)
+```
+
+# Purpose
+
+This tutorial covers the **physical-units preprocessing path**: preserving RT seconds and CV volts through the pipeline so that samples align across time and across cohorts without any post-hoc drift-correction.
+
+Motivation from real data:
+
+- **Variable per-row RT step size**. GC-DMS instruments produce non-uniform time deltas — mostly ~1.14 s per row with occasional ~0.56 s inserts. Row 500 in one sample can be at a different physical time than row 500 in another sample.
+- **Variable RT endpoints**. Different samples get truncated at slightly different times.
+- **Cohorts collected at different periods**. Even the same instrument's total elution length can vary between studies.
+
+Fractional coordinates (peak position ÷ image size) compound all these into systematic misalignment. Physical units (seconds and volts) sidestep all of it by using the instrument's own axes as the reference.
+
+# The two preprocessing options
+
+Two independent decisions, both useful:
+
+1. **Physical coordinates in `peak_params`** — record each peak's RT in seconds and CV in volts. Enables clustering on physical units.
+2. **Common time-grid resampling** — interpolate the Z matrices themselves onto a regular time grid so row index i means the same physical time in every sample. Enables pixel-consistent encoder input.
+
+You can do (1) without (2) — physical coordinates work as long as you have the axis vectors. You can also do (2) without (1) — resampling produces pixel-consistent matrices even if downstream still uses fractions.
+
+**Doing both is the recommended path** — physical coordinates for catalog work, resampling for encoder work.
+
+# 1. Build a small demonstration
+
+For a controllable demonstration we manufacture a couple of samples with different sampling patterns and RT endpoints, so the physical-units effect is visible.
+
+```{r toy}
+# Two "samples" with different time grids
+set.seed(1)
+make_toy_sample <- function(step_pattern, t_end) {
+  # step_pattern: cyclic vector of time deltas
+  # t_end: RT endpoint in seconds
+  t_axis <- 0
+  while (max(t_axis) < t_end) {
+    step <- step_pattern[(length(t_axis) - 1L) %% length(step_pattern) + 1L]
+    t_axis <- c(t_axis, tail(t_axis, 1) + step)
+  }
+  # Trim to t_end
+  t_axis <- t_axis[t_axis <= t_end]
+
+  # A "compound" at t = 42 s, CV col 5
+  n_rt <- length(t_axis)
+  n_cv <- 12
+  Z <- matrix(0, nrow = n_rt, ncol = n_cv)
+  peak_row <- which.min(abs(t_axis - 42))
+  peak_col <- 5
+  for (r in seq_len(n_rt)) {
+    for (c in seq_len(n_cv)) {
+      Z[r, c] <- 0.5 * exp(-0.5 * ((t_axis[r] - 42) / 2)^2) *
+                       exp(-0.5 * ((c - peak_col) / 1.5)^2)
+    }
+  }
+  list(path = "toy", id = "toy",
+       time = t_axis, cv = seq(-40, 15, length.out = n_cv),
+       Z = Z)
+}
+
+# Sample A: mostly 1.14s steps
+sA <- make_toy_sample(c(1.14, 1.14, 1.14, 0.56), 100)
+# Sample B: mostly 1.0s steps, ends earlier
+sB <- make_toy_sample(c(1.0, 1.0), 80)
+
+sprintf("Sample A: %d rows, RT range [%.1f, %.1f], step delta pattern first 6: %s",
+        length(sA$time), min(sA$time), max(sA$time),
+        paste(round(diff(sA$time)[1:6], 3), collapse = ", "))
+sprintf("Sample B: %d rows, RT range [%.1f, %.1f], step delta first 6: %s",
+        length(sB$time), min(sB$time), max(sB$time),
+        paste(round(diff(sB$time)[1:6], 3), collapse = ", "))
+```
+
+Both samples have a peak at physical time RT = 42 s, CV = column 5. But because sampling rates differ, that peak lands at different row indices:
+
+```{r peak-rows}
+peak_row_A <- which.max(rowSums(sA$Z))
+peak_row_B <- which.max(rowSums(sB$Z))
+tibble(
+  sample     = c("A", "B"),
+  peak_row   = c(peak_row_A, peak_row_B),
+  peak_time  = c(sA$time[peak_row_A], sB$time[peak_row_B]),
+  n_rows     = c(length(sA$time), length(sB$time)),
+  fraction   = c(peak_row_A / length(sA$time),
+                  peak_row_B / length(sB$time))
+) |> knitr::kable()
+```
+
+Same physical peak → different `peak_row` (39 vs 43) and different `fraction` (0.44 vs 0.53). This is the misalignment problem in miniature.
+
+# 2. Resample onto a common time grid
+
+```{r resample}
+target_time <- compute_common_time_grid(list(sA, sB), step = 1.0)
+sprintf("Target grid: %d rows, %.1f to %.1f s (step %.2f)",
+        length(target_time), min(target_time), max(target_time),
+        diff(target_time)[1])
+
+sA_re <- resample_to_time_grid(sA, target_time)
+sB_re <- resample_to_time_grid(sB, target_time)
+
+# Now check the peak locations again
+peak_row_A_re <- which.max(rowSums(sA_re$Z))
+peak_row_B_re <- which.max(rowSums(sB_re$Z))
+tibble(
+  sample     = c("A", "B"),
+  peak_row   = c(peak_row_A_re, peak_row_B_re),
+  peak_time  = c(sA_re$time[peak_row_A_re], sB_re$time[peak_row_B_re]),
+  n_rows     = c(length(sA_re$time), length(sB_re$time))
+) |> knitr::kable()
+```
+
+After resampling, both samples have the SAME number of rows AND the peak lands at the SAME row index because that row corresponds to the same physical time in both. The samples are now pixel-consistent.
+
+# 3. Visualize before vs after
+
+```{r viz-before-after, fig.height = 6}
+plot_mat <- function(mat, title, time_axis = NULL) {
+  H <- nrow(mat); W <- ncol(mat)
+  df <- expand.grid(row = seq_len(H), col = seq_len(W))
+  df$val <- as.vector(mat)
+  if (!is.null(time_axis)) df$row_time <- time_axis[df$row]
+  ggplot(df, aes(x = col, y = row, fill = val)) +
+    geom_tile() +
+    scale_fill_gradient(low = "white", high = "#B2182B") +
+    scale_y_reverse() +
+    labs(x = "CV col", y = "row", title = title) +
+    theme_minimal(base_size = 10) +
+    theme(panel.grid = element_blank(), legend.position = "none")
+}
+
+gridExtra::grid.arrange(
+  plot_mat(sA$Z,    "Sample A (raw, 88 rows)"),
+  plot_mat(sB$Z,    "Sample B (raw, 81 rows)"),
+  plot_mat(sA_re$Z, "Sample A (resampled, 101 rows)"),
+  plot_mat(sB_re$Z, "Sample B (resampled, 101 rows)"),
+  ncol = 2
+)
+```
+
+Notice the peak sits at the same row in both bottom panels — that's the guarantee resampling provides.
+
+# 4. Physical-units peak_params
+
+Even without resampling (for the trimmed-but-not-resampled case), you can populate physical coordinates by passing `time_axes` and `cv_axes` to `estimate_peak_params`. The returned object stores BOTH representations:
+
+```{r pp-physical}
+Z_list    <- list(sA_re$Z, sB_re$Z)
+time_axes <- list(sA_re$time, sB_re$time)
+cv_axes   <- list(sA_re$cv,   sB_re$cv)
+# Sample IDs at load time so no backfill is needed later:
+names(Z_list) <- c("toy_A", "toy_B")
+
+pp <- estimate_peak_params(
+  Z_list,
+  time_axes = time_axes,
+  cv_axes   = cv_axes,
+  top_k = 10, frac_height = 0.5,
+  min_sep_rt = 4, min_sep_cv = 2,   # small dims: tighter min_sep than default
+  verbose = FALSE
+)
+
+sprintf("coord_mode: %s", pp$coord_mode)
+sprintf("Physical fields present: rt_seconds_raw=%s, cv_volts_raw=%s",
+        !is.null(pp$rt_seconds_raw), !is.null(pp$cv_volts_raw))
+sprintf("rt_seconds_raw: %s", paste(round(pp$rt_seconds_raw, 2), collapse=", "))
+sprintf("cv_volts_raw:   %s", paste(round(pp$cv_volts_raw, 2), collapse=", "))
+sprintf("sample_idx_raw: %s", paste(pp$sample_idx_raw, collapse=", "))
+sprintf("sample_names:   %s", paste(pp$sample_names, collapse=", "))
+```
+
+Both fraction coordinates (`rt_loc_raw`, `cv_loc_raw`) and physical coordinates (`rt_seconds_raw`, `cv_volts_raw`) are populated. Downstream tools can use whichever they want.
+
+# 5. Physical-mode catalog
+
+```{r cat-physical}
+cat_phys <- build_peak_catalog(pp,
+  eps_rt = 3, eps_cv = 5,       # eps in SECONDS and VOLTS
+  min_support_frac = 0.10,
+  coord_mode = "physical")
+
+sprintf("Physical catalog: %d compounds", nrow(cat_phys$compounds))
+cat_phys$compounds |>
+  select(compound_id, rt_loc, cv_loc, prevalence,
+         n_observations, rt_frac, cv_frac, rt_seconds, cv_volts) |>
+  head() |>
+  knitr::kable(digits = 3)
+```
+
+Compound `rt_loc` and `cv_loc` are in seconds and volts (because we set `coord_mode = "physical"`). The catalog also carries `rt_frac`/`cv_frac`/`rt_seconds`/`cv_volts` as convenience alternate columns.
+
+Compare to a fraction-mode catalog on the same peak_params:
+
+```{r cat-fraction}
+cat_frac <- build_peak_catalog(pp,
+  eps_rt = 0.03, eps_cv = 0.15,   # eps in FRACTION
+  min_support_frac = 0.10,
+  coord_mode = "fraction")
+
+sprintf("Fraction catalog: %d compounds", nrow(cat_frac$compounds))
+cat_frac$compounds |>
+  select(compound_id, rt_loc, cv_loc, prevalence,
+         rt_seconds, cv_volts) |>
+  head() |>
+  knitr::kable(digits = 3)
+```
+
+Same underlying data, two coordinate systems.
+
+# 6. When to use which
+
+| Question | Recommendation |
+|---|---|
+| Just building a catalog per cohort? | **Physical mode**. Same compound → same rt_seconds across all cohorts. |
+| Comparing catalogs across cohorts? | **Physical mode.** Fraction mode WILL misalign if RT endpoints or step sizes differ. |
+| Pretraining the encoder / running the classifier? | **Also resample.** Physical-mode `peak_params` fixes catalog alignment; only resampling fixes pixel-level alignment in the Z matrices themselves. |
+| Cross-referencing against a compound library? | **Physical mode.** Compound libraries use retention time indices in seconds/minutes. Fractions don't lookup. |
+| Iterating on a legacy pipeline that doesn't have time/cv axes? | **Fraction mode** works and stays backward-compatible. Add physical mode when you get axes. |
+
+# Practical pipeline (real cohort)
+
+Assuming your preprocessing gives you `samples_trim` — a list of samples each with `$time`, `$cv`, `$Z`:
+
+```{r real-pipeline, eval = FALSE}
+# 1. Resample to a common grid
+target_time <- compute_common_time_grid(samples_trim, step = 1.0)
+samples_resampled <- lapply(samples_trim, resample_to_time_grid,
+                             target_time = target_time)
+
+# 2. Estimate peak_params in physical mode
+Z_raw <- lapply(samples_resampled, `[[`, "Z")
+names(Z_raw) <- your_sample_ids   # so sample_names populates
+time_axes <- lapply(samples_resampled, `[[`, "time")
+cv_axes   <- lapply(samples_resampled, `[[`, "cv")
+
+pp <- estimate_peak_params(
+  Z_raw,
+  Z_pretrim_list = Z_pretrim,   # if you have this from baseline_basement
+  time_axes = time_axes,
+  cv_axes   = cv_axes,
+  top_k = 2500, frac_height = 0.5
+)
+
+# 3. Build catalog in physical mode
+cat <- build_peak_catalog(pp,
+  eps_rt = 5,      # 5 seconds — was ~0.003 fraction on 1400-row images
+  eps_cv = 1,      # 1 volt   — was ~0.015 fraction on 75-col images
+  coord_mode = "physical",
+  min_support_frac = 0.10)
+
+catalog_summary(cat)
+catalog_compactness(cat)
+```
+
+# What's coming
+
+Two follow-ups that would build on this foundation:
+
+- **`generate_one_synthetic_from_catalog(coord_mode = "physical")`**: place peaks at physical positions on a target sample by converting seconds/volts → row/col via the target's own time/cv axes. Still needed for the physical-catalog synthetic pipeline.
+- **Encoder pretraining on resampled samples**: with pixel-consistent Z matrices, cross-sample encoder features should be substantially more coherent. Worth measuring the improvement empirically.
