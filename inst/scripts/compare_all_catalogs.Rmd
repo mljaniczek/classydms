@@ -9,11 +9,17 @@ output:
     fig_height: 4.5
 params:
   output_root: "output"
-  eps_rt: 0.003
-  eps_cv: 0.015
+  coord_mode: "physical"           # "physical" (seconds/volts) or "fraction"
+  # Catalog eps — physical defaults in seconds/volts;
+  # fraction defaults fall back if coord_mode = "fraction"
+  eps_rt_seconds: 5.0              # seconds — used when coord_mode = "physical"
+  eps_cv_volts: 1.0                # volts   — used when coord_mode = "physical"
+  eps_rt_fraction: 0.003           # fraction — used when coord_mode = "fraction"
+  eps_cv_fraction: 0.015           # fraction — used when coord_mode = "fraction"
   min_support_frac: 0.10
-  do_alignment: true             # if TRUE, run intra-cohort alignment
-  do_cross_cohort_alignment: true # if TRUE, also do cross-cohort alignment (recommended)
+  do_alignment: true               # if TRUE, run intra-cohort alignment
+  do_cross_cohort_alignment: true  # if TRUE, also do cross-cohort alignment (recommended)
+  # Alignment eps — always in FRACTION space (see Section 1b note)
   align_eps_rt_loose: 0.03
   align_eps_cv_loose: 0.08
   cross_align_eps_rt_loose: 0.04
@@ -29,7 +35,21 @@ library(tibble)
 library(ggplot2)
 library(tidyr)
 library(purrr)
+
+# ---- Coord-mode plumbing ----
+coord_mode <- match.arg(params$coord_mode, c("physical", "fraction"))
+
+# Catalog eps chosen from coord_mode
+eps_rt_use <- if (coord_mode == "physical") params$eps_rt_seconds else params$eps_rt_fraction
+eps_cv_use <- if (coord_mode == "physical") params$eps_cv_volts   else params$eps_cv_fraction
+
+# Axis labels for plots
+rt_lab <- if (coord_mode == "physical") "RT (seconds)" else "RT (fraction)"
+cv_lab <- if (coord_mode == "physical") "CV (volts)"   else "CV (fraction)"
+shift_lab <- if (coord_mode == "physical") "shift (seconds / volts)" else "shift (fraction of image)"
 ```
+
+**Coord mode: `r coord_mode`** — catalog eps = `r eps_rt_use` (RT) × `r eps_cv_use` (CV). Physical mode requires peak_params objects to contain `rt_seconds_raw` / `cv_volts_raw` (produced when `estimate_peak_params()` was called with `time_axes` and `cv_axes`). If those fields are missing this report will fall back to fraction mode with a warning.
 
 # Purpose
 
@@ -72,11 +92,31 @@ d_chf  <- load_and_backfill("chf")
 d_asth <- load_and_backfill("asthma")
 d_resp <- load_and_backfill("respiratory")
 
+# ---- Coord-mode compatibility check ----
+has_physical <- function(pp) {
+  !is.null(pp$rt_seconds_raw) && !is.null(pp$cv_volts_raw)
+}
+all_have_phys <- all(vapply(list(d_aki$pp, d_chf$pp, d_asth$pp, d_resp$pp),
+                             has_physical, logical(1)))
+if (coord_mode == "physical" && !all_have_phys) {
+  warning("coord_mode = 'physical' requested but one or more cohorts is ",
+          "missing rt_seconds_raw / cv_volts_raw. Falling back to 'fraction'. ",
+          "Re-run estimate_peak_params() with time_axes and cv_axes to enable ",
+          "physical mode.")
+  coord_mode <- "fraction"
+  eps_rt_use <- params$eps_rt_fraction
+  eps_cv_use <- params$eps_cv_fraction
+  rt_lab <- "RT (fraction)"
+  cv_lab <- "CV (fraction)"
+  shift_lab <- "shift (fraction of image)"
+}
+
 # Subset by class and build catalogs
 build_from <- function(pp) build_peak_catalog(
   pp,
-  eps_rt = params$eps_rt,
-  eps_cv = params$eps_cv,
+  eps_rt = eps_rt_use,
+  eps_cv = eps_cv_use,
+  coord_mode = coord_mode,
   min_support_frac = params$min_support_frac
 )
 
@@ -99,7 +139,64 @@ all_cats <- list(
 )
 ```
 
+# 1a. Time-grid / physical-axis diagnostic
+
+Physical mode relies on `peak_params$time_ranges` and `cv_ranges` recording each sample's original RT and CV extents. This section checks:
+
+- **Physical fields present?** Confirms preprocessing populated the new fields.
+- **RT endpoint consistency.** If samples had wildly different max-RT before resampling, the resampled grid should have picked the smallest one to avoid extrapolation. If not, some samples were zero-filled beyond their real end.
+- **CV range consistency.** CV is typically uniform per instrument; deviations warrant investigation.
+- **Grid density (rows-per-second).** After resampling, this should be ~1 row/sec (if `step = 1.0` was used) and identical across cohorts.
+
+```{r time-grid-check, eval = coord_mode == "physical"}
+axis_diagnostic <- function(pp, cohort) {
+  if (is.null(pp$time_ranges) || is.null(pp$cv_ranges)) {
+    return(tibble(cohort = cohort, note = "physical fields present but time_ranges/cv_ranges missing"))
+  }
+  tr <- pp$time_ranges
+  cr <- pp$cv_ranges
+  tibble(
+    cohort            = cohort,
+    n_samples         = pp$n_samples,
+    rt_min_median     = median(tr[, "min"]),
+    rt_max_median     = median(tr[, "max"]),
+    rt_max_min        = min(tr[, "max"]),
+    rt_max_max        = max(tr[, "max"]),
+    rt_max_spread     = round(max(tr[, "max"]) - min(tr[, "max"]), 1),
+    n_rows_median     = median(tr[, "n"]),
+    n_rows_min        = min(tr[, "n"]),
+    n_rows_max        = max(tr[, "n"]),
+    rows_per_second   = round(median(tr[, "n"]) / median(tr[, "max"]), 3),
+    cv_min_median     = median(cr[, "min"]),
+    cv_max_median     = median(cr[, "max"]),
+    cv_range_spread   = round(max(cr[, "max"] - cr[, "min"]) -
+                              min(cr[, "max"] - cr[, "min"]), 3)
+  )
+}
+axis_df <- bind_rows(
+  axis_diagnostic(d_aki$pp,  "aki"),
+  axis_diagnostic(d_chf$pp,  "chf"),
+  axis_diagnostic(d_asth$pp, "asthma"),
+  axis_diagnostic(d_resp$pp, "respiratory")
+)
+knitr::kable(axis_df, caption = "Per-cohort RT/CV axis summary")
+```
+
+**How to read this table:**
+
+- **`rt_max_spread` near 0** → all samples in the cohort share the same RT endpoint (resampled to common grid, or all instrument runs completed to same time). Good.
+- **`rt_max_spread` large** (say > 100 s) → samples truncated at very different times. Sub-catalog fragmentation likely; consider re-running resampling or truncating to `min(rt_max)`.
+- **`n_rows_median` identical across cohorts** → all cohorts resampled to same grid. Good — enables direct pixel-space comparison across cohorts.
+- **`rows_per_second` = 1.0** → resampling step was 1 second. Deviations mean either not resampled or resampled to a different step.
+- **`cv_range_spread` > 0.5 V** → CV range varies between samples; unusual for GC-DMS.
+
+```{r time-grid-fallback, eval = coord_mode != "physical", results = "asis"}
+cat("*Coord mode is `fraction`; the time-grid diagnostic is skipped. To enable it, re-run `estimate_peak_params()` with `time_axes` and `cv_axes` populated (see `physical_units_walkthrough.Rmd`).*")
+```
+
 # 1b. Alignment (optional) and its effect on catalog compactness
+
+> **Note on alignment and coord_mode.** `align_via_catalog()` currently operates on the fraction fields `rt_loc_raw` and `cv_loc_raw`. For physical mode, the fraction fields still exist (they're always populated when peaks are extracted), so alignment runs fine — but the shifts are applied in fraction space only. If your samples went through the resampling step (`resample_to_time_grid`), most cross-sample drift is already gone and alignment may be unnecessary; set `do_alignment = FALSE` in the YAML params. If your samples were NOT resampled, keep alignment enabled — the fraction-space shift is a good proxy for the physical drift when time-range variability is small.
 
 Systematic per-sample drift in instrument-detected peak positions can fragment true underlying compounds into multiple catalog entries. We use `align_via_catalog()` to correct drift per cohort before catalog building, then rebuild catalogs on aligned data and compare against the un-aligned baseline.
 
@@ -163,7 +260,8 @@ ggplot(shifts_long, aes(x = shift)) +
   geom_histogram(bins = 40, fill = "#B2182B") +
   facet_grid(cohort ~ axis, scales = "free") +
   geom_vline(xintercept = 0, linetype = "dashed") +
-  labs(x = "shift (fraction of image)", y = "n samples",
+  labs(x = "shift (fraction of image — alignment always runs in fraction space)",
+       y = "n samples",
        title = "Per-sample alignment shifts by cohort and axis") +
   theme_minimal()
 ```
@@ -303,7 +401,8 @@ ggplot(cross_shifts_long, aes(x = shift, fill = cohort)) +
   geom_histogram(bins = 40, position = "identity", alpha = 0.5) +
   facet_wrap(~ axis, scales = "free", ncol = 2) +
   geom_vline(xintercept = 0, linetype = "dashed") +
-  labs(x = "shift (fraction of image)", y = "n samples",
+  labs(x = "shift (fraction of image — alignment always runs in fraction space)",
+       y = "n samples",
        title = "Cross-cohort shifts (with cohort overlay)",
        subtitle = "If cohort colors separate along the x-axis, cross-cohort drift is real") +
   theme_minimal()
@@ -384,10 +483,12 @@ preview_pp_after <- list(
 )
 
 universal_before_cross <- build_universal_catalog(preview_pp_before,
-  eps_rt = params$eps_rt, eps_cv = params$eps_cv,
+  eps_rt = eps_rt_use, eps_cv = eps_cv_use,
+  coord_mode = coord_mode,
   min_support_frac = params$min_support_frac)
 universal_after_cross  <- build_universal_catalog(preview_pp_after,
-  eps_rt = params$eps_rt, eps_cv = params$eps_cv,
+  eps_rt = eps_rt_use, eps_cv = eps_cv_use,
+  coord_mode = coord_mode,
   min_support_frac = params$min_support_frac)
 
 sprintf("Universal (before cross-align): %d compounds",
@@ -428,7 +529,7 @@ render_universal_map <- function(uni, title_suffix) {
       guide = guide_legend(override.aes = list(size = 3))) +
     scale_size_continuous(range = c(0.3, 3), guide = "none") +
     scale_y_reverse() +
-    labs(x = "CV (fraction)", y = "RT (fraction)",
+    labs(x = cv_lab, y = rt_lab,
          title = paste("Universal catalog —", title_suffix),
          subtitle = sprintf("%d compounds", nrow(uni$compounds)),
          color = "source coverage") +
@@ -619,7 +720,7 @@ ggplot(unique_spatial_df,
   scale_size_continuous(range = c(0.5, 3.5)) +
   scale_y_reverse() +
   facet_wrap(~ comparison, ncol = 2) +
-  labs(x = "CV (fraction)", y = "RT (fraction)",
+  labs(x = cv_lab, y = rt_lab,
        title = "Spatial distribution of unique vs shared compounds",
        color = "compound group") +
   theme_minimal() +
@@ -776,7 +877,7 @@ ggplot(all_compounds_df, aes(x = cv_loc, y = rt_loc)) +
                        name = "n compounds") +
   scale_y_reverse() +
   facet_wrap(~ catalog, ncol = 3) +
-  labs(x = "CV (fraction)", y = "RT (fraction)",
+  labs(x = cv_lab, y = rt_lab,
        title = "Compound density heatmap per catalog") +
   theme_minimal() +
   theme(panel.grid = element_blank())
@@ -797,7 +898,7 @@ ggplot(all_compounds_df, aes(x = cv_loc, y = rt_loc,
   scale_size_continuous(range = c(0.3, 2.5), guide = "none") +
   scale_y_reverse() +
   facet_wrap(~ catalog, ncol = 3) +
-  labs(x = "CV (fraction)", y = "RT (fraction)",
+  labs(x = cv_lab, y = rt_lab,
        title = "Compound prevalence per catalog") +
   theme_minimal() +
   theme(panel.grid = element_blank())
@@ -823,7 +924,7 @@ ggplot(disease_only_all,
   geom_point(alpha = 0.7) +
   scale_y_reverse() +
   scale_size_continuous(range = c(0.5, 3.5)) +
-  labs(x = "CV (fraction)", y = "RT (fraction)",
+  labs(x = cv_lab, y = rt_lab,
        title = "All disease-only compounds overlaid",
        color = "disease") +
   theme_minimal()
@@ -879,9 +980,11 @@ uni_pp_sources <- list(
 )
 
 universal <- build_universal_catalog(uni_pp_sources,
-  eps_rt = params$eps_rt, eps_cv = params$eps_cv,
+  eps_rt = eps_rt_use, eps_cv = eps_cv_use,
+  coord_mode = coord_mode,
   min_support_frac = params$min_support_frac)
-sprintf("Universal catalog: %d compounds", nrow(universal$compounds))
+sprintf("Universal catalog: %d compounds (coord_mode = %s, eps = %g × %g)",
+        nrow(universal$compounds), coord_mode, eps_rt_use, eps_cv_use)
 ```
 
 ## Per-source presence pattern
@@ -942,7 +1045,7 @@ ggplot(uni_map, aes(x = cv_loc, y = rt_loc, color = coverage_bin,
     "9 sources (universal)"  = "#08306B")) +
   scale_size_continuous(range = c(0.3, 3), guide = "none") +
   scale_y_reverse() +
-  labs(x = "CV (fraction)", y = "RT (fraction)",
+  labs(x = cv_lab, y = rt_lab,
        title = "Universal catalog compounds by source-coverage",
        color = "source coverage") +
   theme_minimal()
@@ -1000,13 +1103,22 @@ if (nrow(multi_disease) > 0) {
 Save the universal catalog and comparison objects so downstream steps (biomarker candidate ranking, cross-cohort encoder pretraining) can pick up without recomputing.
 
 ```{r save-outputs}
-outdir <- "catalog_comparison_outputs"
+# Tag output dir with coord_mode so physical and fraction runs don't clobber
+outdir <- sprintf("catalog_comparison_outputs_%s", coord_mode)
 dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
 saveRDS(all_cats,             file.path(outdir, "all_catalogs.rds"))
 saveRDS(within_comparisons,   file.path(outdir, "within_disease_comparisons.rds"))
 saveRDS(control_comparisons,  file.path(outdir, "control_vs_control_comparisons.rds"))
 saveRDS(disease_comparisons,  file.path(outdir, "disease_vs_disease_comparisons.rds"))
 saveRDS(universal,            file.path(outdir, "universal_catalog.rds"))
+# Save the parameter/coord_mode record too so downstream code knows units
+saveRDS(list(
+  coord_mode = coord_mode,
+  eps_rt = eps_rt_use, eps_cv = eps_cv_use,
+  min_support_frac = params$min_support_frac,
+  do_alignment = params$do_alignment,
+  do_cross_cohort_alignment = params$do_cross_cohort_alignment
+), file.path(outdir, "run_params.rds"))
 sprintf("All comparison objects saved to %s/", outdir)
 ```
 
