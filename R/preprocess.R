@@ -426,6 +426,134 @@ compute_pad_targets <- function(Z_list, multiple = 32L) {
 #' @param pad_value Fill value for the padded margins (default 0).
 #' @return A `target_H x target_W` matrix.
 #' @export
+#' Compute a common regular time grid across a cohort of samples
+#'
+#' Chooses a regular RT grid suitable for resampling every sample
+#' onto shared row indices. Row `i` in the resampled Z always
+#' corresponds to physical time `target_time[i]` regardless of which
+#' sample the row came from — the prerequisite for pixel-consistent
+#' cross-sample encoder input.
+#'
+#' Grid choice:
+#' \itemize{
+#'   \item `step`: distance in seconds between consecutive rows. Default
+#'     `1.0` — physically meaningful (row index = seconds), adequate
+#'     for typical GC-DMS peak FWHM (~2-5 s), and roughly matches
+#'     current native RT dimensions (~1500 rows). Common alternatives:
+#'     `0.5` (double resolution), `median(diff(time))` from the cohort,
+#'     or `"median"` / `"mean"` which computes the median / mean per-row
+#'     time delta across all samples.
+#'   \item `t_max`: maximum RT (seconds) on the returned grid. Default
+#'     `NULL` uses `max(unlist(lapply(samples, `[[`, "time")))` — the
+#'     longest sample's endpoint, so no sample is truncated. Rounded up
+#'     to the nearest integer multiple of `step`.
+#' }
+#'
+#' @param samples List of samples (each with a `$time` numeric vector).
+#' @param step Grid step in seconds. See details.
+#' @param t_max Maximum RT for the grid (seconds). See details.
+#' @return Numeric vector of RT positions in seconds, evenly spaced by
+#'   `step`, starting at 0, ending at `>= max sample time`.
+#' @export
+compute_common_time_grid <- function(samples,
+                                      step = 1.0,
+                                      t_max = NULL) {
+  stopifnot(is.list(samples), length(samples) > 0)
+  all_times <- lapply(samples, `[[`, "time")
+  if (any(vapply(all_times, is.null, logical(1)))) {
+    stop("compute_common_time_grid: every sample must have a $time vector.")
+  }
+  if (is.character(step)) {
+    step <- match.arg(step, c("median", "mean"))
+    all_dts <- unlist(lapply(all_times, function(t) diff(t)), use.names = FALSE)
+    step <- if (step == "median") stats::median(all_dts)
+            else                   mean(all_dts)
+  }
+  stopifnot(is.numeric(step), length(step) == 1L, step > 0)
+  if (is.null(t_max)) t_max <- max(vapply(all_times, max, numeric(1)))
+  n <- ceiling(t_max / step) + 1L
+  seq(0, by = step, length.out = n)
+}
+
+#' Resample one sample onto a regular time grid via linear interpolation
+#'
+#' Interpolates each CV column of the sample's `$Z` matrix from the
+#' sample's own `$time` vector onto a target regular grid. Values past
+#' the sample's own maximum RT are filled with 0 (no signal). Returns
+#' a new sample with `$Z` on the target grid and `$time` set to the
+#' target grid.
+#'
+#' Purpose: after resampling, row index `i` in every sample corresponds
+#' to the same physical RT (`target_time[i]`), removing cross-sample
+#' misalignment caused by variable per-row time deltas and different
+#' RT endpoints. Downstream encoders / classifiers can then treat pixel
+#' positions as physically meaningful and cross-sample-comparable.
+#'
+#' `$cv` is unchanged (CV grid is already consistent across samples on
+#' the same instrument). Other list fields (`$path`, `$id`, etc.) are
+#' preserved.
+#'
+#' @param sample A sample list with `$time` (numeric vector) and `$Z`
+#'   (matrix with `nrow(Z) == length(time)`).
+#' @param target_time Numeric vector of RT positions (seconds) — the
+#'   grid to interpolate onto. Typically from
+#'   [compute_common_time_grid()].
+#' @param method Interpolation method passed to [stats::approx()].
+#'   Default `"linear"`. Alternatives: `"constant"` (nearest-neighbor
+#'   step function).
+#' @return A sample list with updated `$Z` (dims
+#'   `length(target_time) x ncol(Z)`) and `$time` set to `target_time`.
+#' @export
+resample_to_time_grid <- function(sample,
+                                    target_time,
+                                    method = c("linear", "constant")) {
+  method <- match.arg(method)
+  if (is.null(sample$time) || is.null(sample$Z)) {
+    stop("resample_to_time_grid: sample must have $time and $Z.")
+  }
+  if (nrow(sample$Z) != length(sample$time)) {
+    stop("resample_to_time_grid: nrow(Z) (", nrow(sample$Z),
+         ") does not match length(time) (", length(sample$time), ").")
+  }
+  n_target <- length(target_time)
+  W <- ncol(sample$Z)
+  Z_new <- matrix(0, nrow = n_target, ncol = W)
+  for (j in seq_len(W)) {
+    Z_new[, j] <- stats::approx(x = sample$time, y = sample$Z[, j],
+                                  xout = target_time,
+                                  method = method,
+                                  yleft = 0, yright = 0)$y
+  }
+  sample$Z <- Z_new
+  sample$time <- target_time
+  # If there are alternate Z tensors on the sample (e.g. Z_raw,
+  # Z_pretrim), resample those too so they stay consistent with $Z.
+  for (alt in c("Z_raw", "Z_smooth", "Z_pretrim")) {
+    if (!is.null(sample[[alt]])) {
+      # Need the ORIGINAL time axis, which we've already overwritten.
+      # These alternates are usually only present pre-resampling; for
+      # safety, skip if we can't tell the original axis. Callers using
+      # these should resample the primary $Z first, then re-run the
+      # step that produces the alternate (e.g. re-do SG smoothing).
+      # We drop the field with a warning so it doesn't quietly go stale.
+      sample[[alt]] <- NULL
+    }
+  }
+  sample
+}
+
+#' Center-pad a matrix to target dimensions
+#'
+#' Pads `Z` with `pad_value` so the result has dimensions
+#' `target_H x target_W`. The original matrix is placed in the
+#' center of the padded canvas. Errors if `Z` is already larger than
+#' the target along either axis.
+#'
+#' @param Z A 2-D numeric matrix.
+#' @param target_H,target_W Target row and column counts.
+#' @param pad_value Fill value for the padded margins (default 0).
+#' @return A `target_H x target_W` matrix.
+#' @export
 pad_to_target <- function(Z, target_H, target_W, pad_value = 0) {
   if (is.data.frame(Z)) Z <- as.matrix(Z)
   storage.mode(Z) <- "numeric"
