@@ -39,6 +39,18 @@ plot_mat <- function(mat, title = "", low = "white",
 set.seed(1)
 ```
 
+# Summary
+
+This walkthrough follows `generate_one_synthetic()` end to end (`location_mode = "empirical"`, `attribute_mode = "joint"`) on a small canvas so every step is visible. Sections:
+
+1. **The building block — one 2D Gaussian "splotch"** — Constructs a single 2D Gaussian from an outer product and shows the effect of sigma and amplitude.
+2. **Where do the numbers come from? — `peak_params`** — Introduces raw vs fitted fields of `peak_params` and plots the 7 toy observed peaks.
+3. **Draw ONE peak using the default pipeline** — Manually reproduces the empirical + joint bootstrap plus location and size jitter to place one peak.
+4. **Stack N peaks into a full sample** — Samples the peak count, pre-samples indices, and loops peak accumulation while snapshotting the canvas.
+5. **Add noise — folded Normal** — Adds i.i.d. folded-Normal noise, plots the texture on its own scale, and compares clean vs noisy at the peak scale.
+6. **Sanity check: call the real function** — Confirms `generate_one_synthetic()` produces the same character of output.
+7. **Appendix: distribution reference** — Table of every random draw with its distribution and parameter source.
+
 This walkthrough follows `generate_one_synthetic()` in its **default** configuration (`location_mode = "empirical"`, `attribute_mode = "joint"`) — the recommended pipeline as of the most recent commits. Every step visualizes what is happening on a small `r H` × `r W` canvas so plots stay readable.
 
 ## Cheat sheet: parametric vs empirical

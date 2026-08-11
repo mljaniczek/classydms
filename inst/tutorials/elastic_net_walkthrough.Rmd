@@ -32,6 +32,22 @@ plot_mat <- function(mat, title = "", low = "white", high = "#B2182B",
 }
 ```
 
+# Summary
+
+This walkthrough opens up `cv_encoder_elastic_net` step by step on a toy cohort with a bright injected biomarker. Sections:
+
+1. **What `cv_encoder_elastic_net` does** — Two-step pipeline: frozen encoder feature extraction plus a CV elastic-net binary classifier, with rationale.
+2. **Parameter cheat sheet** — Table of all arguments with defaults and rationale for each choice.
+3. **Toy setup — build a tiny cohort with a real signal** — Hand-builds `peak_params`, holds out a Level 1 biomarker, and simulates 30 samples.
+4. **Quick pretrain (tiny, ~30 seconds)** — Runs a short `pretrain_denoising_online` to get a usable encoder.
+5. **Under the hood: extract encoder features first** — Calls `extract_encoder_features` and heatmaps the 64-channel by sample matrix.
+6. **Distribution of features by class** — Runs per-channel Wilcoxon to preview which channels the classifier will lean on.
+7. **Fit the classifier — `cv_encoder_elastic_net`** — Runs the classifier and inspects the returned probs, AUC, features, and coefs.
+8. **ROC curve** — Plots the ROC from out-of-fold probabilities.
+9. **Coefficient interpretation** — Bar chart of mean elastic-net coefficients with case/control/dropped labeling.
+10. **Effect of `alpha`** — Sweeps ridge to LASSO and plots AUC and non-zero coefficient count.
+11. **Practical tips** — Advice on seed reproducibility, choice of `k` and `alpha`, and downstream saliency use.
+
 # What `cv_encoder_elastic_net` does
 
 Two-step supervised classification on top of a *pretrained, frozen* encoder:

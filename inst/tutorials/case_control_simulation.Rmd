@@ -59,6 +59,20 @@ plot_mat_diff <- function(mat, title = "", limits = NULL,
 }
 ```
 
+# Summary
+
+This walkthrough validates the full pipeline end-to-end by injecting known biomarker peaks into a synthetic case group and measuring both classification and spatial recovery. Sections:
+
+1. **Purpose** — Motivates the ground-truth simulation and states the AUC and biomarker-recovery acceptance gates.
+2. **Load a base cohort's `peak_params`** — Runs the preprocessing chain on real flu samples and estimates the empirical peak pool.
+3. **Hold out biomarkers for Level 1** — Picks one pool peak as the biomarker and strips its neighborhood from the background pool.
+4. **Simulate the cohort** — Simulates 30 cases + 30 controls and reports per-biomarker firing rates by class.
+5. **Visualize a case and a control side by side** — Plots log-scale case/control panels and a case-minus-control diff to make the injected peak visible.
+6. **Preprocess and pad the simulated cohort** — Normalizes and pads simulated samples to a common encoder input size.
+7. **Pretraining and classification (heavy — flip `eval = TRUE` to run)** — Optional pretraining, 5-fold CV AUC, and biomarker-recovery AUC from aggregated saliency.
+8. **Fake-saliency demo — always runs** — Sanity-checks `evaluate_biomarker_recovery` on a hand-built Gaussian-blob saliency and a uniform-noise baseline.
+9. **Next steps — Levels 2 and 3** — Lists expected metric ranges for progressively harder `biomarkers_level2/3()` scenarios.
+
 # Purpose
 
 Every step of the classydms pipeline is validated in isolation (report on real cohorts, tutorial on toy params). But there's no ground truth for whether the **full pipeline** — preprocess → params → pretrain → classify → saliency — can recover a signal we *know* is there.

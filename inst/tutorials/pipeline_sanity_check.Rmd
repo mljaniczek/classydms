@@ -49,6 +49,22 @@ plot_diverging <- function(mat, title = "", limits = NULL) {
 }
 ```
 
+# TL;DR
+
+This walkthrough runs the full pipeline (synthesize -> pretrain -> classify -> interpret) under maximally favorable conditions to check that everything works end-to-end. Sections:
+
+1. **Purpose** — Describes the whole-pipeline check under sanity-max conditions and the pipeline-health questions it answers.
+2. **The sanity-max scenario** — Explains the `biomarkers_sanity_max()` levers and builds a toy 200-peak pool.
+3. **Simulate the cohort** — Simulates 60+60 samples and visualizes one case, one control, and their diff.
+4. **Pretrain the encoder** — Runs `pretrain_denoising_online` on the sparse background peak_params.
+5. **Encoder-channel sanity check** — Per-channel Wilcoxon with BH adjustment to confirm the encoder sees class content.
+6. **Classify — case/control AUC** — Runs `cv_encoder_elastic_net` and states acceptance bands.
+7. **Saliency + biomarker recovery** — Aggregates case and control saliency and evaluates per-pixel recovery.
+8. **Cohort size sweep — does bigger help?** — Fixes the encoder and re-runs classification on random subsamples of increasing size.
+9. **Summary — what to conclude** — Blank table of the four acceptance targets to fill in with observed results.
+10. **Realistic-intensity scenario** — Rebuilds the scenario without the intensity multiplier or top-quantile bias, retrains encoder, re-classifies, and re-runs saliency plus a comparison table.
+11. **Future experiments to plug in here** — Lists broader-pretraining, encoder-cohort sweep, architecture, and intermediate-difficulty ideas.
+
 # Purpose
 
 Every previous tutorial builds intuition for *one* function. This one runs the **entire pipeline** — synthesize → pretrain → classify → interpret — under maximally-favorable conditions and asks:

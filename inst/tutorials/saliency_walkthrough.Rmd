@@ -48,6 +48,19 @@ plot_mat_diverging <- function(mat, title = "", limits = NULL) {
 }
 ```
 
+# Summary
+
+This walkthrough opens up `aggregate_saliency_masked` step by step: how one CAM is built, how aggregation across cases sharpens the signal, and what the padding mask does. Sections:
+
+1. **What `aggregate_saliency_masked` does** — Class-Activation-Mapping decomposition of the elastic-net classifier into a spatial map.
+2. **Parameter cheat sheet** — Table of arguments with rationale for the separation between encoder, coefs, sample_indices, and orig_dims.
+3. **Setup: build a mini cohort with a real signal** — Hand-builds peak_params, holds out a bright biomarker, and pretrains a small encoder plus fits the elastic net.
+4. **Under the hood: one sample's CAM** — Calls `compute_saliency_map` on one case and plots the raw and upsampled CAMs.
+5. **Averaging across cases — this is what aggregation does** — Aggregates saliency separately for cases and controls with biomarker markers.
+6. **The masking mechanism — why `orig_dims` matters** — Explains and demonstrates the per-sample mask that excludes padded regions.
+7. **Using the map — what to do with a saliency hotspot** — Lists downstream steps: local maxima, physical-unit mapping, class-difference maps, evaluation.
+8. **Practical tips** — Advice on sample_indices choice, aggregation as a stability tool, and coefficient aggregation options.
+
 # What `aggregate_saliency_masked` does
 
 Converts the elastic-net classifier's decision into a spatial `(RT, CV)` map showing *where in the image* the classifier is finding its signal. Answers the biomarker-discovery question: given that the model says a sample looks like a case, which coordinates drove the prediction?

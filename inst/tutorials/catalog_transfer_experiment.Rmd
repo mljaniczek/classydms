@@ -18,6 +18,20 @@ library(purrr)
 library(pROC)
 ```
 
+# Summary
+
+This walkthrough tests whether an encoder pretrained on one compound subset transfers to classification on a disjoint subset, by splitting one catalog and comparing regimes. Sections:
+
+1. **Purpose** — Frames the encoder-transfer question and outlines the split-catalog design.
+2. **Load flu data and build catalog** — Preprocesses flu samples and builds one catalog.
+3. **Split the catalog** — Uses `split_catalog` to create disjoint compound halves A and B.
+4. **Simulate a case/control cohort from split B** — Picks biomarkers from split B and simulates 20+20 samples.
+5. **Two pretraining regimes to compare** — Pretrains encoders on split A (transfer), split B (matched), and split A with wider `size_jitter`.
+6. **Classify and compare AUC** — Runs `cv_encoder_elastic_net` per encoder and tabulates AUCs and non-zero coefficient counts.
+7. **Sanity check: encoder channel differentiation** — Per-channel Wilcoxon by class for each regime.
+8. **What to do with the results** — Interprets the AUC gaps to answer the one-encoder-vs-per-disease question and the jitter question.
+9. **What to run next** — Lists cross-cohort transfer, wider jitter sweeps, merged-catalog pretraining, and scale-up.
+
 # Purpose
 
 The key transfer-learning question: **can one encoder pretrained on "generic peakiness" from one distribution be applied to case/control classification on a *different* distribution?**

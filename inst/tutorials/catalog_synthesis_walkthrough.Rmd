@@ -37,6 +37,20 @@ plot_mat <- function(mat, title = "", low = "white",
 }
 ```
 
+# Summary
+
+This walkthrough shows how one catalog-based synthetic sample is generated and how many samples together produce the shared-backbone structure that matches real GC-DMS. Sections:
+
+1. **Why this walkthrough exists** — Contrasts the peak_params flow with the catalog flow and motivates position-consistent synthesis.
+2. **Compact cheat sheet** — Table of distributions and operations used at each generation step.
+3. **Build a tiny catalog** — Hand-builds a small `peak_params` and runs `build_peak_catalog` on it.
+4. **One compound to one synthetic peak** — Walks through Bernoulli firing, bootstrapped morphology, jittered placement, and rasterization for a single compound.
+5. **One sample — iterate over the whole catalog** — Calls `generate_one_synthetic_from_catalog` and reports how many compounds fired.
+6. **Multiple samples share a backbone — the whole point** — Generates 6 samples and shows compounds landing at the same positions across panels.
+7. **Averaging many samples reveals the compound landscape** — Averages 30 clean samples to visualize the prevalence-weighted heatmap.
+8. **Biomarker override — case vs control** — Passes `prevalence_override` and `intensity_mult` to boost picked compounds in cases and suppress them in controls.
+9. **Where to go next** — Points at the catalog pipeline sanity check, transfer experiment, and comparison walkthroughs.
+
 # Why this walkthrough exists
 
 The [synthesis walkthrough](synthesis_walkthrough.html) covers `generate_one_synthetic` — the *peak_params* flow, where every synthetic sample independently draws random peak positions from a common pool. The result: each sample looks completely different from the next.

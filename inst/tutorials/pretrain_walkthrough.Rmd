@@ -36,6 +36,21 @@ plot_mat <- function(mat, title = "", low = "white", high = "#B2182B",
 }
 ```
 
+# Summary
+
+This walkthrough opens up `pretrain_denoising_online` step by step: what the training pair looks like, how a short run is configured, and what the returned object contains. Sections:
+
+1. **What `pretrain_denoising_online` does** — Describes the self-supervised denoising task and its role as an encoder for downstream classification.
+2. **Parameter cheat sheet** — Table of all arguments (sizing, optimization, generation, architecture, runtime) with defaults and rationale.
+3. **Toy setup** — Hand-builds a `peak_params` for a fast 100x30 training run.
+4. **One training pair — what the model actually sees** — Generates and plots a `(clean, noisy)` pair at elevated `noise_scale`.
+5. **Train — a fast 5-epoch run** — Runs `pretrain_denoising_online` with tiny settings and shows the returned object structure.
+6. **Loss curves** — Plots train and validation MSE per epoch with diagnostic guidance.
+7. **Reconstruction on a fresh synthetic sample** — Feeds a new synthetic sample through the trained autoencoder and plots noisy/clean/reconstruction.
+8. **The manifest** — Lists fields recorded in the on-disk manifest for reproducibility and resume.
+9. **Pretraining from a peak catalog** — Shows how to swap `peak_params = NULL, catalog = my_catalog` to use the catalog generator.
+10. **Practical tips** — Advice on `val_real`, `save_path`, `num_workers`, and which knobs to tune first.
+
 # What `pretrain_denoising_online` does
 
 Self-supervised training of a convolutional encoder on synthetic GC-DMS images. The encoder isn't given any class labels — it only sees pairs of `(noisy, clean)` synthetic samples and is asked to reconstruct `clean` from `noisy`. The point isn't the reconstruction itself; it's that this task forces the encoder to learn features that describe *the structure of GC-DMS peaks in general* (Vincent et al. 2008). Those features then transfer to downstream classification on real labeled data — even a very small labeled cohort — via a lightweight elastic net on the 64-dim encoder output.

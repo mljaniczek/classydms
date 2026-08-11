@@ -48,6 +48,22 @@ plot_div <- function(mat, title = "", limits = NULL) {
 }
 ```
 
+# Summary
+
+This walkthrough runs the whole catalog-based pipeline (synthesize -> pretrain -> classify -> interpret) at toy scale against sanity-max acceptance targets. Sections:
+
+1. **Purpose** — States the sanity-max acceptance targets for the catalog pipeline.
+2. **Toy setup** — Hand-builds a `peak_params` with fixed compound centers plus sample-specific peaks, then runs `build_peak_catalog`.
+3. **Sanity-max biomarker spec** — Picks 5 catalog compounds via `pick_catalog_biomarkers` and builds a maximum-signal biomarker spec.
+4. **Simulate the cohort** — Runs `simulate_case_control_from_catalog` for 40+40 samples and checks biomarker firing rates.
+5. **Case vs control visualization** — Plots one case, one control, and their diff with biomarker circles overlaid.
+6. **Pretrain encoder on the catalog** — Runs `pretrain_denoising_online` with the catalog as input.
+7. **Encoder-channel sanity check** — Per-channel Wilcoxon with BH adjustment plots channel significance.
+8. **Classify** — Runs `cv_encoder_elastic_net` and reports 5-fold CV AUC and non-zero coefficient count.
+9. **Saliency + biomarker recovery** — Aggregates saliency over cases and evaluates per-pixel recovery AUC.
+10. **Summary vs acceptance targets** — Tabulates observed metrics against the sanity-max targets.
+11. **What comes next** — Suggests harder scenarios, cross-cohort transfer, and universal catalog merges.
+
 # Purpose
 
 The [peak_params pipeline_sanity_check](pipeline_sanity_check.html) validates the pipeline end-to-end using per-sample-random peak positions. This tutorial does the same for the **catalog** flow — where every synthetic sample draws from a shared compound catalog. Catalog-based synthetic data structurally matches real GC-DMS, so the encoder learns the right inductive bias during pretraining.

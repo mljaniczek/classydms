@@ -17,6 +17,17 @@ library(tibble)
 library(purrr)
 ```
 
+# Summary
+
+This walkthrough compares and merges peak catalogs across cohorts, demonstrated on a disease/control split of the flu subset. Sections:
+
+1. **Purpose** — Motivates the two questions (shared vs unique compounds; merging into a universal catalog) and introduces `compare_catalogs` and `merge_catalogs`.
+2. **Setup — two catalogs from the same cohort split by class** — Preprocesses flu samples and builds separate disease/control catalogs via `subset_peak_params` + `build_peak_catalog`.
+3. **Compare the two catalogs** — Runs `compare_catalogs` and plots the shared-compound prevalence delta and unique-compound spatial overlay.
+4. **Merge into a universal catalog** — Runs `merge_catalogs` and shows the per-source prevalence tracking on merged entries.
+5. **Practical uses** — Points at biomarker discovery, universal encoder pretraining, and diagnostic use of shared fractions.
+6. **What comes next** — Suggests multi-cohort catalogs, biomarker ranking tables, and transferability tests.
+
 # Purpose
 
 Once you have peak catalogs from multiple cohorts (per-condition, per-batch, or split by any grouping), two natural questions:

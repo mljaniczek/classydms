@@ -17,6 +17,21 @@ library(tibble)
 library(purrr)
 ```
 
+# Summary
+
+This walkthrough builds and diagnoses a peak catalog on the flu subset to see how many compounds are present and how the count depends on clustering parameters. Sections:
+
+1. **Purpose** — Explains why a peak catalog is needed and what the diagnostics answer.
+2. **Load flu cohort and build `peak_params`** — Runs the preprocessing chain on flu samples and estimates the pooled peak-parameter object.
+3. **Build the catalog at default parameters** — Runs `build_peak_catalog` and calls `catalog_summary` with a note on the discrete prevalence at small scale.
+4. **Spatial overlay — where do the compounds sit?** — Plots compounds, small clusters, and singletons via `plot_catalog`.
+5. **Compound prevalence distribution** — Histograms compound prevalence and describes the expected tiered shape.
+6. **How does the catalog change with clustering radius?** — Sweeps `eps_rt` × `eps_cv` and plots compound counts.
+7. **How does the catalog change with support threshold?** — Sweeps `min_support_frac` to expose the anchor/common/frequent/sporadic tiers.
+8. **Loner analysis** — Spatial layout, intensity comparison, and pairwise-proximity check for singleton peaks.
+9. **Case vs control catalog comparison (mini demo)** — Splits the pool by class and builds per-class catalogs to preview `compare_catalogs`.
+10. **What comes next** — Lists follow-ups including catalog-based synthesis and DBSCAN clustering.
+
 # Purpose
 
 Real GC-DMS samples share the same underlying compounds. If subject A's spectrum has a peak at RT = 42.3s, CV = 17V, subject B's spectrum usually has one at *the same* position (with different brightness, or occasionally absent). Our current synthetic generator doesn't capture this — it draws random peak positions independently per sample.

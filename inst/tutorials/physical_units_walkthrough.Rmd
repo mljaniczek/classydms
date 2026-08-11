@@ -17,6 +17,21 @@ library(tibble)
 library(purrr)
 ```
 
+# Summary
+
+This walkthrough covers preprocessing that preserves RT seconds and CV volts so samples align across time and across cohorts without post-hoc drift correction. Sections:
+
+1. **Purpose** — Motivates keeping physical units to sidestep variable per-row RT steps and endpoints.
+2. **The two preprocessing options** — Distinguishes physical-coordinate peak_params from common-time-grid resampling.
+3. **Build a small demonstration** — Manufactures two toy samples with different step sizes and RT endpoints.
+4. **Resample onto a common time grid** — Calls `compute_common_time_grid` and `resample_to_time_grid` to align peak-row indices.
+5. **Visualize before vs after** — Heatmaps raw and resampled samples to confirm the peak lands at the same row.
+6. **Physical-units peak_params** — Runs `estimate_peak_params` with `time_axes`/`cv_axes` and shows both fraction and physical fields.
+7. **Physical-mode catalog** — Builds a catalog with `coord_mode = "physical"` (eps in seconds and volts) and compares to fraction mode.
+8. **When to use which** — Decision table mapping analysis goals to physical vs fraction mode and whether to resample.
+9. **Practical pipeline (real cohort)** — Template code showing resample -> physical peak_params -> physical catalog on real data.
+10. **What's coming** — Lists physical-mode catalog synthetic generation and resampled-encoder-pretraining measurements.
+
 # Purpose
 
 This tutorial covers the **physical-units preprocessing path**: preserving RT seconds and CV volts through the pipeline so that samples align across time and across cohorts without any post-hoc drift-correction.
