@@ -229,11 +229,19 @@ pick_catalog_biomarkers <- function(catalog, n_biomarkers,
   keep <- df$prevalence >= min_prevalence &
           df$prevalence <= max_prevalence
   if (!is.null(min_intensity_quantile)) {
-    median_intensity <- vapply(df$intensity_obs, stats::median,
-                                numeric(1))
-    thr <- as.numeric(stats::quantile(median_intensity,
-                                        min_intensity_quantile))
-    keep <- keep & (median_intensity >= thr)
+    # Length-safe + NA-safe median. A compound with an empty intensity_obs
+    # (older catalogs pre-fix, or catalogs loaded from disk) would give
+    # median() a numeric(0) and yield NaN — filter these out of the
+    # eligibility set rather than letting them poison quantile().
+    median_intensity <- vapply(df$intensity_obs, function(x) {
+      x <- x[is.finite(x) & x > 0]
+      if (length(x) == 0L) NA_real_ else stats::median(x)
+    }, numeric(1))
+    finite_mask <- is.finite(median_intensity)
+    thr <- as.numeric(stats::quantile(median_intensity[finite_mask],
+                                        min_intensity_quantile,
+                                        na.rm = TRUE))
+    keep <- keep & finite_mask & (median_intensity >= thr)
   }
   eligible <- df$compound_id[keep]
   if (length(eligible) < n_biomarkers) {
@@ -427,13 +435,25 @@ simulate_case_control_from_catalog <- function(catalog,
       if (is.null(ocp[[nm]]))
         stop("off_catalog_peaks$", nm, " is required.")
     }
-    # Pool sigma distributions
-    ocp$sigma_rt_pool <- unlist(catalog$compounds$sigma_rt_obs)
-    ocp$sigma_cv_pool <- unlist(catalog$compounds$sigma_cv_obs)
+    # Pool sigma distributions. Filter to finite positive values so a
+    # catalog with stale NAs in the list-columns (pre-fix build or
+    # externally-provided catalog) can't seed off-catalog peaks with
+    # NA sigma that render as NaN Gaussians.
+    srp <- unlist(catalog$compounds$sigma_rt_obs)
+    scp <- unlist(catalog$compounds$sigma_cv_obs)
+    ocp$sigma_rt_pool <- srp[is.finite(srp) & srp > 0]
+    ocp$sigma_cv_pool <- scp[is.finite(scp) & scp > 0]
+    if (length(ocp$sigma_rt_pool) == 0L || length(ocp$sigma_cv_pool) == 0L)
+      stop("off_catalog_peaks: catalog has no usable sigma observations ",
+           "to draw peak shapes from.")
     # Catalog compound positions in fraction space (for exclusion)
     cmp <- catalog$compounds
     ocp$cat_rt_frac <- if (!is.null(cmp$rt_frac)) cmp$rt_frac else cmp$rt_loc
     ocp$cat_cv_frac <- if (!is.null(cmp$cv_frac)) cmp$cv_frac else cmp$cv_loc
+    # Filter to finite so exclusion check doesn't compare against NA
+    keep_pos <- is.finite(ocp$cat_rt_frac) & is.finite(ocp$cat_cv_frac)
+    ocp$cat_rt_frac <- ocp$cat_rt_frac[keep_pos]
+    ocp$cat_cv_frac <- ocp$cat_cv_frac[keep_pos]
   } else {
     ocp <- NULL
   }
@@ -499,9 +519,6 @@ simulate_case_control_from_catalog <- function(catalog,
 
     # ---- cofire post-processing ----
     if (!is.null(cofire)) {
-      cid_to_row <- match(catalog$compounds$compound_id,
-                           catalog$compounds$compound_id)
-      # Rebuild the row-lookup fresh (identity mapping over sorted ids)
       cid_to_row <- stats::setNames(seq_len(nrow(catalog$compounds)),
                                      as.character(catalog$compounds$compound_id))
       # Fast index into placements by compound_id (may hold >1 hit if
@@ -523,13 +540,27 @@ simulate_case_control_from_catalog <- function(catalog,
       add_compound <- function(cid) {
         crow <- cid_to_row[[as.character(cid)]]
         if (is.na(crow)) return()
-        # Draw fresh morphology (same convention as generator)
+        # Skip if placement fraction non-finite (catalog defense).
+        if (!is.finite(rt_place[crow]) || !is.finite(cv_place[crow])) return()
+        # Draw fresh morphology (same convention as generator, with the
+        # same resample-on-bad-triple loop so a stale NA in the per-obs
+        # lists doesn't render a NaN Gaussian and break subtract later).
         obs_intensity <- catalog$compounds$intensity_obs[[crow]]
         n_obs <- length(obs_intensity)
-        j <- sample.int(n_obs, size = 1L)
-        sig_rt <- catalog$compounds$sigma_rt_obs[[crow]][j]
-        sig_cv <- catalog$compounds$sigma_cv_obs[[crow]][j]
-        base_amp <- obs_intensity[j]
+        if (n_obs == 0L) return()
+        got_valid <- FALSE
+        for (draw_attempt in seq_len(5L)) {
+          j <- sample.int(n_obs, size = 1L)
+          sig_rt <- catalog$compounds$sigma_rt_obs[[crow]][j]
+          sig_cv <- catalog$compounds$sigma_cv_obs[[crow]][j]
+          base_amp <- obs_intensity[j]
+          if (is.finite(sig_rt) && sig_rt > 0 &&
+              is.finite(sig_cv) && sig_cv > 0 &&
+              is.finite(base_amp) && base_amp > 0) {
+            got_valid <- TRUE; break
+          }
+        }
+        if (!got_valid) return()
         mult <- if (as.character(cid) %in% names(int_mult))
                   int_mult[[as.character(cid)]] else 1.0
         mu_rt <- rt_place[crow] * H + stats::rnorm(1, 0, location_jitter_rt)
@@ -598,13 +629,19 @@ simulate_case_control_from_catalog <- function(catalog,
     # don't leave stale noise unrelated to the modified peaks.
     if (add_noise && !is.null(catalog$noise) &&
         is.finite(catalog$noise$mean) && is.finite(catalog$noise$sd)) {
-      noise_sd <- max(1e-8, catalog$noise$sd * noise_scale)
+      noise_sd   <- max(1e-8, catalog$noise$sd * noise_scale)
+      noise_mean <- catalog$noise$mean
+      if (!is.finite(noise_sd))   noise_sd   <- 1e-8
+      if (!is.finite(noise_mean)) noise_mean <- 0
       noise <- matrix(abs(stats::rnorm(H * W,
-                                        mean = catalog$noise$mean,
+                                        mean = noise_mean,
                                         sd = noise_sd)),
                        nrow = H, ncol = W)
       Z <- Z + noise
     }
+    stopifnot(
+      "simulate_case_control_from_catalog produced non-finite pixels" =
+        all(is.finite(Z)))
 
     firing[i, ] <- fired[biom_rows]
 
@@ -928,16 +965,26 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
                                                     cc$n_per_sample[1],
                                                     cc$n_per_sample[2] + 1))
     if (n_con > 0L) {
+      srp <- unlist(cmp$sigma_rt_obs); scp <- unlist(cmp$sigma_cv_obs)
+      pos_rt <- if (!is.null(cmp$rt_frac)) cmp$rt_frac else cmp$rt_loc
+      pos_cv <- if (!is.null(cmp$cv_frac)) cmp$cv_frac else cmp$cv_loc
+      keep_pos <- is.finite(pos_rt) & is.finite(pos_cv)
       ocp <- list(
         rt_range = cc$rt_range, cv_range = cc$cv_range,
         intensity_range = cc$intensity_range,
         exclusion_eps_rt = cc$exclusion_eps_rt,
         exclusion_eps_cv = cc$exclusion_eps_cv,
-        sigma_rt_pool = unlist(cmp$sigma_rt_obs),
-        sigma_cv_pool = unlist(cmp$sigma_cv_obs),
-        cat_rt_frac = if (!is.null(cmp$rt_frac)) cmp$rt_frac else cmp$rt_loc,
-        cat_cv_frac = if (!is.null(cmp$cv_frac)) cmp$cv_frac else cmp$cv_loc
+        sigma_rt_pool = srp[is.finite(srp) & srp > 0],
+        sigma_cv_pool = scp[is.finite(scp) & scp > 0],
+        cat_rt_frac   = pos_rt[keep_pos],
+        cat_cv_frac   = pos_cv[keep_pos]
       )
+      if (length(ocp$sigma_rt_pool) == 0L ||
+          length(ocp$sigma_cv_pool) == 0L) {
+        # No usable sigma observations — skip contamination for this
+        # sample rather than blowing up the training loop.
+        n_con <- 0L
+      }
       inj <- inject_off_catalog(Z, ocp, H, W, n_con,
                                   size_jitter,
                                   location_jitter_rt,
@@ -950,13 +997,19 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
   noisy <- Z
   if (add_noise && !is.null(catalog$noise) &&
       is.finite(catalog$noise$mean) && is.finite(catalog$noise$sd)) {
-    noise_sd <- max(1e-8, catalog$noise$sd * noise_scale)
+    noise_sd   <- max(1e-8, catalog$noise$sd * noise_scale)
+    noise_mean <- catalog$noise$mean
+    if (!is.finite(noise_sd))   noise_sd   <- 1e-8
+    if (!is.finite(noise_mean)) noise_mean <- 0
     noise <- matrix(abs(stats::rnorm(H * W,
-                                      mean = catalog$noise$mean,
+                                      mean = noise_mean,
                                       sd = noise_sd)),
                      nrow = H, ncol = W)
     noisy <- Z + noise
   }
+  stopifnot(
+    "generate_noisy_pretrain_sample produced non-finite pixels" =
+      all(is.finite(Z)) && all(is.finite(noisy)))
 
   list(clean = Z, noisy = noisy,
        anchor_ids = anchor_ids,

@@ -173,12 +173,12 @@ align_across_cohorts <- function(pp_list,
     # Recompute derived summaries
     new_pp$rt_loc <- list(
       values = new_pp$rt_loc_raw,
-      mean = mean(new_pp$rt_loc_raw),
-      sd = stats::sd(new_pp$rt_loc_raw))
+      mean = mean(new_pp$rt_loc_raw, na.rm = TRUE),
+      sd = stats::sd(new_pp$rt_loc_raw, na.rm = TRUE))
     new_pp$cv_loc <- list(
       values = new_pp$cv_loc_raw,
-      mean = mean(new_pp$cv_loc_raw),
-      sd = stats::sd(new_pp$cv_loc_raw))
+      mean = mean(new_pp$cv_loc_raw, na.rm = TRUE),
+      sd = stats::sd(new_pp$cv_loc_raw, na.rm = TRUE))
 
     cohort_samples <- (off + 1L):(off + n_s)
     new_pp$alignment <- list(
@@ -322,14 +322,19 @@ align_via_catalog <- function(peak_params,
       }
     }
 
-    # Compute per-sample median offsets and apply as shifts
+    # Compute per-sample median offsets and apply as shifts. na.rm
+    # so a stray NA in the offset vectors doesn't propagate into
+    # shifts (which would then propagate into rt_loc_raw and later
+    # cascade to NaN pixels in synthesis).
     shifts_rt <- numeric(n_samples)
     shifts_cv <- numeric(n_samples)
     for (s in seq_len(n_samples)) {
       n_matched[s] <- length(offsets_rt_by_sample[[s]])
       if (n_matched[s] >= min_anchors_per_sample) {
-        shifts_rt[s] <- stats::median(offsets_rt_by_sample[[s]])
-        shifts_cv[s] <- stats::median(offsets_cv_by_sample[[s]])
+        m_rt <- stats::median(offsets_rt_by_sample[[s]], na.rm = TRUE)
+        m_cv <- stats::median(offsets_cv_by_sample[[s]], na.rm = TRUE)
+        if (is.finite(m_rt)) shifts_rt[s] <- m_rt
+        if (is.finite(m_cv)) shifts_cv[s] <- m_cv
       }
     }
 
@@ -360,12 +365,12 @@ align_via_catalog <- function(peak_params,
   # Update derived summary stats
   current_pp$rt_loc <- list(
     values = current_pp$rt_loc_raw,
-    mean = mean(current_pp$rt_loc_raw),
-    sd = stats::sd(current_pp$rt_loc_raw))
+    mean = mean(current_pp$rt_loc_raw, na.rm = TRUE),
+    sd = stats::sd(current_pp$rt_loc_raw, na.rm = TRUE))
   current_pp$cv_loc <- list(
     values = current_pp$cv_loc_raw,
-    mean = mean(current_pp$cv_loc_raw),
-    sd = stats::sd(current_pp$cv_loc_raw))
+    mean = mean(current_pp$cv_loc_raw, na.rm = TRUE),
+    sd = stats::sd(current_pp$cv_loc_raw, na.rm = TRUE))
 
   # Back-sync physical fields if they exist. Alignment runs on fraction
   # fields (rt_loc_raw / cv_loc_raw), but downstream physical-mode catalog
@@ -573,10 +578,16 @@ align_peak_params <- function(peak_params,
       n_matched[s] <- n_anchors_hit
       if (n_anchors_hit >= min_anchors_per_sample &&
           length(dr_list) > 0L) {
-        shifts_rt[s] <- stats::median(dr_list)
-        shifts_cv[s] <- stats::median(dc_list)
-        aligned_rt[peak_mask] <- peaks_rt - shifts_rt[s]
-        aligned_cv[peak_mask] <- peaks_cv - shifts_cv[s]
+        m_rt <- stats::median(dr_list, na.rm = TRUE)
+        m_cv <- stats::median(dc_list, na.rm = TRUE)
+        # If offsets were all NA (peak positions themselves NA), skip
+        # this sample rather than propagating NaN into aligned coords.
+        if (is.finite(m_rt) && is.finite(m_cv)) {
+          shifts_rt[s] <- m_rt
+          shifts_cv[s] <- m_cv
+          aligned_rt[peak_mask] <- peaks_rt - shifts_rt[s]
+          aligned_cv[peak_mask] <- peaks_cv - shifts_cv[s]
+        }
       }
     }
 
@@ -607,12 +618,12 @@ align_peak_params <- function(peak_params,
   # Update derived stats
   current_pp$rt_loc <- list(
     values = current_pp$rt_loc_raw,
-    mean = mean(current_pp$rt_loc_raw),
-    sd = stats::sd(current_pp$rt_loc_raw))
+    mean = mean(current_pp$rt_loc_raw, na.rm = TRUE),
+    sd = stats::sd(current_pp$rt_loc_raw, na.rm = TRUE))
   current_pp$cv_loc <- list(
     values = current_pp$cv_loc_raw,
-    mean = mean(current_pp$cv_loc_raw),
-    sd = stats::sd(current_pp$cv_loc_raw))
+    mean = mean(current_pp$cv_loc_raw, na.rm = TRUE),
+    sd = stats::sd(current_pp$cv_loc_raw, na.rm = TRUE))
 
   current_pp$alignment <- list(
     shifts_rt = total_shift_rt,
