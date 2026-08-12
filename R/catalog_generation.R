@@ -103,17 +103,36 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
     prev <- if (cid %in% po_names) prevalence_override[[cid]]
             else                   compounds$prevalence[i]
     if (stats::runif(1) >= prev) next
-    fired[i] <- TRUE
+
+    # If the compound's placement fraction is non-finite (a bad catalog
+    # entry that slipped through), skip it. This can happen if the
+    # catalog was built from peak_params containing NAs in
+    # rt_loc_raw / cv_loc_raw and the median aggregation produced NaN.
+    if (!is.finite(rt_place[i]) || !is.finite(cv_place[i])) next
 
     mult <- if (cid %in% im_names) intensity_mult[[cid]] else 1.0
 
-    # Bootstrap morphology triple from this compound's observations
+    # Bootstrap morphology triple from this compound's observations.
+    # Skip the compound (don't count as fired) if we can't find a valid
+    # finite triple in a bounded number of tries — the alternative is a
+    # NaN pixel that will crash normalization downstream.
     obs_intensity <- compounds$intensity_obs[[i]]
     n_obs <- length(obs_intensity)
-    j <- sample.int(n_obs, size = 1L)
-    sig_rt   <- compounds$sigma_rt_obs[[i]][j]
-    sig_cv   <- compounds$sigma_cv_obs[[i]][j]
-    base_amp <- obs_intensity[j]
+    if (n_obs == 0L) next
+    got_valid <- FALSE
+    for (draw_attempt in seq_len(5L)) {
+      j <- sample.int(n_obs, size = 1L)
+      sig_rt   <- compounds$sigma_rt_obs[[i]][j]
+      sig_cv   <- compounds$sigma_cv_obs[[i]][j]
+      base_amp <- obs_intensity[j]
+      if (is.finite(sig_rt) && sig_rt > 0 &&
+          is.finite(sig_cv) && sig_cv > 0 &&
+          is.finite(base_amp) && base_amp > 0) {
+        got_valid <- TRUE; break
+      }
+    }
+    if (!got_valid) next
+    fired[i] <- TRUE
 
     # Place with location jitter (rt_place / cv_place are always in
     # fraction — see coord_mode branch above).
@@ -151,14 +170,24 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
 
   if (!add_noise || is.null(catalog$noise) ||
       !is.finite(catalog$noise$mean) || !is.finite(catalog$noise$sd)) {
+    stopifnot(
+      "generate_one_synthetic_from_catalog produced non-finite clean pixels" =
+        all(is.finite(clean)))
     return(list(clean = clean, noisy = clean, fired = fired,
                 placements = placements))
   }
-  noise_sd <- max(1e-8, catalog$noise$sd * noise_scale)
-  noise <- matrix(abs(stats::rnorm(H * W, mean = catalog$noise$mean,
-                                    sd = noise_sd)),
+  noise_sd   <- max(1e-8, catalog$noise$sd * noise_scale)
+  noise_mean <- catalog$noise$mean
+  # rnorm silently returns NaN if mean or sd is non-finite; guard here.
+  if (!is.finite(noise_mean)) noise_mean <- 0
+  if (!is.finite(noise_sd))   noise_sd   <- 1e-8
+  noise <- matrix(abs(stats::rnorm(H * W, mean = noise_mean, sd = noise_sd)),
                    nrow = H, ncol = W)
-  list(clean = clean, noisy = clean + noise, fired = fired,
+  noisy <- clean + noise
+  stopifnot(
+    "generate_one_synthetic_from_catalog produced non-finite pixels" =
+      all(is.finite(clean)) && all(is.finite(noisy)))
+  list(clean = clean, noisy = noisy, fired = fired,
        placements = placements)
 }
 

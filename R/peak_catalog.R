@@ -302,20 +302,33 @@ build_peak_catalog <- function(peak_params,
     n_uniq <- length(unique_samples)
     # Build the base row using the CLUSTERING coordinate system as
     # rt_loc / cv_loc (fraction OR physical depending on coord_mode).
+    # NA-safe aggregation across cluster members. Raw peak_params
+    # occasionally contain NAs on individual axes (e.g., degenerate
+    # peaks near the pad boundary); without na.rm the whole compound's
+    # rt_loc / rt_frac / rt_seconds becomes NA and every downstream
+    # generation of that compound produces NaN pixels. Also filter the
+    # per-observation morphology list-columns so downstream bootstrap
+    # draws can't pick an NA.
+    sig_rt_m <- peak_params$sigma_rt_raw[members]
+    sig_cv_m <- peak_params$sigma_cv_raw[members]
+    int_m    <- intensity[members]
+    keep_obs <- is.finite(sig_rt_m) & sig_rt_m > 0 &
+                is.finite(sig_cv_m) & sig_cv_m > 0 &
+                is.finite(int_m)    & int_m    > 0
     row <- tibble::tibble(
       compound_id     = cid,
-      rt_loc          = stats::median(rt[members]),
-      cv_loc          = stats::median(cv[members]),
+      rt_loc          = stats::median(rt[members], na.rm = TRUE),
+      cv_loc          = stats::median(cv[members], na.rm = TRUE),
       location_sd_rt  = if (length(members) > 1L)
-                          stats::sd(rt[members]) else 0,
+                          stats::sd(rt[members], na.rm = TRUE) else 0,
       location_sd_cv  = if (length(members) > 1L)
-                          stats::sd(cv[members]) else 0,
+                          stats::sd(cv[members], na.rm = TRUE) else 0,
       n_observations  = length(members),
       n_samples       = n_uniq,
       prevalence      = n_uniq / n_cohort_samples,
-      sigma_rt_obs    = list(peak_params$sigma_rt_raw[members]),
-      sigma_cv_obs    = list(peak_params$sigma_cv_raw[members]),
-      intensity_obs   = list(intensity[members]),
+      sigma_rt_obs    = list(sig_rt_m[keep_obs]),
+      sigma_cv_obs    = list(sig_cv_m[keep_obs]),
+      intensity_obs   = list(int_m[keep_obs]),
       member_indices  = list(members)
     )
     # If both physical + fraction are available, also store the OTHER
@@ -323,27 +336,45 @@ build_peak_catalog <- function(peak_params,
     if (coord_mode == "physical") {
       row$rt_seconds <- row$rt_loc   # already in seconds
       row$cv_volts   <- row$cv_loc   # already in volts
-      row$rt_frac    <- stats::median(rt_frac_ref[members])
-      row$cv_frac    <- stats::median(cv_frac_ref[members])
+      row$rt_frac    <- stats::median(rt_frac_ref[members], na.rm = TRUE)
+      row$cv_frac    <- stats::median(cv_frac_ref[members], na.rm = TRUE)
     } else if (!is.null(peak_params$rt_seconds_raw)) {
       row$rt_frac    <- row$rt_loc   # already in fraction
       row$cv_frac    <- row$cv_loc   # already in fraction
-      row$rt_seconds <- stats::median(peak_params$rt_seconds_raw[members])
-      row$cv_volts   <- stats::median(peak_params$cv_volts_raw[members])
+      row$rt_seconds <- stats::median(peak_params$rt_seconds_raw[members],
+                                       na.rm = TRUE)
+      row$cv_volts   <- stats::median(peak_params$cv_volts_raw[members],
+                                       na.rm = TRUE)
     }
     row
   })
   clusters_df <- dplyr::bind_rows(cluster_rows)
 
   # Classify into compounds / small_clusters / singletons.
+  # Reject any cluster with a non-finite coordinate OR no usable
+  # per-observation morphology draws (empty intensity_obs list) — the
+  # generator can't render these safely.
+  n_obs_valid <- vapply(clusters_df$intensity_obs, length, integer(1))
+  is_bad_coord <- !is.finite(clusters_df$rt_loc) |
+                  !is.finite(clusters_df$cv_loc) |
+                  n_obs_valid == 0L
+  if ("rt_frac" %in% names(clusters_df))
+    is_bad_coord <- is_bad_coord | !is.finite(clusters_df$rt_frac) |
+                                    !is.finite(clusters_df$cv_frac)
+  if (any(is_bad_coord)) {
+    message("build_peak_catalog: dropping ", sum(is_bad_coord),
+            " cluster(s) with non-finite coordinates or no usable ",
+            "per-observation morphology.")
+  }
   is_singleton      <- clusters_df$n_observations < 2L
   is_below_support  <- clusters_df$prevalence < min_support_frac
   is_below_size     <- clusters_df$n_observations < min_cluster_size
-  is_compound       <- !is_singleton & !is_below_support & !is_below_size
+  is_compound       <- !is_singleton & !is_below_support & !is_below_size &
+                       !is_bad_coord
 
   compounds       <- clusters_df[is_compound, ]
-  small_clusters  <- clusters_df[!is_compound & !is_singleton, ]
-  singletons      <- clusters_df[is_singleton, ]
+  small_clusters  <- clusters_df[!is_compound & !is_singleton & !is_bad_coord, ]
+  singletons      <- clusters_df[is_singleton & !is_bad_coord, ]
 
   # Re-number compounds starting from 1 for convenience.
   if (nrow(compounds) > 0L) {

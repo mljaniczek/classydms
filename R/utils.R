@@ -119,8 +119,14 @@ pick_peak_centers <- function(Z, top_k = 30, eps = NULL,
 #' @return A normalized matrix of the same shape as `Z`.
 #' @export
 normalize_sample <- function(Z, q = 0.95, eps = 1e-8) {
+  # Coerce non-finite pixels to 0 so downstream training doesn't inherit
+  # upstream NaN/Inf artifacts. This is a defensive layer — generators
+  # SHOULD not produce non-finite images (see stopifnot in the training
+  # loop), but this catches silent leaks so a single bad synthetic
+  # doesn't crash the entire pretraining run.
+  Z[!is.finite(Z)] <- 0
   Z <- log1p(Z)
-  scale <- as.numeric(stats::quantile(Z, q))
+  scale <- as.numeric(stats::quantile(Z, q, na.rm = TRUE))
   if (!is.finite(scale) || scale < eps) scale <- 1
   Z / scale
 }
