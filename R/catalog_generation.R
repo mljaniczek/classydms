@@ -755,3 +755,182 @@ catalog_biomarkers_universal_backdrop <- function(
   attr(spec, "anchor_prevalence_threshold") <- anchor_prevalence_threshold
   spec
 }
+
+#' Generate one three-layer synthetic sample for encoder pretraining
+#'
+#' Builds a synthetic GC-DMS image by stacking three layers of peaks:
+#'
+#' 1. **Anchor backbone.** Every compound in `anchor_ids` fires
+#'    unconditionally, with its own catalog morphology and normal
+#'    per-peak location / size jitter. These are the stable ~100
+#'    highly-prevalent compounds you want the encoder to treat as the
+#'    baseline landscape.
+#' 2. **Variable catalog compounds** (optional). Per-sample random
+#'    subset of the catalog's less-prevalent compounds — filtered by
+#'    `variable_config$prevalence_range` and (optionally) excluding the
+#'    anchor pool. Simulates diet-related, host-genetics-related, and
+#'    other per-person volatiles. Intensity scaled by a per-peak factor
+#'    drawn from `variable_config$intensity_scale`.
+#' 3. **Contamination** (optional). Uniform-random peaks placed at
+#'    positions NOT overlapping catalog compounds. Simulates sampling
+#'    apparatus contamination, environmental exposure, and truly
+#'    unfamiliar peaks. Sigmas drawn from the pooled catalog sigma
+#'    distribution so shapes look realistic.
+#'
+#' @param catalog A `peak_catalog` object.
+#' @param H,W Output image dimensions in pixels.
+#' @param anchor_ids Integer vector of compound_ids to force-fire.
+#'   Typically the ~100 anchors from the universal catalog with
+#'   prevalence >= 0.9.
+#' @param variable_config Optional list controlling the variable layer.
+#'   Fields:
+#'   - `n_per_sample`: scalar (fixed count) or length-2 numeric (uniform
+#'     range) for how many variable compounds to draw. Default
+#'     `c(30, 80)`.
+#'   - `prevalence_range`: length-2 numeric giving the catalog
+#'     prevalence range eligible for the variable pool. Default
+#'     `c(0.05, 0.5)`.
+#'   - `intensity_scale`: length-2 numeric giving amplitude multiplier
+#'     bounds. Default `c(0.3, 1.0)` (variable compounds slightly
+#'     dimmer than anchors on average).
+#'   - `exclude_anchors`: `TRUE` (default) — remove anchor_ids from the
+#'     variable pool so anchors don't get drawn twice.
+#'   Pass `NULL` to skip this layer.
+#' @param contamination_config Optional list controlling contamination
+#'   injection. Same fields as `off_catalog_peaks` in
+#'   [simulate_case_control_from_catalog()] except with `n_per_sample`
+#'   instead of `n_cases` / `n_controls`. Default field values:
+#'   `n_per_sample = c(5, 30)`, `rt_range = c(0.05, 0.95)`,
+#'   `cv_range = c(0.05, 0.95)`, `intensity_range = c(0.1, 0.5)`,
+#'   `exclusion_eps_rt = 0.02`, `exclusion_eps_cv = 0.05`. Pass `NULL`
+#'   to skip this layer.
+#' @param add_noise Whether to add folded-Normal background noise on
+#'   top of the three layers.
+#' @param size_jitter,location_jitter_rt,location_jitter_cv Per-peak
+#'   jitter parameters (same convention as
+#'   [generate_one_synthetic_from_catalog()]).
+#' @param noise_scale Multiplier on catalog noise SD.
+#' @return List with `clean` (H x W), `noisy` (H x W), and per-layer
+#'   composition metadata (`anchor_ids`, `variable_ids`,
+#'   `contamination_positions`).
+#' @export
+generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
+                                             variable_config = NULL,
+                                             contamination_config = NULL,
+                                             add_noise = TRUE,
+                                             size_jitter = 0.15,
+                                             location_jitter_rt = 2,
+                                             location_jitter_cv = 1,
+                                             noise_scale = 1.0) {
+  stopifnot(inherits(catalog, "peak_catalog"))
+  cmp <- catalog$compounds
+  if (!all(anchor_ids %in% cmp$compound_id)) {
+    bad <- setdiff(anchor_ids, cmp$compound_id)
+    stop("anchor_ids references compound_id(s) not in the catalog: ",
+         paste(head(bad, 5), collapse = ", "),
+         if (length(bad) > 5) "..." else "")
+  }
+
+  # Layer 2 selection — draw variable compound IDs
+  variable_ids <- integer(0)
+  variable_int_mult <- setNames(numeric(0), character(0))
+  if (!is.null(variable_config)) {
+    vc <- variable_config
+    vc$n_per_sample     <- vc$n_per_sample     %||% c(30, 80)
+    vc$prevalence_range <- vc$prevalence_range %||% c(0.05, 0.5)
+    vc$intensity_scale  <- vc$intensity_scale  %||% c(0.3, 1.0)
+    vc$exclude_anchors  <- vc$exclude_anchors  %||% TRUE
+    n_var <- if (length(vc$n_per_sample) == 1L) as.integer(vc$n_per_sample)
+             else                                as.integer(stats::runif(1,
+                                                    vc$n_per_sample[1],
+                                                    vc$n_per_sample[2] + 1))
+    eligible_mask <- cmp$prevalence >= vc$prevalence_range[1] &
+                     cmp$prevalence <= vc$prevalence_range[2]
+    if (vc$exclude_anchors)
+      eligible_mask <- eligible_mask & !(cmp$compound_id %in% anchor_ids)
+    eligible <- cmp$compound_id[eligible_mask]
+    if (length(eligible) == 0L) {
+      warning("generate_noisy_pretrain_sample: no compounds match ",
+              "variable_config$prevalence_range; skipping variable layer.")
+    } else {
+      n_take <- min(n_var, length(eligible))
+      variable_ids <- sample(eligible, size = n_take, replace = FALSE)
+      variable_int_mult <- stats::setNames(
+        stats::runif(length(variable_ids),
+                      vc$intensity_scale[1], vc$intensity_scale[2]),
+        as.character(variable_ids))
+    }
+  }
+
+  fire_ids <- c(anchor_ids, variable_ids)
+  # Force firing: prevalence_override = 1.0 for each. Anchor intensity
+  # multiplier is 1.0; variable ones use their sampled scale.
+  prev_ov <- stats::setNames(rep(1.0, length(fire_ids)),
+                              as.character(fire_ids))
+  int_ov  <- stats::setNames(rep(1.0, length(fire_ids)),
+                              as.character(fire_ids))
+  if (length(variable_int_mult))
+    int_ov[names(variable_int_mult)] <- variable_int_mult
+
+  base_res <- generate_one_synthetic_from_catalog(
+    catalog, H = H, W = W,
+    add_noise           = FALSE,
+    size_jitter         = size_jitter,
+    location_jitter_rt  = location_jitter_rt,
+    location_jitter_cv  = location_jitter_cv,
+    prevalence_override = prev_ov,
+    intensity_mult      = int_ov,
+    compound_ids        = fire_ids
+  )
+  Z <- base_res$clean
+
+  # Layer 3 — contamination injection
+  contamination_positions <- NULL
+  if (!is.null(contamination_config)) {
+    cc <- contamination_config
+    cc$n_per_sample       <- cc$n_per_sample       %||% c(5, 30)
+    cc$rt_range           <- cc$rt_range           %||% c(0.05, 0.95)
+    cc$cv_range           <- cc$cv_range           %||% c(0.05, 0.95)
+    cc$intensity_range    <- cc$intensity_range    %||% c(0.1, 0.5)
+    cc$exclusion_eps_rt   <- cc$exclusion_eps_rt   %||% 0.02
+    cc$exclusion_eps_cv   <- cc$exclusion_eps_cv   %||% 0.05
+    n_con <- if (length(cc$n_per_sample) == 1L) as.integer(cc$n_per_sample)
+             else                                as.integer(stats::runif(1,
+                                                    cc$n_per_sample[1],
+                                                    cc$n_per_sample[2] + 1))
+    if (n_con > 0L) {
+      ocp <- list(
+        rt_range = cc$rt_range, cv_range = cc$cv_range,
+        intensity_range = cc$intensity_range,
+        exclusion_eps_rt = cc$exclusion_eps_rt,
+        exclusion_eps_cv = cc$exclusion_eps_cv,
+        sigma_rt_pool = unlist(cmp$sigma_rt_obs),
+        sigma_cv_pool = unlist(cmp$sigma_cv_obs),
+        cat_rt_frac = if (!is.null(cmp$rt_frac)) cmp$rt_frac else cmp$rt_loc,
+        cat_cv_frac = if (!is.null(cmp$cv_frac)) cmp$cv_frac else cmp$cv_loc
+      )
+      inj <- inject_off_catalog(Z, ocp, H, W, n_con,
+                                  size_jitter,
+                                  location_jitter_rt,
+                                  location_jitter_cv)
+      Z <- inj$Z
+      contamination_positions <- inj$positions
+    }
+  }
+
+  noisy <- Z
+  if (add_noise && !is.null(catalog$noise) &&
+      is.finite(catalog$noise$mean) && is.finite(catalog$noise$sd)) {
+    noise_sd <- max(1e-8, catalog$noise$sd * noise_scale)
+    noise <- matrix(abs(stats::rnorm(H * W,
+                                      mean = catalog$noise$mean,
+                                      sd = noise_sd)),
+                     nrow = H, ncol = W)
+    noisy <- Z + noise
+  }
+
+  list(clean = Z, noisy = noisy,
+       anchor_ids = anchor_ids,
+       variable_ids = variable_ids,
+       contamination_positions = contamination_positions)
+}
