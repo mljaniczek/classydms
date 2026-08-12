@@ -24,6 +24,9 @@ pretrain_denoising_online(
   attribute_mode = c("joint", "marginal"),
   noise_scale = 1,
   catalog = NULL,
+  anchor_ids = NULL,
+  variable_config = NULL,
+  contamination_config = NULL,
   val_real = NULL,
   val_n = 200L,
   checkpoint_every = 10L,
@@ -93,6 +96,23 @@ the denoising autoencoder must learn to remove, which typically
 improves encoder feature quality up to some optimum
 (Vincent et al. 2008). Sweep \code{c(1, 3, 5, 10)} and pick the
 largest value that doesn't degrade real-validation MSE.}
+
+\item{anchor_ids}{Optional integer vector of catalog \code{compound_id}s.
+When provided (along with \code{catalog}), synthetic samples are
+generated via the three-layer noisy scheme (see
+\code{\link[=generate_noisy_pretrain_sample]{generate_noisy_pretrain_sample()}}) rather than the default
+catalog-prevalence firing. The anchor set fires unconditionally
+in every sample; \code{variable_config} and \code{contamination_config}
+optionally add per-sample layers on top.}
+
+\item{variable_config}{Optional list; see
+\code{\link[=generate_noisy_pretrain_sample]{generate_noisy_pretrain_sample()}}. Requires \code{anchor_ids}. Adds
+a per-sample random subset of low-prevalence catalog compounds.}
+
+\item{contamination_config}{Optional list; see
+\code{\link[=generate_noisy_pretrain_sample]{generate_noisy_pretrain_sample()}}. Requires \code{anchor_ids}. Adds
+per-sample uniform-random peaks at positions outside catalog
+compound exclusion boxes.}
 
 \item{val_real}{Optional list of real preprocessed, padded Z
 matrices (each of size \verb{H x W}) held out as a real-data

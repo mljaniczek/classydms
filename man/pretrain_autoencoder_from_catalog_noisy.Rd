@@ -2,7 +2,7 @@
 % Please edit documentation in R/pretrain.R
 \name{pretrain_autoencoder_from_catalog_noisy}
 \alias{pretrain_autoencoder_from_catalog_noisy}
-\title{Pre-train the encoder from a peak catalog using three-layer noisy samples}
+\title{Pre-train the encoder from a peak catalog using three-layer noisy samples (smoke test only)}
 \usage{
 pretrain_autoencoder_from_catalog_noisy(
   catalog,
@@ -64,6 +64,13 @@ skin-VOC characteristics: consistent backbone, per-sample dietary /
 host-genetic peaks, and contamination-like unfamiliar peaks.
 }
 \details{
+\strong{For real pretraining runs prefer
+\code{\link[=pretrain_denoising_online]{pretrain_denoising_online()}} with \code{catalog = your_catalog},
+\code{anchor_ids = ids}, and the same \code{variable_config} /
+\code{contamination_config}} — that path is online (fresh batches per
+step) so training data isn't capped at \code{n_synthetic}. This pre-alloc
+version stays available for smoke tests.
+
 To reproduce the current \code{pretrain_autoencoder_from_catalog()}
 behavior, pass \code{variable_config = NULL} and \code{contamination_config = NULL}
 — the samples will contain only the anchor set (fired at 100 percent).

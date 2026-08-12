@@ -93,12 +93,21 @@ pretrain_autoencoder <- function(peak_params, H, W,
 #' @export
 pretrain_denoising <- pretrain_autoencoder
 
-#' Pre-train the encoder from a peak catalog
+#' Pre-train the encoder from a peak catalog (smoke test only)
 #'
 #' Same idea as [pretrain_autoencoder()] but generates the synthetic
 #' pretraining set via [generate_one_synthetic_from_catalog()]. Use
 #' this when you have a catalog (perhaps loaded from disk) but not the
 #' original `peak_params` object.
+#'
+#' **For real pretraining runs prefer
+#' [pretrain_denoising_online()] with `catalog = your_catalog`** — that
+#' generates fresh batches per training step, so the model can see
+#' effectively unlimited unique synthetic samples with constant memory.
+#' This pre-alloc version holds the full `n_synthetic` × H × W tensor
+#' in RAM and reuses the same set every epoch, which caps the effective
+#' training data. It stays available for smoke tests
+#' (`n_synthetic <= a few thousand`).
 #'
 #' @param catalog A `peak_catalog` object.
 #' @param H,W Synthetic image dimensions.
@@ -243,6 +252,20 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   improves encoder feature quality up to some optimum
 #'   (Vincent et al. 2008). Sweep `c(1, 3, 5, 10)` and pick the
 #'   largest value that doesn't degrade real-validation MSE.
+#' @param anchor_ids Optional integer vector of catalog `compound_id`s.
+#'   When provided (along with `catalog`), synthetic samples are
+#'   generated via the three-layer noisy scheme (see
+#'   [generate_noisy_pretrain_sample()]) rather than the default
+#'   catalog-prevalence firing. The anchor set fires unconditionally
+#'   in every sample; `variable_config` and `contamination_config`
+#'   optionally add per-sample layers on top.
+#' @param variable_config Optional list; see
+#'   [generate_noisy_pretrain_sample()]. Requires `anchor_ids`. Adds
+#'   a per-sample random subset of low-prevalence catalog compounds.
+#' @param contamination_config Optional list; see
+#'   [generate_noisy_pretrain_sample()]. Requires `anchor_ids`. Adds
+#'   per-sample uniform-random peaks at positions outside catalog
+#'   compound exclusion boxes.
 #' @param val_real Optional list of real preprocessed, padded Z
 #'   matrices (each of size `H x W`) held out as a real-data
 #'   validation set. When provided, an additional per-epoch metric
@@ -306,6 +329,9 @@ pretrain_denoising_online <- function(peak_params, H, W,
                                                           "marginal"),
                                        noise_scale = 1.0,
                                        catalog = NULL,
+                                       anchor_ids = NULL,
+                                       variable_config = NULL,
+                                       contamination_config = NULL,
                                        val_real = NULL,
                                        val_n = 200L,
                                        checkpoint_every = 10L,
@@ -324,6 +350,23 @@ pretrain_denoising_online <- function(peak_params, H, W,
   }
   if (!is.null(catalog)) {
     stopifnot(inherits(catalog, "peak_catalog"))
+  }
+  # Noisy three-layer mode requires catalog + anchor_ids. variable_config
+  # and contamination_config are then optional and default to NULL each.
+  use_noisy <- !is.null(anchor_ids)
+  if (use_noisy) {
+    if (is.null(catalog))
+      stop("pretrain_denoising_online: anchor_ids requires catalog.")
+    if (!all(anchor_ids %in% catalog$compounds$compound_id)) {
+      bad <- setdiff(anchor_ids, catalog$compounds$compound_id)
+      stop("anchor_ids references compound_id(s) not in the catalog: ",
+           paste(head(bad, 5), collapse = ", "),
+           if (length(bad) > 5) "..." else "")
+    }
+  }
+  if ((!is.null(variable_config) || !is.null(contamination_config)) &&
+      !use_noisy) {
+    stop("variable_config / contamination_config require anchor_ids.")
   }
   if (!is.null(num_threads)) {
     torch::torch_set_num_threads(as.integer(num_threads))
@@ -362,7 +405,13 @@ pretrain_denoising_online <- function(peak_params, H, W,
   message("  R-side data workers: ", num_workers,
           if (use_parallel) " (parallel via mclapply)" else " (serial)")
   message("  Source: ",
-          if (!is.null(catalog))
+          if (use_noisy)
+            paste0("peak_catalog three-layer (", nrow(catalog$compounds),
+                   " compounds, ", length(anchor_ids), " anchors",
+                   if (!is.null(variable_config))     ", +variable"     else "",
+                   if (!is.null(contamination_config)) ", +contamination" else "",
+                   ")")
+          else if (!is.null(catalog))
             paste0("peak_catalog (", nrow(catalog$compounds), " compounds)")
           else "peak_params")
   message("  size_jitter: ", size_jitter)
@@ -447,7 +496,17 @@ pretrain_denoising_online <- function(peak_params, H, W,
   # default uses L'Ecuyer-CMRG streams so workers produce independent
   # synthetic samples without colliding RNG states.
   generate_one_pair <- function(i) {
-    pair <- if (!is.null(catalog)) {
+    pair <- if (use_noisy) {
+      generate_noisy_pretrain_sample(catalog, H, W,
+                                       anchor_ids = anchor_ids,
+                                       variable_config = variable_config,
+                                       contamination_config = contamination_config,
+                                       add_noise = add_noise,
+                                       size_jitter = size_jitter,
+                                       location_jitter_rt = location_jitter_rt,
+                                       location_jitter_cv = location_jitter_cv,
+                                       noise_scale = noise_scale)
+    } else if (!is.null(catalog)) {
       generate_one_synthetic_from_catalog(catalog, H, W,
                                     add_noise = add_noise,
                                     size_jitter = size_jitter,
@@ -703,7 +762,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
        batch_loss_stats = batch_loss_stats, total_samples = total_samples)
 }
 
-#' Pre-train the encoder from a peak catalog using three-layer noisy samples
+#' Pre-train the encoder from a peak catalog using three-layer noisy samples (smoke test only)
 #'
 #' Same training loop as [pretrain_autoencoder_from_catalog()] but each
 #' synthetic sample is generated via
@@ -712,6 +771,13 @@ pretrain_denoising_online <- function(peak_params, H, W,
 #' variability is intended to teach the encoder to expect real-world
 #' skin-VOC characteristics: consistent backbone, per-sample dietary /
 #' host-genetic peaks, and contamination-like unfamiliar peaks.
+#'
+#' **For real pretraining runs prefer
+#' [pretrain_denoising_online()] with `catalog = your_catalog`,
+#' `anchor_ids = ids`, and the same `variable_config` /
+#' `contamination_config`** — that path is online (fresh batches per
+#' step) so training data isn't capped at `n_synthetic`. This pre-alloc
+#' version stays available for smoke tests.
 #'
 #' To reproduce the current `pretrain_autoencoder_from_catalog()`
 #' behavior, pass `variable_config = NULL` and `contamination_config = NULL`

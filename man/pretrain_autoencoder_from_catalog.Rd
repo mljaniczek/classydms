@@ -2,7 +2,7 @@
 % Please edit documentation in R/pretrain.R
 \name{pretrain_autoencoder_from_catalog}
 \alias{pretrain_autoencoder_from_catalog}
-\title{Pre-train the encoder from a peak catalog}
+\title{Pre-train the encoder from a peak catalog (smoke test only)}
 \usage{
 pretrain_autoencoder_from_catalog(
   catalog,
@@ -46,4 +46,14 @@ Same idea as \code{\link[=pretrain_autoencoder]{pretrain_autoencoder()}} but gen
 pretraining set via \code{\link[=generate_one_synthetic_from_catalog]{generate_one_synthetic_from_catalog()}}. Use
 this when you have a catalog (perhaps loaded from disk) but not the
 original \code{peak_params} object.
+}
+\details{
+\strong{For real pretraining runs prefer
+\code{\link[=pretrain_denoising_online]{pretrain_denoising_online()}} with \code{catalog = your_catalog}} — that
+generates fresh batches per training step, so the model can see
+effectively unlimited unique synthetic samples with constant memory.
+This pre-alloc version holds the full \code{n_synthetic} × H × W tensor
+in RAM and reuses the same set every epoch, which caps the effective
+training data. It stays available for smoke tests
+(\verb{n_synthetic <= a few thousand}).
 }
