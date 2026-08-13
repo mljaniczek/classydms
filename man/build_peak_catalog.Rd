@@ -10,7 +10,8 @@ build_peak_catalog(
   eps_cv = 0.05,
   min_support_frac = 0.1,
   min_cluster_size = 2L,
-  coord_mode = c("fraction", "physical")
+  coord_mode = c("fraction", "physical"),
+  align = FALSE
 )
 }
 \arguments{
@@ -30,6 +31,17 @@ samples.}
 \item{min_cluster_size}{Minimum number of pool peaks in a cluster
 for compound status. Default \code{2L} (excludes singletons from
 compounds regardless of support).}
+
+\item{align}{Optional per-sample drift correction applied to
+\code{peak_params} before clustering. \code{FALSE} (default) skips
+alignment. \code{TRUE} calls \code{\link[=align_via_catalog]{align_via_catalog()}} with sensible
+defaults (\code{eps_rt_loose = 3 * eps_rt}, \code{eps_cv_loose = 3 * eps_cv},
+\code{min_support_frac = min_support_frac}, \code{iterate = TRUE},
+\code{max_iter = 3L}). Pass a named list to override any of those.
+Alignment is idempotent and safe to leave off if drift is small;
+see the compactness-delta table in
+\code{compare_all_catalogs.Rmd} for how to decide whether it helps
+on your cohort.}
 }
 \value{
 An object of class \code{peak_catalog} with fields:

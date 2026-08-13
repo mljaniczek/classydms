@@ -217,13 +217,41 @@ subset_peak_params <- function(peak_params, sample_indices) {
 #'   \item{singletons}{same schema, for clusters of size 1.}
 #'   \item{parameters}{the settings used to build the catalog.}
 #' }
+#' @param align Optional per-sample drift correction applied to
+#'   `peak_params` before clustering. `FALSE` (default) skips
+#'   alignment. `TRUE` calls [align_via_catalog()] with sensible
+#'   defaults (`eps_rt_loose = 3 * eps_rt`, `eps_cv_loose = 3 * eps_cv`,
+#'   `min_support_frac = min_support_frac`, `iterate = TRUE`,
+#'   `max_iter = 3L`). Pass a named list to override any of those.
+#'   Alignment is idempotent and safe to leave off if drift is small;
+#'   see the compactness-delta table in
+#'   `compare_all_catalogs.Rmd` for how to decide whether it helps
+#'   on your cohort.
 #' @export
 build_peak_catalog <- function(peak_params,
                                 eps_rt = 0.01, eps_cv = 0.05,
                                 min_support_frac = 0.10,
                                 min_cluster_size = 2L,
-                                coord_mode = c("fraction", "physical")) {
+                                coord_mode = c("fraction", "physical"),
+                                align = FALSE) {
   coord_mode <- match.arg(coord_mode)
+  if (!isFALSE(align)) {
+    align_args <- if (isTRUE(align)) list() else align
+    if (!is.list(align_args))
+      stop("build_peak_catalog: `align` must be FALSE, TRUE, or a ",
+           "named list of align_via_catalog parameters.")
+    align_args$eps_rt_loose     <- align_args$eps_rt_loose     %||% (3 * eps_rt)
+    align_args$eps_cv_loose     <- align_args$eps_cv_loose     %||% (3 * eps_cv)
+    align_args$min_support_frac <- align_args$min_support_frac %||% min_support_frac
+    align_args$iterate          <- align_args$iterate          %||% TRUE
+    align_args$max_iter         <- align_args$max_iter         %||% 3L
+    align_args$verbose          <- align_args$verbose          %||% FALSE
+    message("build_peak_catalog: running align_via_catalog ",
+            "(eps_rt_loose = ", align_args$eps_rt_loose,
+            ", eps_cv_loose = ", align_args$eps_cv_loose, ") ...")
+    peak_params <- do.call(align_via_catalog,
+                            c(list(peak_params = peak_params), align_args))
+  }
   needed <- c("rt_loc_raw", "cv_loc_raw", "sample_idx_raw",
               "sigma_rt_raw", "sigma_cv_raw", "intensity_raw",
               "n_samples")
@@ -654,6 +682,17 @@ merge_peak_params <- function(pp_list) {
 #'   sample set — a compound must span at least this fraction of the
 #'   total N samples.
 #' @param min_cluster_size Minimum peaks per cluster.
+#' @param align Optional cross-cohort drift correction. `FALSE` (default)
+#'   skips alignment. `TRUE` calls [align_across_cohorts()] on
+#'   `pp_list` with sensible defaults (`eps_rt_loose = 3 * eps_rt`,
+#'   `eps_cv_loose = 3 * eps_cv`, `min_support_frac = min_support_frac`,
+#'   `iterate = TRUE`, `max_iter = 3L`), then builds the universal
+#'   catalog on the aligned cohorts. Corrects BOTH intra-cohort and
+#'   inter-cohort drift in one step. Pass a named list to override
+#'   any of those. Setting `align = TRUE` is a defensible answer to
+#'   reviewer concerns about systematic per-sample or per-batch
+#'   drift; the compactness-delta table in `compare_all_catalogs.Rmd`
+#'   shows whether it helped on your cohorts.
 #' @return A `peak_catalog` object with a `per_source_prevalence`
 #'   list-column on `compounds` giving cohort-level prevalence, and
 #'   `source_names` / `source_n_samples` fields in `parameters`.
@@ -662,8 +701,26 @@ build_universal_catalog <- function(pp_list,
                                      eps_rt = 0.01, eps_cv = 0.05,
                                      min_support_frac = 0.10,
                                      min_cluster_size = 2L,
-                                     coord_mode = c("fraction", "physical")) {
+                                     coord_mode = c("fraction", "physical"),
+                                     align = FALSE) {
   coord_mode <- match.arg(coord_mode)
+  if (!isFALSE(align)) {
+    align_args <- if (isTRUE(align)) list() else align
+    if (!is.list(align_args))
+      stop("build_universal_catalog: `align` must be FALSE, TRUE, or ",
+           "a named list of align_across_cohorts parameters.")
+    align_args$eps_rt_loose     <- align_args$eps_rt_loose     %||% (3 * eps_rt)
+    align_args$eps_cv_loose     <- align_args$eps_cv_loose     %||% (3 * eps_cv)
+    align_args$min_support_frac <- align_args$min_support_frac %||% min_support_frac
+    align_args$iterate          <- align_args$iterate          %||% TRUE
+    align_args$max_iter         <- align_args$max_iter         %||% 3L
+    align_args$verbose          <- align_args$verbose          %||% FALSE
+    message("build_universal_catalog: running align_across_cohorts ",
+            "(eps_rt_loose = ", align_args$eps_rt_loose,
+            ", eps_cv_loose = ", align_args$eps_cv_loose, ") ...")
+    pp_list <- do.call(align_across_cohorts,
+                        c(list(pp_list = pp_list), align_args))
+  }
   merged <- merge_peak_params(pp_list)
   # Also merge physical fields if all sources have them
   if (coord_mode == "physical" ||

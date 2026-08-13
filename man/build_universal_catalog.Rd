@@ -10,7 +10,8 @@ build_universal_catalog(
   eps_cv = 0.05,
   min_support_frac = 0.1,
   min_cluster_size = 2L,
-  coord_mode = c("fraction", "physical")
+  coord_mode = c("fraction", "physical"),
+  align = FALSE
 )
 }
 \arguments{
@@ -23,6 +24,18 @@ sample set — a compound must span at least this fraction of the
 total N samples.}
 
 \item{min_cluster_size}{Minimum peaks per cluster.}
+
+\item{align}{Optional cross-cohort drift correction. \code{FALSE} (default)
+skips alignment. \code{TRUE} calls \code{\link[=align_across_cohorts]{align_across_cohorts()}} on
+\code{pp_list} with sensible defaults (\code{eps_rt_loose = 3 * eps_rt},
+\code{eps_cv_loose = 3 * eps_cv}, \code{min_support_frac = min_support_frac},
+\code{iterate = TRUE}, \code{max_iter = 3L}), then builds the universal
+catalog on the aligned cohorts. Corrects BOTH intra-cohort and
+inter-cohort drift in one step. Pass a named list to override
+any of those. Setting \code{align = TRUE} is a defensible answer to
+reviewer concerns about systematic per-sample or per-batch
+drift; the compactness-delta table in \code{compare_all_catalogs.Rmd}
+shows whether it helped on your cohorts.}
 }
 \value{
 A \code{peak_catalog} object with a \code{per_source_prevalence}
