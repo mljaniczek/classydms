@@ -142,14 +142,20 @@ cores contribute less per thread. Default \code{NULL} leaves torch's
 automatic choice in place.}
 
 \item{num_workers}{Number of parallel workers for R-side synthetic
-data generation (default \code{1L} = serial). On Unix/macOS, values > 1
-use \code{parallel::mclapply} to generate the per-batch synthetic
-samples in parallel via fork. Most useful on GPU/MPS backends
-where the GPU is otherwise waiting on R between batches. A
-reasonable choice on a chip with N performance cores is
-\code{num_workers = N - 2} (leaving a couple cores for the GPU's
-communication threads, BLAS, and the OS). On Windows this
-argument is ignored and generation falls back to serial.}
+data generation (default \code{1L} = serial). When > 1, uses
+\code{future.apply::future_lapply} with a \code{future::multisession} plan
+— fresh R processes (not fork), so it side-steps the macOS
+libtorch fork crash where \code{mclapply} children inherit poisoned
+threadpool mutexes. Cross-platform (Linux, macOS, Windows) and
+handles global-variable discovery automatically. Most useful on
+GPU / MPS backends where the GPU is otherwise waiting on R
+between batches. A reasonable choice on a chip with N performance
+cores is \code{num_workers = N - 2} (leaving a couple cores for the
+GPU's communication threads, BLAS, and the OS). Each worker task
+gets an independent L'Ecuyer-CMRG substream via
+\code{future.seed = TRUE} for reproducibility. Requires the \code{future}
+and \code{future.apply} packages when > 1; falls back to serial with
+a message if either is missing.}
 
 \item{save_path}{If non-NULL, writes encoder, autoencoder, and manifest
 to disk after every epoch (so a mid-run crash leaves recoverable

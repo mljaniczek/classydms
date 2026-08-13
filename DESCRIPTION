@@ -34,7 +34,9 @@ Imports:
     zoo,
     pROC,
     coro,
-    purrr
+    purrr,
+    future,
+    future.apply
 Suggests:
     piggyback,
     pheatmap,

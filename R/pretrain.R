@@ -287,14 +287,20 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   cores contribute less per thread. Default `NULL` leaves torch's
 #'   automatic choice in place.
 #' @param num_workers Number of parallel workers for R-side synthetic
-#'   data generation (default `1L` = serial). On Unix/macOS, values > 1
-#'   use `parallel::mclapply` to generate the per-batch synthetic
-#'   samples in parallel via fork. Most useful on GPU/MPS backends
-#'   where the GPU is otherwise waiting on R between batches. A
-#'   reasonable choice on a chip with N performance cores is
-#'   `num_workers = N - 2` (leaving a couple cores for the GPU's
-#'   communication threads, BLAS, and the OS). On Windows this
-#'   argument is ignored and generation falls back to serial.
+#'   data generation (default `1L` = serial). When > 1, uses
+#'   `future.apply::future_lapply` with a `future::multisession` plan
+#'   — fresh R processes (not fork), so it side-steps the macOS
+#'   libtorch fork crash where `mclapply` children inherit poisoned
+#'   threadpool mutexes. Cross-platform (Linux, macOS, Windows) and
+#'   handles global-variable discovery automatically. Most useful on
+#'   GPU / MPS backends where the GPU is otherwise waiting on R
+#'   between batches. A reasonable choice on a chip with N performance
+#'   cores is `num_workers = N - 2` (leaving a couple cores for the
+#'   GPU's communication threads, BLAS, and the OS). Each worker task
+#'   gets an independent L'Ecuyer-CMRG substream via
+#'   `future.seed = TRUE` for reproducibility. Requires the `future`
+#'   and `future.apply` packages when > 1; falls back to serial with
+#'   a message if either is missing.
 #' @param save_path If non-NULL, writes encoder, autoencoder, and manifest
 #'   to disk after every epoch (so a mid-run crash leaves recoverable
 #'   artifacts).
@@ -310,7 +316,7 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #' @return List with `encoder`, `autoencoder`, `loss_history`,
 #'   `val_loss_history`, `batch_loss_stats`, and `total_samples`.
 #' @export
-pretrain_denoising_online <- function(peak_params, H, W,
+pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        steps_per_epoch = 500L,
                                        epochs = 30L,
                                        batch_size = 32L,
@@ -371,18 +377,33 @@ pretrain_denoising_online <- function(peak_params, H, W,
   if (!is.null(num_threads)) {
     torch::torch_set_num_threads(as.integer(num_threads))
   }
-  # Validate num_workers and downgrade to serial on Windows.
+  # Parallel data-generation workers.
+  #
+  # Fork-based `parallel::mclapply` is unsafe here on macOS: libtorch's
+  # internal threadpool mutexes don't survive fork(), and the child
+  # processes hit `mutex lock failed: Invalid argument` on the first
+  # batch. Use `future.apply::future_lapply` with `future::multisession`
+  # instead — fresh R processes (not fork), globals resolved
+  # automatically, no shared libtorch state to poison. Slightly higher
+  # per-worker startup than fork on Linux but negligible over a
+  # multi-epoch pretraining run.
   num_workers <- as.integer(num_workers)
-  if (.Platform$OS.type != "unix" && num_workers > 1L) {
-    message("num_workers > 1 requested but fork-based parallelism ",
-            "is Unix/macOS only. Falling back to serial.")
-    num_workers <- 1L
-  }
   use_parallel <- num_workers > 1L
-  if (use_parallel && !requireNamespace("parallel", quietly = TRUE)) {
-    message("Package 'parallel' not available; falling back to serial.")
-    use_parallel <- FALSE
-    num_workers <- 1L
+  if (use_parallel) {
+    if (!requireNamespace("future", quietly = TRUE) ||
+        !requireNamespace("future.apply", quietly = TRUE)) {
+      message("num_workers > 1 requires the `future` and ",
+              "`future.apply` packages. Install with ",
+              "`install.packages(c('future', 'future.apply'))`. ",
+              "Falling back to serial.")
+      use_parallel <- FALSE
+      num_workers <- 1L
+    } else {
+      # Multisession = fresh R processes on any platform. Save the
+      # caller's plan so we don't clobber their outer future config.
+      old_plan <- future::plan(future::multisession, workers = num_workers)
+      on.exit(future::plan(old_plan), add = TRUE)
+    }
   }
   location_mode  <- match.arg(location_mode)
   attribute_mode <- match.arg(attribute_mode)
@@ -403,7 +424,7 @@ pretrain_denoising_online <- function(peak_params, H, W,
           else "")
   message("  CPU threads (torch): ", torch::torch_get_num_threads())
   message("  R-side data workers: ", num_workers,
-          if (use_parallel) " (parallel via mclapply)" else " (serial)")
+          if (use_parallel) " (parallel via future::multisession)" else " (serial)")
   message("  Source: ",
           if (use_noisy)
             paste0("peak_catalog three-layer (", nrow(catalog$compounds),
@@ -491,10 +512,11 @@ pretrain_denoising_online <- function(peak_params, H, W,
   loss_fn <- torch::nn_mse_loss()
 
   # generate_batch: builds clean + noisy synthetic batches. When
-  # use_parallel = TRUE, the per-sample loop is parallelized via
-  # parallel::mclapply (fork-based on Unix/macOS). The mc.set.seed
-  # default uses L'Ecuyer-CMRG streams so workers produce independent
-  # synthetic samples without colliding RNG states.
+  # use_parallel = TRUE, the per-sample loop is dispatched to
+  # `num_workers` fresh R processes via future.apply::future_lapply
+  # backed by future::multisession. Each task gets an independent
+  # L'Ecuyer-CMRG substream (via future.seed = TRUE) so worker samples
+  # are independent and reproducible.
   generate_one_pair <- function(i) {
     pair <- if (use_noisy) {
       generate_noisy_pretrain_sample(catalog, H, W,
@@ -538,9 +560,10 @@ pretrain_denoising_online <- function(peak_params, H, W,
 
   generate_batch <- function(n = batch_size) {
     pairs <- if (use_parallel) {
-      parallel::mclapply(seq_len(n), generate_one_pair,
-                          mc.cores = num_workers,
-                          mc.set.seed = TRUE)
+      # future.seed = TRUE gives each parallel task an independent
+      # L'Ecuyer-CMRG substream, so worker samples don't collide.
+      future.apply::future_lapply(seq_len(n), generate_one_pair,
+                                    future.seed = TRUE)
     } else {
       lapply(seq_len(n), generate_one_pair)
     }
