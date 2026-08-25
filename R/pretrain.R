@@ -266,6 +266,24 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   [generate_noisy_pretrain_sample()]. Requires `anchor_ids`. Adds
 #'   per-sample uniform-random peaks at positions outside catalog
 #'   compound exclusion boxes.
+#' @param clean_layers,noise_layers Optional character vectors naming
+#'   which of the three catalog layers (`"anchors"`, `"variable"`,
+#'   `"contamination"`) go into the CLEAN target vs. only into the
+#'   NOISY input. Default `NULL / NULL` uses the returned
+#'   `pair$clean` and `pair$noisy` directly, which is the current
+#'   behavior where all three layers are in the clean target and only
+#'   sensor noise (from `noise_scale`) is corruption. Setting either
+#'   switches to split-layer denoising: `Z_clean = sum of clean_layers`
+#'   and `Z_noisy = Z_clean + sum of noise_layers + sensor_noise`.
+#'   Recommended recipe for skin GC-DMS pretraining:
+#'   `clean_layers = c("anchors", "variable")`,
+#'   `noise_layers = c("contamination")`, plus a stronger
+#'   `contamination_config` (say 30–100 peaks, intensity 0.3–1.0) and
+#'   `noise_scale` bumped ~2×. This teaches the encoder to strip
+#'   apparatus contamination and unfamiliar peaks while preserving
+#'   the catalog compound structure — the actual denoising objective
+#'   the training loss is measuring. Layers can't appear in both
+#'   vectors; naming a layer whose config is `NULL` produces a warning.
 #' @param val_real Optional list of real preprocessed, padded Z
 #'   matrices (each of size `H x W`) held out as a real-data
 #'   validation set. When provided, an additional per-epoch metric
@@ -338,6 +356,8 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        anchor_ids = NULL,
                                        variable_config = NULL,
                                        contamination_config = NULL,
+                                       clean_layers = NULL,
+                                       noise_layers = NULL,
                                        val_real = NULL,
                                        val_n = 200L,
                                        checkpoint_every = 10L,
@@ -373,6 +393,45 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   if ((!is.null(variable_config) || !is.null(contamination_config)) &&
       !use_noisy) {
     stop("variable_config / contamination_config require anchor_ids.")
+  }
+  # Split-layer denoising: when clean_layers or noise_layers is set,
+  # compose the clean target and the noisy input from named layers of
+  # the returned sample rather than using the default pair$clean /
+  # pair$noisy. Enables true denoising (contamination as corruption
+  # the encoder must strip, not signal to preserve).
+  valid_layer_names <- c("anchors", "variable", "contamination")
+  split_layers <- !is.null(clean_layers) || !is.null(noise_layers)
+  if (split_layers) {
+    if (!use_noisy)
+      stop("clean_layers / noise_layers require anchor_ids ",
+           "(the three-layer noisy path).")
+    if (is.null(clean_layers)) clean_layers <- valid_layer_names
+    if (is.null(noise_layers)) noise_layers <- character(0)
+    bad_cl <- setdiff(clean_layers, valid_layer_names)
+    bad_nl <- setdiff(noise_layers, valid_layer_names)
+    if (length(bad_cl) || length(bad_nl))
+      stop("Unknown layer name(s): ",
+           paste(unique(c(bad_cl, bad_nl)), collapse = ", "),
+           ". Valid: ", paste(valid_layer_names, collapse = ", "), ".")
+    overlap <- intersect(clean_layers, noise_layers)
+    if (length(overlap))
+      stop("Layer(s) in BOTH clean_layers and noise_layers ",
+           "(contradictory objective): ",
+           paste(overlap, collapse = ", "), ".")
+    # Warn if user names a layer whose config wasn't passed — the layer
+    # will always render as zeros, which usually isn't what they meant.
+    layer_configured <- c(
+      anchors       = TRUE,
+      variable      = !is.null(variable_config),
+      contamination = !is.null(contamination_config)
+    )
+    named <- unique(c(clean_layers, noise_layers))
+    missing_cfg <- named[!layer_configured[named]]
+    if (length(missing_cfg))
+      warning("clean_layers / noise_layers name(s) ",
+              paste(missing_cfg, collapse = ", "),
+              " but the corresponding config is NULL; those layers will ",
+              "contribute zeros.")
   }
   if (!is.null(num_threads)) {
     torch::torch_set_num_threads(as.integer(num_threads))
@@ -435,6 +494,14 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
           else if (!is.null(catalog))
             paste0("peak_catalog (", nrow(catalog$compounds), " compounds)")
           else "peak_params")
+  if (split_layers) {
+    message("  Denoising split — clean_layers: {",
+            paste(clean_layers, collapse = ", "),
+            "}, noise_layers: {",
+            if (length(noise_layers)) paste(noise_layers, collapse = ", ")
+            else "(none)",
+            "}, sensor_noise: noisy-only")
+  }
   message("  size_jitter: ", size_jitter)
   message("  dust_threshold: ", dust_threshold,
           if (dust_threshold > 0)
@@ -544,6 +611,21 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                     location_jitter_cv = location_jitter_cv,
                                     attribute_mode = attribute_mode,
                                     noise_scale = noise_scale)
+    }
+    # Split-layer denoising: compose Z_clean and Z_noisy from the
+    # per-layer matrices returned by generate_noisy_pretrain_sample.
+    # Sensor noise is always in Z_noisy only (i.e. always corruption)
+    # so the encoder can never learn to preserve it.
+    if (split_layers) {
+      zero <- matrix(0, nrow = H, ncol = W)
+      add_layers <- function(names_vec) {
+        Reduce(`+`, pair$layers[names_vec], init = zero)
+      }
+      Z_clean       <- add_layers(clean_layers)
+      Z_noise_add   <- add_layers(noise_layers)
+      Z_sensor      <- pair$layers$sensor_noise
+      pair$clean <- Z_clean
+      pair$noisy <- Z_clean + Z_noise_add + Z_sensor
     }
     # Dust thresholding matches real-data preprocessing (see
     # baseline_basement) so synthetic samples have the same sparsity

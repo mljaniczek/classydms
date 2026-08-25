@@ -5,7 +5,7 @@
 \title{Pre-train the encoder via online denoising autoencoder}
 \usage{
 pretrain_denoising_online(
-  peak_params,
+  peak_params = NULL,
   H,
   W,
   steps_per_epoch = 500L,
@@ -27,6 +27,8 @@ pretrain_denoising_online(
   anchor_ids = NULL,
   variable_config = NULL,
   contamination_config = NULL,
+  clean_layers = NULL,
+  noise_layers = NULL,
   val_real = NULL,
   val_n = 200L,
   checkpoint_every = 10L,
@@ -113,6 +115,25 @@ a per-sample random subset of low-prevalence catalog compounds.}
 \code{\link[=generate_noisy_pretrain_sample]{generate_noisy_pretrain_sample()}}. Requires \code{anchor_ids}. Adds
 per-sample uniform-random peaks at positions outside catalog
 compound exclusion boxes.}
+
+\item{clean_layers, noise_layers}{Optional character vectors naming
+which of the three catalog layers (\code{"anchors"}, \code{"variable"},
+\code{"contamination"}) go into the CLEAN target vs. only into the
+NOISY input. Default \code{NULL / NULL} uses the returned
+\code{pair$clean} and \code{pair$noisy} directly, which is the current
+behavior where all three layers are in the clean target and only
+sensor noise (from \code{noise_scale}) is corruption. Setting either
+switches to split-layer denoising: \verb{Z_clean = sum of clean_layers}
+and \verb{Z_noisy = Z_clean + sum of noise_layers + sensor_noise}.
+Recommended recipe for skin GC-DMS pretraining:
+\code{clean_layers = c("anchors", "variable")},
+\code{noise_layers = c("contamination")}, plus a stronger
+\code{contamination_config} (say 30–100 peaks, intensity 0.3–1.0) and
+\code{noise_scale} bumped ~2×. This teaches the encoder to strip
+apparatus contamination and unfamiliar peaks while preserving
+the catalog compound structure — the actual denoising objective
+the training loss is measuring. Layers can't appear in both
+vectors; naming a layer whose config is \code{NULL} produces a warning.}
 
 \item{val_real}{Optional list of real preprocessed, padded Z
 matrices (each of size \verb{H x W}) held out as a real-data

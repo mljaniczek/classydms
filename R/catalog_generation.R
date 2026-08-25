@@ -928,29 +928,38 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
     }
   }
 
-  fire_ids <- c(anchor_ids, variable_ids)
-  # Force firing: prevalence_override = 1.0 for each. Anchor intensity
-  # multiplier is 1.0; variable ones use their sampled scale.
-  prev_ov <- stats::setNames(rep(1.0, length(fire_ids)),
-                              as.character(fire_ids))
-  int_ov  <- stats::setNames(rep(1.0, length(fire_ids)),
-                              as.character(fire_ids))
-  if (length(variable_int_mult))
-    int_ov[names(variable_int_mult)] <- variable_int_mult
+  # Render anchors and variable as SEPARATE layers so callers can
+  # compose them independently (see clean_layers / noise_layers in
+  # pretrain_denoising_online — needed for a proper denoising loss).
+  render_layer <- function(ids, int_mult) {
+    if (length(ids) == 0L) return(matrix(0, nrow = H, ncol = W))
+    prev_ov_l <- stats::setNames(rep(1.0, length(ids)),
+                                   as.character(ids))
+    int_ov_l  <- stats::setNames(rep(1.0, length(ids)),
+                                   as.character(ids))
+    if (length(int_mult))
+      int_ov_l[names(int_mult)] <- int_mult
+    res <- generate_one_synthetic_from_catalog(
+      catalog, H = H, W = W,
+      add_noise           = FALSE,
+      size_jitter         = size_jitter,
+      location_jitter_rt  = location_jitter_rt,
+      location_jitter_cv  = location_jitter_cv,
+      prevalence_override = prev_ov_l,
+      intensity_mult      = int_ov_l,
+      compound_ids        = ids
+    )
+    res$clean
+  }
+  Z_anchors  <- render_layer(anchor_ids, setNames(numeric(0), character(0)))
+  Z_variable <- render_layer(variable_ids, variable_int_mult)
 
-  base_res <- generate_one_synthetic_from_catalog(
-    catalog, H = H, W = W,
-    add_noise           = FALSE,
-    size_jitter         = size_jitter,
-    location_jitter_rt  = location_jitter_rt,
-    location_jitter_cv  = location_jitter_cv,
-    prevalence_override = prev_ov,
-    intensity_mult      = int_ov,
-    compound_ids        = fire_ids
-  )
-  Z <- base_res$clean
+  Z <- Z_anchors + Z_variable
 
-  # Layer 3 — contamination injection
+  # Layer 3 — contamination injection. Rendered onto a zero canvas so we
+  # can return it as an independent layer, then added to Z for the
+  # combined image the current caller expects.
+  Z_contamination <- matrix(0, nrow = H, ncol = W)
   contamination_positions <- NULL
   if (!is.null(contamination_config)) {
     cc <- contamination_config
@@ -985,15 +994,18 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
         # sample rather than blowing up the training loop.
         n_con <- 0L
       }
-      inj <- inject_off_catalog(Z, ocp, H, W, n_con,
+      inj <- inject_off_catalog(matrix(0, nrow = H, ncol = W),
+                                  ocp, H, W, n_con,
                                   size_jitter,
                                   location_jitter_rt,
                                   location_jitter_cv)
-      Z <- inj$Z
+      Z_contamination <- inj$Z
+      Z <- Z + Z_contamination
       contamination_positions <- inj$positions
     }
   }
 
+  Z_sensor_noise <- matrix(0, nrow = H, ncol = W)
   noisy <- Z
   if (add_noise && !is.null(catalog$noise) &&
       is.finite(catalog$noise$mean) && is.finite(catalog$noise$sd)) {
@@ -1001,11 +1013,11 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
     noise_mean <- catalog$noise$mean
     if (!is.finite(noise_sd))   noise_sd   <- 1e-8
     if (!is.finite(noise_mean)) noise_mean <- 0
-    noise <- matrix(abs(stats::rnorm(H * W,
-                                      mean = noise_mean,
-                                      sd = noise_sd)),
-                     nrow = H, ncol = W)
-    noisy <- Z + noise
+    Z_sensor_noise <- matrix(abs(stats::rnorm(H * W,
+                                                mean = noise_mean,
+                                                sd = noise_sd)),
+                              nrow = H, ncol = W)
+    noisy <- Z + Z_sensor_noise
   }
   stopifnot(
     "generate_noisy_pretrain_sample produced non-finite pixels" =
@@ -1014,5 +1026,11 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
   list(clean = Z, noisy = noisy,
        anchor_ids = anchor_ids,
        variable_ids = variable_ids,
-       contamination_positions = contamination_positions)
+       contamination_positions = contamination_positions,
+       layers = list(
+         anchors       = Z_anchors,
+         variable      = Z_variable,
+         contamination = Z_contamination,
+         sensor_noise  = Z_sensor_noise
+       ))
 }
