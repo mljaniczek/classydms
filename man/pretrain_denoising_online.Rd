@@ -29,6 +29,9 @@ pretrain_denoising_online(
   contamination_config = NULL,
   clean_layers = NULL,
   noise_layers = NULL,
+  mask_config = NULL,
+  affine_shift_rt = 0L,
+  affine_shift_cv = 0L,
   val_real = NULL,
   val_n = 200L,
   checkpoint_every = 10L,
@@ -97,7 +100,12 @@ real-cohort noise levels; larger values increase the corruption
 the denoising autoencoder must learn to remove, which typically
 improves encoder feature quality up to some optimum
 (Vincent et al. 2008). Sweep \code{c(1, 3, 5, 10)} and pick the
-largest value that doesn't degrade real-validation MSE.}
+largest value that doesn't degrade real-validation MSE. Accepts
+a \strong{length-2 vector} \code{c(min, max)} to draw a fresh noise scale
+per sample uniformly from that range — teaches the encoder to
+handle varying real-instrument noise levels rather than assuming
+a fixed floor. Recommended range for the "wild" recipe:
+\code{c(1.0, 3.0)}.}
 
 \item{anchor_ids}{Optional integer vector of catalog \code{compound_id}s.
 When provided (along with \code{catalog}), synthetic samples are
@@ -134,6 +142,30 @@ apparatus contamination and unfamiliar peaks while preserving
 the catalog compound structure — the actual denoising objective
 the training loss is measuring. Layers can't appear in both
 vectors; naming a layer whose config is \code{NULL} produces a warning.}
+
+\item{mask_config}{Optional list enabling MAE-style masking
+augmentation. When provided, zeros out random rectangles from
+the NOISY input only (target unchanged), forcing the encoder to
+reconstruct the masked regions from surrounding context. Fields:
+\code{n_rects = c(min, max)} (default \code{c(3L, 5L)}) — how many
+rectangles per sample, drawn uniformly; \code{size_frac = c(min, max)}
+(default \code{c(0.05, 0.15)}) — each rectangle's area as a fraction
+of image size, drawn uniformly per rectangle. Aspect ratio is
+randomized per rectangle in \verb{[0.5, 2.0]}. \code{NULL} (default)
+disables masking. Regularizes against synthetic-pixel-pattern
+memorization; effective on top of split-layer denoising.}
+
+\item{affine_shift_rt, affine_shift_cv}{Integer max magnitudes for
+coherent per-sample affine shift augmentation. When > 0, each
+sample's clean and noisy matrices are shifted by
+\code{dr ~ U(-affine_shift_rt, affine_shift_rt)} rows and
+\code{dc ~ U(-affine_shift_cv, affine_shift_cv)} cols, with zero-fill
+at exposed edges. Applied to BOTH clean and noisy identically —
+this is data augmentation, not drift correction. Teaches the
+encoder that a compound at row r is the same as one at row r+k.
+Defaults \code{0L / 0L} (no shift, backward-compatible). Reasonable
+values: \verb{affine_shift_rt = 5L, affine_shift_cv = 1L} on
+1400 x 90 images.}
 
 \item{val_real}{Optional list of real preprocessed, padded Z
 matrices (each of size \verb{H x W}) held out as a real-data

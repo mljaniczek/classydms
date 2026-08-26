@@ -251,7 +251,12 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   the denoising autoencoder must learn to remove, which typically
 #'   improves encoder feature quality up to some optimum
 #'   (Vincent et al. 2008). Sweep `c(1, 3, 5, 10)` and pick the
-#'   largest value that doesn't degrade real-validation MSE.
+#'   largest value that doesn't degrade real-validation MSE. Accepts
+#'   a **length-2 vector** `c(min, max)` to draw a fresh noise scale
+#'   per sample uniformly from that range — teaches the encoder to
+#'   handle varying real-instrument noise levels rather than assuming
+#'   a fixed floor. Recommended range for the "wild" recipe:
+#'   `c(1.0, 3.0)`.
 #' @param anchor_ids Optional integer vector of catalog `compound_id`s.
 #'   When provided (along with `catalog`), synthetic samples are
 #'   generated via the three-layer noisy scheme (see
@@ -284,6 +289,28 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   the catalog compound structure — the actual denoising objective
 #'   the training loss is measuring. Layers can't appear in both
 #'   vectors; naming a layer whose config is `NULL` produces a warning.
+#' @param mask_config Optional list enabling MAE-style masking
+#'   augmentation. When provided, zeros out random rectangles from
+#'   the NOISY input only (target unchanged), forcing the encoder to
+#'   reconstruct the masked regions from surrounding context. Fields:
+#'   `n_rects = c(min, max)` (default `c(3L, 5L)`) — how many
+#'   rectangles per sample, drawn uniformly; `size_frac = c(min, max)`
+#'   (default `c(0.05, 0.15)`) — each rectangle's area as a fraction
+#'   of image size, drawn uniformly per rectangle. Aspect ratio is
+#'   randomized per rectangle in `[0.5, 2.0]`. `NULL` (default)
+#'   disables masking. Regularizes against synthetic-pixel-pattern
+#'   memorization; effective on top of split-layer denoising.
+#' @param affine_shift_rt,affine_shift_cv Integer max magnitudes for
+#'   coherent per-sample affine shift augmentation. When > 0, each
+#'   sample's clean and noisy matrices are shifted by
+#'   `dr ~ U(-affine_shift_rt, affine_shift_rt)` rows and
+#'   `dc ~ U(-affine_shift_cv, affine_shift_cv)` cols, with zero-fill
+#'   at exposed edges. Applied to BOTH clean and noisy identically —
+#'   this is data augmentation, not drift correction. Teaches the
+#'   encoder that a compound at row r is the same as one at row r+k.
+#'   Defaults `0L / 0L` (no shift, backward-compatible). Reasonable
+#'   values: `affine_shift_rt = 5L, affine_shift_cv = 1L` on
+#'   1400 x 90 images.
 #' @param val_real Optional list of real preprocessed, padded Z
 #'   matrices (each of size `H x W`) held out as a real-data
 #'   validation set. When provided, an additional per-epoch metric
@@ -358,6 +385,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        contamination_config = NULL,
                                        clean_layers = NULL,
                                        noise_layers = NULL,
+                                       mask_config = NULL,
+                                       affine_shift_rt = 0L,
+                                       affine_shift_cv = 0L,
                                        val_real = NULL,
                                        val_n = 200L,
                                        checkpoint_every = 10L,
@@ -433,6 +463,45 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
               " but the corresponding config is NULL; those layers will ",
               "contribute zeros.")
   }
+  # noise_scale can be a scalar (fixed sensor-noise strength) or a
+  # length-2 vector (per-sample uniform draw between the two values).
+  # Draw-per-sample makes the encoder robust to varying real-instrument
+  # noise levels rather than assuming a fixed noise floor.
+  noise_scale_range <- NULL
+  if (length(noise_scale) == 2L) {
+    noise_scale_range <- as.numeric(noise_scale)
+    if (any(noise_scale_range < 0) ||
+        noise_scale_range[1] > noise_scale_range[2])
+      stop("noise_scale as a range must be c(min, max) with 0 <= min <= max.")
+    noise_scale <- mean(noise_scale_range)   # for the log line
+  } else if (length(noise_scale) != 1L) {
+    stop("noise_scale must be scalar or length-2 numeric.")
+  }
+  # Masking augmentation. mask_config = NULL disables. Setting it
+  # zeros out random rectangles from the NOISY input only (target
+  # left unchanged) — MAE-style corruption. Encoder must reconstruct
+  # the masked regions from surrounding context, which regularizes
+  # against memorizing synthetic pixel patterns.
+  if (!is.null(mask_config)) {
+    mask_config$n_rects   <- mask_config$n_rects   %||% c(3L, 5L)
+    mask_config$size_frac <- mask_config$size_frac %||% c(0.05, 0.15)
+    if (length(mask_config$n_rects) == 1L)
+      mask_config$n_rects <- c(mask_config$n_rects, mask_config$n_rects)
+    if (any(mask_config$size_frac < 0) ||
+        any(mask_config$size_frac > 1))
+      stop("mask_config$size_frac must be within [0, 1].")
+  }
+  # Affine shift augmentation. Draws per-sample dRT ~ U(-affine_shift_rt,
+  # affine_shift_rt) and dCV ~ U(-affine_shift_cv, affine_shift_cv) and
+  # coherently shifts BOTH the clean target and noisy input by the same
+  # amount (zero-fill at newly-exposed edges). Data augmentation, not
+  # drift correction — the encoder learns that a compound at row r is
+  # the same compound as one at row r+k, without penalizing itself.
+  affine_shift_rt <- as.integer(affine_shift_rt)
+  affine_shift_cv <- as.integer(affine_shift_cv)
+  if (affine_shift_rt < 0 || affine_shift_cv < 0)
+    stop("affine_shift_rt / affine_shift_cv must be >= 0.")
+  use_affine <- affine_shift_rt > 0L || affine_shift_cv > 0L
   if (!is.null(num_threads)) {
     torch::torch_set_num_threads(as.integer(num_threads))
   }
@@ -501,6 +570,22 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
             if (length(noise_layers)) paste(noise_layers, collapse = ", ")
             else "(none)",
             "}, sensor_noise: noisy-only")
+  }
+  if (!is.null(noise_scale_range)) {
+    message("  noise_scale (per-sample uniform): [",
+            noise_scale_range[1], ", ", noise_scale_range[2], "]")
+  }
+  if (!is.null(mask_config)) {
+    message("  Mask augmentation: ",
+            mask_config$n_rects[1], "-", mask_config$n_rects[2],
+            " rects/sample, size_frac [",
+            mask_config$size_frac[1], ", ", mask_config$size_frac[2],
+            "] (zeros noisy input, target unchanged)")
+  }
+  if (use_affine) {
+    message("  Affine shift augmentation: dRT +-", affine_shift_rt,
+            " px, dCV +-", affine_shift_cv,
+            " px (coherent shift of clean + noisy)")
   }
   message("  size_jitter: ", size_jitter)
   message("  dust_threshold: ", dust_threshold,
@@ -585,6 +670,10 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   # L'Ecuyer-CMRG substream (via future.seed = TRUE) so worker samples
   # are independent and reproducible.
   generate_one_pair <- function(i) {
+    # Per-sample noise_scale draw (if range specified).
+    ns <- if (!is.null(noise_scale_range))
+            stats::runif(1, noise_scale_range[1], noise_scale_range[2])
+          else noise_scale
     pair <- if (use_noisy) {
       generate_noisy_pretrain_sample(catalog, H, W,
                                        anchor_ids = anchor_ids,
@@ -594,14 +683,14 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        size_jitter = size_jitter,
                                        location_jitter_rt = location_jitter_rt,
                                        location_jitter_cv = location_jitter_cv,
-                                       noise_scale = noise_scale)
+                                       noise_scale = ns)
     } else if (!is.null(catalog)) {
       generate_one_synthetic_from_catalog(catalog, H, W,
                                     add_noise = add_noise,
                                     size_jitter = size_jitter,
                                     location_jitter_rt = location_jitter_rt,
                                     location_jitter_cv = location_jitter_cv,
-                                    noise_scale = noise_scale)
+                                    noise_scale = ns)
     } else {
       generate_one_synthetic(peak_params, H, W,
                                     add_noise = add_noise,
@@ -610,7 +699,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                     location_jitter_rt = location_jitter_rt,
                                     location_jitter_cv = location_jitter_cv,
                                     attribute_mode = attribute_mode,
-                                    noise_scale = noise_scale)
+                                    noise_scale = ns)
     }
     # Split-layer denoising: compose Z_clean and Z_noisy from the
     # per-layer matrices returned by generate_noisy_pretrain_sample.
@@ -626,6 +715,49 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
       Z_sensor      <- pair$layers$sensor_noise
       pair$clean <- Z_clean
       pair$noisy <- Z_clean + Z_noise_add + Z_sensor
+    }
+    # Coherent per-sample affine shift (data augmentation). Applied
+    # to BOTH clean and noisy so the encoder is not asked to correct
+    # the drift — it just sees peaks at different absolute row/col
+    # positions across samples.
+    if (use_affine) {
+      dr <- if (affine_shift_rt > 0L)
+              sample(-affine_shift_rt:affine_shift_rt, 1L) else 0L
+      dc <- if (affine_shift_cv > 0L)
+              sample(-affine_shift_cv:affine_shift_cv, 1L) else 0L
+      shift_mat <- function(M, dr, dc) {
+        out <- matrix(0, nrow = nrow(M), ncol = ncol(M))
+        src_r <- max(1L, 1L - dr):min(nrow(M), nrow(M) - dr)
+        src_c <- max(1L, 1L - dc):min(ncol(M), ncol(M) - dc)
+        if (length(src_r) == 0L || length(src_c) == 0L) return(out)
+        out[src_r + dr, src_c + dc] <- M[src_r, src_c]
+        out
+      }
+      pair$clean <- shift_mat(pair$clean, dr, dc)
+      pair$noisy <- shift_mat(pair$noisy, dr, dc)
+    }
+    # Mask augmentation: zero out random rectangles from the NOISY
+    # input only. Encoder reconstructs from surrounding context.
+    if (!is.null(mask_config)) {
+      n_rects <- if (mask_config$n_rects[1] == mask_config$n_rects[2])
+                   mask_config$n_rects[1]
+                 else
+                   as.integer(stats::runif(1,
+                     mask_config$n_rects[1],
+                     mask_config$n_rects[2] + 1))
+      for (k in seq_len(n_rects)) {
+        area_frac <- stats::runif(1, mask_config$size_frac[1],
+                                       mask_config$size_frac[2])
+        # Aspect ratio ~ uniform 0.5..2.0 so rectangles vary in shape
+        aspect <- exp(stats::runif(1, log(0.5), log(2.0)))
+        rect_h <- max(1L, as.integer(sqrt(area_frac * H * W * aspect)))
+        rect_w <- max(1L, as.integer(sqrt(area_frac * H * W / aspect)))
+        rect_h <- min(rect_h, H); rect_w <- min(rect_w, W)
+        r0 <- sample.int(H - rect_h + 1L, 1L)
+        c0 <- sample.int(W - rect_w + 1L, 1L)
+        pair$noisy[r0:(r0 + rect_h - 1L),
+                    c0:(c0 + rect_w - 1L)] <- 0
+      }
     }
     # Dust thresholding matches real-data preprocessing (see
     # baseline_basement) so synthetic samples have the same sparsity
