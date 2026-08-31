@@ -353,9 +353,37 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   (`*.pt`). The function looks for the corresponding `_autoencoder.pt`
 #'   and `_manifest.Rdata` next to it and resumes training from
 #'   `last_epoch_completed + 1`, inheriting prior loss history. Useful
-#'   for picking up after a crash without losing the work done so far.
-#'   The other hyperparameters (`H`, `W`, `epochs`, etc.) must match
-#'   the original run.
+#'   for a "trained 32 epochs, want 64" continuation and for picking up
+#'   after a crash. All training-affecting args (`H`, `W`,
+#'   `batch_size`, `lr`, `weight_decay`, `noise_scale`,
+#'   `size_jitter`, `dust_threshold`, `location_mode`,
+#'   `location_jitter_rt/cv`, `attribute_mode`, `stem_stride_rt/cv`,
+#'   `anchor_ids`, `variable_config`, `contamination_config`,
+#'   `clean_layers`, `noise_layers`, `mask_config`, `affine_shift_rt/cv`)
+#'   should match the original run. Values that differ trigger a
+#'   warning on load listing the mismatches — training continues with
+#'   the CURRENT-call values, but the model was trained so far under
+#'   the manifest values. To resume identically, read the manifest and
+#'   copy its `hyperparams` list:
+#'
+#'   ```
+#'   e <- new.env(); load("path/to/enc_manifest.Rdata", envir = e)
+#'   hp <- e$training_manifest$hyperparams
+#'   hp$epochs <- 64L                     # extend past original target
+#'   hp$noise_scale_range <- NULL         # internal-only field, drop it
+#'   do.call(pretrain_denoising_online,
+#'     c(list(catalog = catalog,
+#'             resume_from = "path/to/enc.pt",
+#'             save_path   = "path/to/enc.pt"), hp))
+#'   ```
+#'
+#'   Two housekeeping notes on the replay pattern:
+#'   1. `noise_scale_range` is an internal-derived field on the manifest;
+#'      drop it before splicing (the original `noise_scale` still lives
+#'      in the same hp list, so scalar/range detection re-runs cleanly).
+#'   2. `epochs` and `save_path` are the two things you typically override
+#'      at resume time — the former to extend training past the original
+#'      target, the latter to overwrite the same encoder file.
 #' @param seed RNG seed.
 #' @param verbose Whether to print epoch progress.
 #' @return List with `encoder`, `autoencoder`, `loss_history`,
@@ -641,6 +669,48 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         message("  Manifest shows last_epoch_completed = ",
                 tm$last_epoch_completed,
                 "; continuing from epoch ", start_epoch)
+        # Verify that training-affecting args on THIS call match the ones
+        # recorded in the manifest. Mismatch means continuing with a
+        # DIFFERENT training distribution than what the model was trained
+        # on so far — usually a mistake. Warn per mismatch so the user
+        # can decide whether to abort and re-run.
+        current_vals <- list(
+          H = H, W = W, batch_size = batch_size, lr = lr,
+          weight_decay = weight_decay, add_noise = add_noise,
+          size_jitter = size_jitter, dust_threshold = dust_threshold,
+          location_mode = location_mode,
+          location_jitter_rt = location_jitter_rt,
+          location_jitter_cv = location_jitter_cv,
+          attribute_mode = attribute_mode,
+          noise_scale = noise_scale,
+          noise_scale_range = noise_scale_range,
+          anchor_ids = anchor_ids,
+          variable_config = variable_config,
+          contamination_config = contamination_config,
+          clean_layers = clean_layers,
+          noise_layers = noise_layers,
+          mask_config = mask_config,
+          affine_shift_rt = affine_shift_rt,
+          affine_shift_cv = affine_shift_cv,
+          stem_stride_rt = stem_stride_rt,
+          stem_stride_cv = stem_stride_cv
+        )
+        hp <- tm$hyperparams
+        mismatches <- character(0)
+        for (nm in names(current_vals)) {
+          if (nm %in% names(hp) && !identical(current_vals[[nm]], hp[[nm]])) {
+            mismatches <- c(mismatches, nm)
+          }
+        }
+        if (length(mismatches)) {
+          warning("resume_from: the following args differ between the ",
+                  "current call and the saved manifest: ",
+                  paste(mismatches, collapse = ", "),
+                  ". Continuing with the CURRENT-call values (the model ",
+                  "was trained so far with the manifest values). If you ",
+                  "intended to resume identically, re-invoke with the ",
+                  "manifest's args (they're in tm$hyperparams).")
+        }
         if (start_epoch > epochs) {
           message("  Already at or past requested epochs; nothing to do.")
           return(list(encoder = model$encoder, autoencoder = model,
@@ -882,6 +952,16 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         location_jitter_cv = location_jitter_cv,
         attribute_mode = attribute_mode,
         noise_scale = noise_scale,
+        noise_scale_range = noise_scale_range,
+        # Three-layer noisy / split denoising / augmentation config
+        anchor_ids = anchor_ids,
+        variable_config = variable_config,
+        contamination_config = contamination_config,
+        clean_layers = clean_layers,
+        noise_layers = noise_layers,
+        mask_config = mask_config,
+        affine_shift_rt = affine_shift_rt,
+        affine_shift_cv = affine_shift_cv,
         val_real_n = if (is.null(val_real)) 0L else length(val_real),
         checkpoint_every = checkpoint_every,
         stem_stride_rt = stem_stride_rt, stem_stride_cv = stem_stride_cv,

@@ -218,9 +218,29 @@ artifacts).}
 (\verb{*.pt}). The function looks for the corresponding \verb{_autoencoder.pt}
 and \verb{_manifest.Rdata} next to it and resumes training from
 \code{last_epoch_completed + 1}, inheriting prior loss history. Useful
-for picking up after a crash without losing the work done so far.
-The other hyperparameters (\code{H}, \code{W}, \code{epochs}, etc.) must match
-the original run.}
+for a "trained 32 epochs, want 64" continuation and for picking up
+after a crash. All training-affecting args (\code{H}, \code{W},
+\code{batch_size}, \code{lr}, \code{weight_decay}, \code{noise_scale},
+\code{size_jitter}, \code{dust_threshold}, \code{location_mode},
+\code{location_jitter_rt/cv}, \code{attribute_mode}, \code{stem_stride_rt/cv},
+\code{anchor_ids}, \code{variable_config}, \code{contamination_config},
+\code{clean_layers}, \code{noise_layers}, \code{mask_config}, \code{affine_shift_rt/cv})
+should match the original run. Values that differ trigger a
+warning on load listing the mismatches — training continues with
+the CURRENT-call values, but the model was trained so far under
+the manifest values. To resume identically, read the manifest and
+copy its \code{hyperparams} list:
+
+\if{html}{\out{<div class="sourceCode">}}\preformatted{e <- new.env(); load("path/to/enc_manifest.Rdata", envir = e)
+hp <- e$training_manifest$hyperparams
+do.call(pretrain_denoising_online,
+  c(list(catalog = catalog, resume_from = "path/to/enc.pt",
+          epochs = 64L, save_path = "path/to/enc.pt"), hp))
+}\if{html}{\out{</div>}}
+
+\code{epochs} and \code{save_path} are the two things you typically override
+at resume time — the former to extend training past the original
+target, the latter to overwrite the same encoder file.}
 
 \item{seed}{RNG seed.}
 
