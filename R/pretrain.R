@@ -223,14 +223,24 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #' @param size_jitter Per-peak random log-normal size scale factor SD.
 #' @param grad_clip Maximum L2 norm for gradient clipping (0 disables).
 #' @param norm_clamp Maximum normalized pixel value (safety clamp).
-#' @param dust_threshold If > 0, zero out pixels below this value in
-#'   both the clean and noisy synthetic samples BEFORE normalization.
-#'   Matches the dust thresholding applied to real data via
-#'   [baseline_basement()] so synthetic and real samples have the same
-#'   sparsity profile entering the encoder. Default 0 (off,
-#'   backward-compatible). For consistent training with real-data
-#'   preprocessing, set to the same `basement_thr` used on real data
-#'   (typically 0.005).
+#' @param dust_threshold Zero out pixels below this value in the CLEAN
+#'   target BEFORE normalization. Matches the dust thresholding
+#'   applied to real data via [baseline_basement()] so synthetic and
+#'   real samples have the same sparsity profile entering the encoder.
+#'   **Default `0.01`** — was `0` previously, which produced dense
+#'   synthetic Z matrices that mismatched real (baseline_basement'ed)
+#'   validation samples and pushed the encoder toward feature collapse.
+#'   Set to `0` to disable. If your real preprocessing uses a
+#'   different `basement_thr`, match it here.
+#' @param noisy_dust_threshold Zero-out threshold for the NOISY input.
+#'   `NULL` (default) chooses a mode-appropriate value: in split-layer
+#'   mode (any `clean_layers` / `noise_layers` set) the noisy input
+#'   is left UNTHRESHOLDED so contamination and sensor noise remain
+#'   full-resolution corruption for the encoder to strip; in standard
+#'   mode the same `dust_threshold` is applied to noisy as to clean
+#'   (matches previous behavior). Pass an explicit scalar to override
+#'   either default (e.g., `0` to force no thresholding, or a small
+#'   positive value to keep some background floor in the noisy input).
 #' @param location_mode Passed to [generate_one_synthetic()]. Default
 #'   `"empirical"` samples peak locations from the real cohort's
 #'   observed hotspots (`params$rt_loc_raw` / `cv_loc_raw`), producing
@@ -399,7 +409,8 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        size_jitter = 0.15,
                                        grad_clip = 1.0,
                                        norm_clamp = 10.0,
-                                       dust_threshold = 0,
+                                       dust_threshold = 0.01,
+                                       noisy_dust_threshold = NULL,
                                        location_mode = c("empirical",
                                                           "marginal"),
                                        location_jitter_rt = 2,
@@ -530,6 +541,18 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   if (affine_shift_rt < 0 || affine_shift_cv < 0)
     stop("affine_shift_rt / affine_shift_cv must be >= 0.")
   use_affine <- affine_shift_rt > 0L || affine_shift_cv > 0L
+  # Resolve noisy_dust_threshold once at entry:
+  #   NULL default:
+  #     split-layer mode -> 0    (keep contamination/noise in noisy)
+  #     standard mode    -> same as dust_threshold (backward compat)
+  #   explicit scalar   -> honored as-is
+  if (is.null(noisy_dust_threshold)) {
+    noisy_dust_threshold <- if (split_layers) 0 else dust_threshold
+  } else {
+    noisy_dust_threshold <- as.numeric(noisy_dust_threshold)
+    if (length(noisy_dust_threshold) != 1L || noisy_dust_threshold < 0)
+      stop("noisy_dust_threshold must be a non-negative scalar or NULL.")
+  }
   if (!is.null(num_threads)) {
     torch::torch_set_num_threads(as.integer(num_threads))
   }
@@ -616,10 +639,14 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
             " px (coherent shift of clean + noisy)")
   }
   message("  size_jitter: ", size_jitter)
-  message("  dust_threshold: ", dust_threshold,
+  message("  dust_threshold (clean target): ", dust_threshold,
           if (dust_threshold > 0)
             " (synthetic samples will match real-data sparsity)" else
             " (no dust thresholding; synthetic will be dense)")
+  message("  noisy_dust_threshold (noisy input): ", noisy_dust_threshold,
+          if (noisy_dust_threshold == 0)
+            " (noisy input unclipped — contamination + sensor noise pass through)"
+          else "")
   message("  location_mode: ", location_mode,
           if (location_mode == "empirical")
             paste0(" (jitter RT=", location_jitter_rt,
@@ -678,6 +705,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
           H = H, W = W, batch_size = batch_size, lr = lr,
           weight_decay = weight_decay, add_noise = add_noise,
           size_jitter = size_jitter, dust_threshold = dust_threshold,
+          noisy_dust_threshold = noisy_dust_threshold,
           location_mode = location_mode,
           location_jitter_rt = location_jitter_rt,
           location_jitter_cv = location_jitter_cv,
@@ -834,7 +862,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     # profile as real samples entering the encoder.
     if (dust_threshold > 0) {
       pair$clean[pair$clean < dust_threshold] <- 0
-      pair$noisy[pair$noisy < dust_threshold] <- 0
+    }
+    if (noisy_dust_threshold > 0) {
+      pair$noisy[pair$noisy < noisy_dust_threshold] <- 0
     }
     list(
       clean = pmin(normalize_sample(pair$clean), norm_clamp),
@@ -947,6 +977,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         add_noise = add_noise, size_jitter = size_jitter,
         grad_clip = grad_clip, norm_clamp = norm_clamp, val_n = val_n,
         dust_threshold = dust_threshold,
+        noisy_dust_threshold = noisy_dust_threshold,
         location_mode = location_mode,
         location_jitter_rt = location_jitter_rt,
         location_jitter_cv = location_jitter_cv,

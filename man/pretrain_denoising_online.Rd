@@ -17,7 +17,8 @@ pretrain_denoising_online(
   size_jitter = 0.15,
   grad_clip = 1,
   norm_clamp = 10,
-  dust_threshold = 0,
+  dust_threshold = 0.01,
+  noisy_dust_threshold = NULL,
   location_mode = c("empirical", "marginal"),
   location_jitter_rt = 2,
   location_jitter_cv = 1,
@@ -68,14 +69,25 @@ pretrain_denoising_online(
 
 \item{norm_clamp}{Maximum normalized pixel value (safety clamp).}
 
-\item{dust_threshold}{If > 0, zero out pixels below this value in
-both the clean and noisy synthetic samples BEFORE normalization.
-Matches the dust thresholding applied to real data via
-\code{\link[=baseline_basement]{baseline_basement()}} so synthetic and real samples have the same
-sparsity profile entering the encoder. Default 0 (off,
-backward-compatible). For consistent training with real-data
-preprocessing, set to the same \code{basement_thr} used on real data
-(typically 0.005).}
+\item{dust_threshold}{Zero out pixels below this value in the CLEAN
+target BEFORE normalization. Matches the dust thresholding
+applied to real data via \code{\link[=baseline_basement]{baseline_basement()}} so synthetic and
+real samples have the same sparsity profile entering the encoder.
+\strong{Default \code{0.01}} — was \code{0} previously, which produced dense
+synthetic Z matrices that mismatched real (baseline_basement'ed)
+validation samples and pushed the encoder toward feature collapse.
+Set to \code{0} to disable. If your real preprocessing uses a
+different \code{basement_thr}, match it here.}
+
+\item{noisy_dust_threshold}{Zero-out threshold for the NOISY input.
+\code{NULL} (default) chooses a mode-appropriate value: in split-layer
+mode (any \code{clean_layers} / \code{noise_layers} set) the noisy input
+is left UNTHRESHOLDED so contamination and sensor noise remain
+full-resolution corruption for the encoder to strip; in standard
+mode the same \code{dust_threshold} is applied to noisy as to clean
+(matches previous behavior). Pass an explicit scalar to override
+either default (e.g., \code{0} to force no thresholding, or a small
+positive value to keep some background floor in the noisy input).}
 
 \item{location_mode}{Passed to \code{\link[=generate_one_synthetic]{generate_one_synthetic()}}. Default
 \code{"empirical"} samples peak locations from the real cohort's
@@ -233,14 +245,23 @@ copy its \code{hyperparams} list:
 
 \if{html}{\out{<div class="sourceCode">}}\preformatted{e <- new.env(); load("path/to/enc_manifest.Rdata", envir = e)
 hp <- e$training_manifest$hyperparams
+hp$epochs <- 64L                     # extend past original target
+hp$noise_scale_range <- NULL         # internal-only field, drop it
 do.call(pretrain_denoising_online,
-  c(list(catalog = catalog, resume_from = "path/to/enc.pt",
-          epochs = 64L, save_path = "path/to/enc.pt"), hp))
+  c(list(catalog = catalog,
+          resume_from = "path/to/enc.pt",
+          save_path   = "path/to/enc.pt"), hp))
 }\if{html}{\out{</div>}}
 
-\code{epochs} and \code{save_path} are the two things you typically override
+Two housekeeping notes on the replay pattern:
+\enumerate{
+\item \code{noise_scale_range} is an internal-derived field on the manifest;
+drop it before splicing (the original \code{noise_scale} still lives
+in the same hp list, so scalar/range detection re-runs cleanly).
+\item \code{epochs} and \code{save_path} are the two things you typically override
 at resume time — the former to extend training past the original
-target, the latter to overwrite the same encoder file.}
+target, the latter to overwrite the same encoder file.
+}}
 
 \item{seed}{RNG seed.}
 
