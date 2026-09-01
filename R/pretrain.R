@@ -299,6 +299,20 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   the catalog compound structure — the actual denoising objective
 #'   the training loss is measuring. Layers can't appear in both
 #'   vectors; naming a layer whose config is `NULL` produces a warning.
+#' @param contamination_schedule Optional named list of regime weights
+#'   giving stochastic per-sample variation in contamination level.
+#'   Currently uses fixed scale multipliers: `clean = 0x`,
+#'   `light = 0.3x`, `heavy = 1x` — where the multiplier scales BOTH
+#'   `contamination_config$n_per_sample` and `intensity_range`. Weights
+#'   normalize automatically. Example:
+#'   `contamination_schedule = list(clean = 0.3, light = 0.4, heavy = 0.3)`
+#'   makes 30% of samples clean, 40% lightly contaminated, 30% heavily
+#'   contaminated. Prevents the encoder from overfitting to
+#'   "always messy" — real skin GC-DMS ranges from clean to messy per
+#'   subject, and the encoder should generalize to both extremes.
+#'   Requires `contamination_config` (the config to scale) and
+#'   `anchor_ids` (the three-layer path). `NULL` (default) disables
+#'   scheduling — every sample uses the full `contamination_config`.
 #' @param mask_config Optional list enabling MAE-style masking
 #'   augmentation. When provided, zeros out random rectangles from
 #'   the NOISY input only (target unchanged), forcing the encoder to
@@ -424,6 +438,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        contamination_config = NULL,
                                        clean_layers = NULL,
                                        noise_layers = NULL,
+                                       contamination_schedule = NULL,
                                        mask_config = NULL,
                                        affine_shift_rt = 0L,
                                        affine_shift_cv = 0L,
@@ -501,6 +516,26 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
               paste(missing_cfg, collapse = ", "),
               " but the corresponding config is NULL; those layers will ",
               "contribute zeros.")
+  }
+  # Contamination-regime schedule: per-sample stochastic selection of
+  # {clean, light, heavy} contamination. Scale multipliers on the
+  # config's n_per_sample and intensity_range are fixed (clean=0,
+  # light=0.3, heavy=1.0). Named-list weights determine the sampling
+  # probability; weights normalize automatically.
+  if (!is.null(contamination_schedule)) {
+    if (is.null(contamination_config))
+      stop("contamination_schedule requires contamination_config.")
+    if (!use_noisy)
+      stop("contamination_schedule requires anchor_ids (three-layer path).")
+    valid_regimes <- c("clean", "light", "heavy")
+    bad_reg <- setdiff(names(contamination_schedule), valid_regimes)
+    if (length(bad_reg))
+      stop("contamination_schedule names must be from {clean, light, ",
+           "heavy}; got: ", paste(bad_reg, collapse = ", "))
+    w <- unlist(contamination_schedule)
+    if (any(w < 0) || sum(w) <= 0)
+      stop("contamination_schedule weights must be non-negative with sum > 0.")
+    contamination_schedule <- as.list(w / sum(w))
   }
   # noise_scale can be a scalar (fixed sensor-noise strength) or a
   # length-2 vector (per-sample uniform draw between the two values).
@@ -622,6 +657,13 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
             else "(none)",
             "}, sensor_noise: noisy-only")
   }
+  if (!is.null(contamination_schedule)) {
+    parts <- paste(names(contamination_schedule),
+                    sprintf("=%.2f", unlist(contamination_schedule)),
+                    sep = "", collapse = ", ")
+    message("  Contamination schedule (per-sample): ", parts,
+            "  (scale multipliers: clean=0x, light=0.3x, heavy=1x)")
+  }
   if (!is.null(noise_scale_range)) {
     message("  noise_scale (per-sample uniform): [",
             noise_scale_range[1], ", ", noise_scale_range[2], "]")
@@ -715,6 +757,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
           anchor_ids = anchor_ids,
           variable_config = variable_config,
           contamination_config = contamination_config,
+          contamination_schedule = contamination_schedule,
           clean_layers = clean_layers,
           noise_layers = noise_layers,
           mask_config = mask_config,
@@ -772,11 +815,29 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     ns <- if (!is.null(noise_scale_range))
             stats::runif(1, noise_scale_range[1], noise_scale_range[2])
           else noise_scale
+    # Per-sample contamination-regime draw. NULL schedule -> config
+    # passed through unchanged. Otherwise resolve to a scaled config:
+    #   clean -> NULL (no contamination layer this sample)
+    #   light -> 0.3x n_per_sample and intensity_range
+    #   heavy -> full config as-is
+    active_cc <- contamination_config
+    if (!is.null(contamination_schedule)) {
+      regime <- sample(names(contamination_schedule), size = 1L,
+                        prob = unlist(contamination_schedule))
+      scale <- switch(regime, clean = 0, light = 0.3, heavy = 1.0)
+      if (scale == 0) {
+        active_cc <- NULL
+      } else if (scale < 1) {
+        active_cc$n_per_sample <-
+          pmax(0L, as.integer(active_cc$n_per_sample * scale))
+        active_cc$intensity_range <- active_cc$intensity_range * scale
+      }
+    }
     pair <- if (use_noisy) {
       generate_noisy_pretrain_sample(catalog, H, W,
                                        anchor_ids = anchor_ids,
                                        variable_config = variable_config,
-                                       contamination_config = contamination_config,
+                                       contamination_config = active_cc,
                                        add_noise = add_noise,
                                        size_jitter = size_jitter,
                                        location_jitter_rt = location_jitter_rt,
@@ -988,6 +1049,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         anchor_ids = anchor_ids,
         variable_config = variable_config,
         contamination_config = contamination_config,
+        contamination_schedule = contamination_schedule,
         clean_layers = clean_layers,
         noise_layers = noise_layers,
         mask_config = mask_config,

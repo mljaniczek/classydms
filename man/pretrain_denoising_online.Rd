@@ -30,6 +30,7 @@ pretrain_denoising_online(
   contamination_config = NULL,
   clean_layers = NULL,
   noise_layers = NULL,
+  contamination_schedule = NULL,
   mask_config = NULL,
   affine_shift_rt = 0L,
   affine_shift_cv = 0L,
@@ -154,6 +155,21 @@ apparatus contamination and unfamiliar peaks while preserving
 the catalog compound structure — the actual denoising objective
 the training loss is measuring. Layers can't appear in both
 vectors; naming a layer whose config is \code{NULL} produces a warning.}
+
+\item{contamination_schedule}{Optional named list of regime weights
+giving stochastic per-sample variation in contamination level.
+Currently uses fixed scale multipliers: \verb{clean = 0x},
+\verb{light = 0.3x}, \verb{heavy = 1x} — where the multiplier scales BOTH
+\code{contamination_config$n_per_sample} and \code{intensity_range}. Weights
+normalize automatically. Example:
+\code{contamination_schedule = list(clean = 0.3, light = 0.4, heavy = 0.3)}
+makes 30\% of samples clean, 40\% lightly contaminated, 30\% heavily
+contaminated. Prevents the encoder from overfitting to
+"always messy" — real skin GC-DMS ranges from clean to messy per
+subject, and the encoder should generalize to both extremes.
+Requires \code{contamination_config} (the config to scale) and
+\code{anchor_ids} (the three-layer path). \code{NULL} (default) disables
+scheduling — every sample uses the full \code{contamination_config}.}
 
 \item{mask_config}{Optional list enabling MAE-style masking
 augmentation. When provided, zeros out random rectangles from
