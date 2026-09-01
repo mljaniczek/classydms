@@ -46,7 +46,8 @@ reconstruct_real_samples <- function(autoencoder, Z_list,
 #'
 #' @param encoder A pre-trained `dms_encoder`.
 #' @param Z One sample's preprocessed, padded matrix.
-#' @param coefs Numeric vector of length 64 (elastic net coefficients).
+#' @param coefs Numeric vector of length equal to the encoder's latent
+#'   dim (elastic net coefficients on the GAP features).
 #' @param device "cpu" or "cuda".
 #' @return List with `raw_cam` and `upsampled_cam`.
 #' @export
@@ -56,8 +57,13 @@ compute_saliency_map <- function(encoder, Z, coefs, device = "cpu") {
     unsqueeze(1)$unsqueeze(1)$to(device = device)
   torch::with_no_grad({ fmap <- encoder(x) })
   fmap_arr <- as.array(fmap$squeeze(1)$to(device = "cpu"))
+  n_channels <- dim(fmap_arr)[1]
+  if (length(coefs) != n_channels) {
+    stop("compute_saliency_map: length(coefs) = ", length(coefs),
+         " does not match encoder latent dim = ", n_channels, ".")
+  }
   raw_cam <- matrix(0, nrow = dim(fmap_arr)[2], ncol = dim(fmap_arr)[3])
-  for (c in seq_len(64L)) {
+  for (c in seq_len(n_channels)) {
     if (coefs[c] != 0) raw_cam <- raw_cam + coefs[c] * fmap_arr[c, , ]
   }
   H_in <- nrow(Z); W_in <- ncol(Z)

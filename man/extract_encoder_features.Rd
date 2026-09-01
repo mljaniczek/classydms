@@ -2,7 +2,7 @@
 % Please edit documentation in R/classify.R
 \name{extract_encoder_features}
 \alias{extract_encoder_features}
-\title{Extract 64-dim encoder features for all samples (GAP-pooled)}
+\title{Extract encoder features for all samples (GAP-pooled)}
 \usage{
 extract_encoder_features(encoder, Z_list, device = "cpu")
 }
@@ -14,10 +14,14 @@ extract_encoder_features(encoder, Z_list, device = "cpu")
 \item{device}{"cpu" or "cuda".}
 }
 \value{
-Numeric matrix with one row per sample, 64 columns.
+Numeric matrix with one row per sample, \code{latent_dim} columns.
 }
 \description{
 Runs each sample through the (frozen) encoder, applies global average
-pooling to its feature map, and stacks the result into an \verb{(N, 64)}
-matrix suitable for use as input to a classical classifier.
+pooling to its feature map, and stacks the result into an
+\verb{(N, latent_dim)} matrix suitable for use as input to a classical
+classifier. Latent dim is auto-detected from the encoder (either via
+its \code{encoder_channels} attribute or by peeking at its output shape
+on the first sample), so encoders built with wider
+\code{encoder_channels} work without additional args.
 }

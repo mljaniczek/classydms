@@ -11,7 +11,8 @@ compute_saliency_map(encoder, Z, coefs, device = "cpu")
 
 \item{Z}{One sample's preprocessed, padded matrix.}
 
-\item{coefs}{Numeric vector of length 64 (elastic net coefficients).}
+\item{coefs}{Numeric vector of length equal to the encoder's latent
+dim (elastic net coefficients on the GAP features).}
 
 \item{device}{"cpu" or "cuda".}
 }

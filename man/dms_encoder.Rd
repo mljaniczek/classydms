@@ -4,17 +4,46 @@
 \alias{dms_encoder}
 \title{GC-DMS encoder (ResNet-style, asymmetric stride)}
 \usage{
-dms_encoder(in_channels = 1L, stem_stride_rt = 4L, stem_stride_cv = 1L)
+dms_encoder(
+  in_channels = 1L,
+  stem_stride_rt = 4L,
+  stem_stride_cv = 1L,
+  encoder_channels = c(16L, 16L, 32L, 64L, 64L)
+)
 }
 \arguments{
 \item{in_channels}{Number of input channels (default 1).}
 
 \item{stem_stride_rt, stem_stride_cv}{Stride in the stem conv layer
 (default 4 and 1, reflecting the typical 30:1 RT:CV pixel ratio).}
+
+\item{encoder_channels}{Length-5 integer vector of per-stage channel
+counts. Default \code{c(16L, 16L, 32L, 64L, 64L)} matches the previous
+fixed architecture exactly (no projection layer added). Wider
+examples: \code{c(16L, 32L, 64L, 128L, 128L)} for 128-dim latent;
+\code{c(16L, 32L, 64L, 128L, 256L)} for 256-dim latent with a 1x1
+projection on top.}
 }
 \description{
-Three residual block groups (16 -> 32 -> 64 channels) with an asymmetric
-stem stride that aggressively downsamples RT while preserving CV
-resolution. Output is a \verb{(B, 64, h, w)} feature map suitable as input to
-a classification head or for spatial saliency mapping.
+Three residual block groups with an asymmetric stem stride that
+aggressively downsamples RT while preserving CV resolution. Output
+is a \verb{(B, encoder_channels[5], h, w)} feature map suitable as input
+to a classification head or for spatial saliency mapping.
+}
+\details{
+Channel schedule via \code{encoder_channels}, a length-5 integer vector
+\code{c(stem_ch, layer1_ch, layer2_ch, layer3_ch, latent_ch)}:
+\itemize{
+\item Stem: \code{1 -> stem_ch} (kernel 7, stride \verb{(stem_stride_rt, stem_stride_cv)})
+\item MaxPool: stride \verb{(2, 1)}
+\item Layer1: \code{stem_ch -> layer1_ch}, 2 residual blocks at stride 1
+\item Layer2: \code{layer1_ch -> layer2_ch}, 2 blocks with first stride 2
+\item Layer3: \code{layer2_ch -> layer3_ch}, 2 blocks with first stride 2
+\item Optional 1x1 projection: \code{layer3_ch -> latent_ch} (skipped when equal)
+}
+
+Total spatial downsample is fixed at 32x on RT and 4x on CV
+regardless of channel counts (stem 4x1, maxpool 2x1, layer2 2x2,
+layer3 2x2). Only channel counts change with different
+\code{encoder_channels} values.
 }

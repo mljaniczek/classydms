@@ -4,15 +4,30 @@
 \alias{dms_decoder}
 \title{GC-DMS decoder (mirror of encoder, transposed convolutions)}
 \usage{
-dms_decoder(target_H, target_W, stem_stride_rt = 4L, stem_stride_cv = 1L)
+dms_decoder(
+  target_H,
+  target_W,
+  stem_stride_rt = 4L,
+  stem_stride_cv = 1L,
+  encoder_channels = c(16L, 16L, 32L, 64L, 64L)
+)
 }
 \arguments{
 \item{target_H, target_W}{Input image dimensions.}
 
 \item{stem_stride_rt, stem_stride_cv}{Must match encoder configuration.}
+
+\item{encoder_channels}{Length-5 integer vector, same as the encoder's.
+Default \code{c(16L, 16L, 32L, 64L, 64L)} matches previous behavior.}
 }
 \description{
 Used during pretraining to reconstruct synthetic inputs through the
 encoder bottleneck. Crops output to the exact \code{target_H} x \code{target_W}
 if transposed-conv strides produce slightly larger output.
+}
+\details{
+Channel schedule mirrors the encoder: input is \code{latent_ch}
+(= \code{encoder_channels[5]}), optional 1x1 unprojection to \code{layer3_ch}
+(skipped when equal), then three transposed convs
+\code{layer3_ch -> layer2_ch -> layer1_ch -> stem_ch -> 1}.
 }

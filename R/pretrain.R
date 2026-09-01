@@ -347,6 +347,18 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #' @param checkpoint_every Save encoder checkpoint every N epochs.
 #' @param loss_diagnostics If TRUE, also print median, p95, max batch loss.
 #' @param stem_stride_rt,stem_stride_cv Encoder stem strides.
+#' @param encoder_channels Length-5 integer vector controlling encoder
+#'   capacity: `c(stem_ch, layer1_ch, layer2_ch, layer3_ch, latent_ch)`.
+#'   The final entry is the GAP-pooled feature dimension (input width
+#'   for the downstream elastic-net classifier). Default
+#'   `c(16L, 16L, 32L, 64L, 64L)` matches previous behavior exactly
+#'   (no projection layer added). Wider examples:
+#'   `c(16L, 32L, 64L, 128L, 128L)` for 128-dim latent;
+#'   `c(16L, 32L, 64L, 128L, 256L)` for 256-dim latent (adds a 1x1
+#'   projection on top). Same 32x/4x RT/CV spatial downsample
+#'   regardless — only channel counts differ. Downstream classifier
+#'   and feature extractor auto-detect the latent dim from the
+#'   trained encoder, so no other args need updating.
 #' @param device "cpu" or "cuda".
 #' @param num_threads If non-NULL, sets the number of CPU threads
 #'   used by torch for forward/backward passes via
@@ -448,6 +460,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        loss_diagnostics = TRUE,
                                        stem_stride_rt = 4L,
                                        stem_stride_cv = 1L,
+                                       encoder_channels = c(16L, 16L, 32L, 64L, 64L),
                                        device = if (torch::cuda_is_available()) "cuda" else "cpu",
                                        num_threads = NULL,
                                        num_workers = 1L,
@@ -637,6 +650,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
           if (add_noise) paste0(" (noise_scale = ", noise_scale, ")")
           else "")
   message("  CPU threads (torch): ", torch::torch_get_num_threads())
+  message("  Encoder channels: [",
+          paste(encoder_channels, collapse = ", "),
+          "] (latent dim = ", tail(encoder_channels, 1L), ")")
   message("  R-side data workers: ", num_workers,
           if (use_parallel) " (parallel via future::multisession)" else " (serial)")
   message("  Source: ",
@@ -706,7 +722,8 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
 
   model <- dms_denoising_autoencoder(target_H = H, target_W = W,
                                       stem_stride_rt = stem_stride_rt,
-                                      stem_stride_cv = stem_stride_cv)
+                                      stem_stride_cv = stem_stride_cv,
+                                      encoder_channels = encoder_channels)
   model$to(device = device)
 
   # ---- Resume from saved state if requested ----
@@ -764,7 +781,8 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
           affine_shift_rt = affine_shift_rt,
           affine_shift_cv = affine_shift_cv,
           stem_stride_rt = stem_stride_rt,
-          stem_stride_cv = stem_stride_cv
+          stem_stride_cv = stem_stride_cv,
+          encoder_channels = encoder_channels
         )
         hp <- tm$hyperparams
         mismatches <- character(0)
@@ -1058,6 +1076,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         val_real_n = if (is.null(val_real)) 0L else length(val_real),
         checkpoint_every = checkpoint_every,
         stem_stride_rt = stem_stride_rt, stem_stride_cv = stem_stride_cv,
+        encoder_channels = encoder_channels,
         device = device, seed = seed),
       loss_history = loss_h, val_loss_history = val_h,
       real_val_loss_history = real_val_h,

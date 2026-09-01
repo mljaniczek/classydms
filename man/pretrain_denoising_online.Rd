@@ -40,6 +40,7 @@ pretrain_denoising_online(
   loss_diagnostics = TRUE,
   stem_stride_rt = 4L,
   stem_stride_cv = 1L,
+  encoder_channels = c(16L, 16L, 32L, 64L, 64L),
   device = if (torch::cuda_is_available()) "cuda" else "cpu",
   num_threads = NULL,
   num_workers = 1L,
@@ -211,6 +212,19 @@ synthetic validation metric is computed.}
 \item{loss_diagnostics}{If TRUE, also print median, p95, max batch loss.}
 
 \item{stem_stride_rt, stem_stride_cv}{Encoder stem strides.}
+
+\item{encoder_channels}{Length-5 integer vector controlling encoder
+capacity: \code{c(stem_ch, layer1_ch, layer2_ch, layer3_ch, latent_ch)}.
+The final entry is the GAP-pooled feature dimension (input width
+for the downstream elastic-net classifier). Default
+\code{c(16L, 16L, 32L, 64L, 64L)} matches previous behavior exactly
+(no projection layer added). Wider examples:
+\code{c(16L, 32L, 64L, 128L, 128L)} for 128-dim latent;
+\code{c(16L, 32L, 64L, 128L, 256L)} for 256-dim latent (adds a 1x1
+projection on top). Same 32x/4x RT/CV spatial downsample
+regardless — only channel counts differ. Downstream classifier
+and feature extractor auto-detect the latent dim from the
+trained encoder, so no other args need updating.}
 
 \item{device}{"cpu" or "cuda".}
 

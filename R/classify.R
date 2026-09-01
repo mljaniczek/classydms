@@ -23,6 +23,12 @@ build_pretrained_classifier <- function(encoder,
                                          freeze_backbone = TRUE,
                                          unfreeze_last_block = TRUE) {
   enc <- encoder$clone(deep = TRUE)
+  # Auto-detect latent dim so encoders built with wider
+  # encoder_channels work without needing an explicit latent_dim arg.
+  # Peek at the encoder_channels attr if present (recent dms_encoder),
+  # otherwise fall back to 64 (legacy encoders).
+  latent_dim <- if (!is.null(enc$encoder_channels))
+                  as.integer(tail(enc$encoder_channels, 1L)) else 64L
   classifier <- torch::nn_module(
     initialize = function() {
       self$encoder <- enc
@@ -30,7 +36,7 @@ build_pretrained_classifier <- function(encoder,
       self$head <- torch::nn_sequential(
         torch::nn_flatten(),
         torch::nn_dropout(p = dropout_p),
-        torch::nn_linear(64L, num_classes)
+        torch::nn_linear(latent_dim, num_classes)
       )
       if (freeze_backbone) {
         for (p in self$encoder$parameters) p$requires_grad_(FALSE)
@@ -171,22 +177,39 @@ cv_pretrained_oof <- function(Z_list, y, encoder,
   list(probs = oof, auc = auc_from_probs(y, oof))
 }
 
-#' Extract 64-dim encoder features for all samples (GAP-pooled)
+#' Extract encoder features for all samples (GAP-pooled)
 #'
 #' Runs each sample through the (frozen) encoder, applies global average
-#' pooling to its feature map, and stacks the result into an `(N, 64)`
-#' matrix suitable for use as input to a classical classifier.
+#' pooling to its feature map, and stacks the result into an
+#' `(N, latent_dim)` matrix suitable for use as input to a classical
+#' classifier. Latent dim is auto-detected from the encoder (either via
+#' its `encoder_channels` attribute or by peeking at its output shape
+#' on the first sample), so encoders built with wider
+#' `encoder_channels` work without additional args.
 #'
 #' @param encoder A pre-trained `dms_encoder`.
 #' @param Z_list List of preprocessed, padded intensity matrices.
 #' @param device "cpu" or "cuda".
-#' @return Numeric matrix with one row per sample, 64 columns.
+#' @return Numeric matrix with one row per sample, `latent_dim` columns.
 #' @export
 extract_encoder_features <- function(encoder, Z_list, device = "cpu") {
   encoder$eval(); encoder$to(device = device)
   gap <- torch::nn_adaptive_avg_pool2d(c(1L, 1L))
   n <- length(Z_list)
-  feat_mat <- matrix(NA_real_, nrow = n, ncol = 64L)
+  # Determine latent_dim: prefer the encoder_channels attribute (recent
+  # encoders record it); otherwise probe the first sample's output.
+  latent_dim <- if (!is.null(encoder$encoder_channels))
+                  as.integer(tail(encoder$encoder_channels, 1L))
+                else {
+                  Z0 <- as.matrix(Z_list[[1]])
+                  x0 <- torch::torch_tensor(Z0, dtype = torch::torch_float())$
+                    unsqueeze(1)$unsqueeze(1)$to(device = device)
+                  torch::with_no_grad({
+                    dim <- as.integer(encoder(x0)$size()[2])
+                  })
+                  dim
+                }
+  feat_mat <- matrix(NA_real_, nrow = n, ncol = latent_dim)
   for (i in seq_len(n)) {
     Z <- as.matrix(Z_list[[i]])
     x <- torch::torch_tensor(Z, dtype = torch::torch_float())$
