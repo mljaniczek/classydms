@@ -17,7 +17,8 @@ generate_noisy_pretrain_sample(
   location_jitter_cv = 1,
   noise_scale = 1,
   anchor_dropout = 0,
-  anchor_jitter_variability = NULL
+  anchor_jitter_variability = NULL,
+  variable_source_peak_params = NULL
 )
 }
 \arguments{
@@ -63,6 +64,19 @@ jitter parameters (same convention as
 \code{\link[=generate_one_synthetic_from_catalog]{generate_one_synthetic_from_catalog()}}).}
 
 \item{noise_scale}{Multiplier on catalog noise SD.}
+
+\item{anchor_dropout}{Per-sample Bernoulli probability of dropping
+each anchor before rendering. \code{0} (default) fires all anchors.}
+
+\item{anchor_jitter_variability}{Optional length-2 range for a
+per-sample scalar multiplier on \code{location_jitter_rt/cv}.
+\code{NULL} (default) uses the fixed jitter values as-is.}
+
+\item{variable_source_peak_params}{Optional \code{peak_params} bundle.
+When provided, the variable layer is rendered via
+\code{\link[=generate_one_synthetic]{generate_one_synthetic()}} on this bundle (real peaks, empirical
+locations, joint attributes) instead of the catalog-clustered
+render. Mutually exclusive with \code{variable_config}.}
 }
 \value{
 List with \code{clean} (H x W), \code{noisy} (H x W), and per-layer

@@ -950,6 +950,16 @@ catalog_biomarkers_universal_backdrop <- function(
 #'   jitter parameters (same convention as
 #'   [generate_one_synthetic_from_catalog()]).
 #' @param noise_scale Multiplier on catalog noise SD.
+#' @param anchor_dropout Per-sample Bernoulli probability of dropping
+#'   each anchor before rendering. `0` (default) fires all anchors.
+#' @param anchor_jitter_variability Optional length-2 range for a
+#'   per-sample scalar multiplier on `location_jitter_rt/cv`.
+#'   `NULL` (default) uses the fixed jitter values as-is.
+#' @param variable_source_peak_params Optional `peak_params` bundle.
+#'   When provided, the variable layer is rendered via
+#'   [generate_one_synthetic()] on this bundle (real peaks, empirical
+#'   locations, joint attributes) instead of the catalog-clustered
+#'   render. Mutually exclusive with `variable_config`.
 #' @return List with `clean` (H x W), `noisy` (H x W), and per-layer
 #'   composition metadata (`anchor_ids`, `variable_ids`,
 #'   `contamination_positions`).
@@ -963,7 +973,12 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
                                              location_jitter_cv = 1,
                                              noise_scale = 1.0,
                                              anchor_dropout = 0.0,
-                                             anchor_jitter_variability = NULL) {
+                                             anchor_jitter_variability = NULL,
+                                             variable_source_peak_params = NULL) {
+  if (!is.null(variable_source_peak_params) && !is.null(variable_config)) {
+    stop("variable_source_peak_params and variable_config are ",
+         "mutually exclusive — pass one or the other, not both.")
+  }
   stopifnot(inherits(catalog, "peak_catalog"))
   cmp <- catalog$compounds
   if (!all(anchor_ids %in% cmp$compound_id)) {
@@ -1053,7 +1068,24 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
     res$clean
   }
   Z_anchors  <- render_layer(anchor_ids, setNames(numeric(0), character(0)))
-  Z_variable <- render_layer(variable_ids, variable_int_mult)
+  # Variable layer: default is catalog-clustered medians via
+  # render_layer; override with variable_source_peak_params to draw
+  # from real observed peaks (bootstraps morphology from raw _obs
+  # triples in the peak_params bundle). Bypasses the
+  # catalog-compound-id path entirely — count and morphology are
+  # driven by peak_params$n_peaks$mean/sd and the raw triples.
+  Z_variable <- if (!is.null(variable_source_peak_params)) {
+    res <- generate_one_synthetic(variable_source_peak_params, H, W,
+      add_noise = FALSE,
+      size_jitter = size_jitter,
+      location_mode = "empirical",
+      location_jitter_rt = eff_jitter_rt,
+      location_jitter_cv = eff_jitter_cv,
+      attribute_mode = "joint")
+    res$clean
+  } else {
+    render_layer(variable_ids, variable_int_mult)
+  }
 
   Z <- Z_anchors + Z_variable
 
