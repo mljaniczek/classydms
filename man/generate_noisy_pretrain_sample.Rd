@@ -15,7 +15,9 @@ generate_noisy_pretrain_sample(
   size_jitter = 0.15,
   location_jitter_rt = 2,
   location_jitter_cv = 1,
-  noise_scale = 1
+  noise_scale = 1,
+  anchor_dropout = 0,
+  anchor_jitter_variability = NULL
 )
 }
 \arguments{

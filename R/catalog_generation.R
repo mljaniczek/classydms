@@ -961,7 +961,9 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
                                              size_jitter = 0.15,
                                              location_jitter_rt = 2,
                                              location_jitter_cv = 1,
-                                             noise_scale = 1.0) {
+                                             noise_scale = 1.0,
+                                             anchor_dropout = 0.0,
+                                             anchor_jitter_variability = NULL) {
   stopifnot(inherits(catalog, "peak_catalog"))
   cmp <- catalog$compounds
   if (!all(anchor_ids %in% cmp$compound_id)) {
@@ -969,6 +971,31 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
     stop("anchor_ids references compound_id(s) not in the catalog: ",
          paste(head(bad, 5), collapse = ", "),
          if (length(bad) > 5) "..." else "")
+  }
+  # Per-sample anchor dropout: randomly drop anchor_dropout * 100%
+  # of the anchor compounds so the encoder sees varying anchor
+  # counts across samples (simulates real subject-to-subject
+  # compound absence). At 0 (default) all anchors fire; at 0.2 a
+  # random 20% are silenced this sample.
+  if (anchor_dropout < 0 || anchor_dropout >= 1)
+    stop("anchor_dropout must be in [0, 1).")
+  if (anchor_dropout > 0 && length(anchor_ids) > 0L) {
+    keep_mask <- stats::runif(length(anchor_ids)) >= anchor_dropout
+    anchor_ids <- anchor_ids[keep_mask]
+  }
+  # Per-sample anchor-jitter scalar multiplier drawn from a range.
+  # Whole-sample scalar (not per-anchor) for now — per-anchor is a
+  # deferred refactor (see enhancement backlog).
+  eff_jitter_rt <- location_jitter_rt
+  eff_jitter_cv <- location_jitter_cv
+  if (!is.null(anchor_jitter_variability)) {
+    if (length(anchor_jitter_variability) != 2L ||
+        any(anchor_jitter_variability < 0))
+      stop("anchor_jitter_variability must be length-2, non-negative.")
+    jm <- stats::runif(1, anchor_jitter_variability[1],
+                            anchor_jitter_variability[2])
+    eff_jitter_rt <- location_jitter_rt * jm
+    eff_jitter_cv <- location_jitter_cv * jm
   }
 
   # Layer 2 selection — draw variable compound IDs
@@ -1017,8 +1044,8 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
       catalog, H = H, W = W,
       add_noise           = FALSE,
       size_jitter         = size_jitter,
-      location_jitter_rt  = location_jitter_rt,
-      location_jitter_cv  = location_jitter_cv,
+      location_jitter_rt  = eff_jitter_rt,
+      location_jitter_cv  = eff_jitter_cv,
       prevalence_override = prev_ov_l,
       intensity_mult      = int_ov_l,
       compound_ids        = ids

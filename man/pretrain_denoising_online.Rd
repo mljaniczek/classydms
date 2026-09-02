@@ -42,6 +42,11 @@ pretrain_denoising_online(
   stem_stride_cv = 1L,
   encoder_channels = c(16L, 16L, 32L, 64L, 64L),
   encoder_dropout = 0,
+  anchor_dropout = 0,
+  anchor_jitter_variability = NULL,
+  affine_shift_prob = 1,
+  stripe_noise_config = NULL,
+  rt_warp_config = NULL,
   device = if (torch::cuda_is_available()) "cuda" else "cpu",
   num_threads = NULL,
   num_workers = 1L,
@@ -239,6 +244,57 @@ plateaus or begins rising past a certain epoch. Decoder is left
 clean — only encoder-side matters for downstream transfer.
 Dropout is training-only; encoder$eval() disables it for
 feature extraction and inference automatically.}
+
+\item{anchor_dropout}{Per-sample Bernoulli drop probability applied
+to the anchor set before rendering. Each sample, each anchor
+compound is independently dropped with this probability;
+surviving anchors fire as usual. Default \code{0.0} — all anchors
+always fire (backward-compatible). Recommended \code{0.1}–\code{0.2} to
+simulate real subject-to-subject compound absence.}
+
+\item{anchor_jitter_variability}{Optional length-2 numeric range
+for a per-sample scalar multiplier applied to
+\code{location_jitter_rt} and \code{location_jitter_cv}. When provided,
+each sample draws \code{jm ~ Uniform(low, high)} and effective
+jitter for that sample is \code{location_jitter_rt * jm} on RT and
+\code{location_jitter_cv * jm} on CV. Whole-sample scalar
+(per-anchor variation deferred as a follow-up refactor).
+Default \code{NULL} disables (fixed jitter per sample).}
+
+\item{affine_shift_prob}{Bernoulli probability that any given
+sample gets an affine shift. Default \code{1.0} — every sample when
+\code{affine_shift_rt}/\code{cv} > 0. Set to e.g. \code{0.6} to have 40\% of
+samples receive NO shift (better mimics real acquisition where
+most runs are well-aligned and only some drift).}
+
+\item{stripe_noise_config}{Optional list controlling row- or
+column-correlated stripe noise added to the NOISY input on a
+fraction of samples. Simulates thermal / electrical acquisition
+artifacts. Fields:
+\itemize{
+\item \code{prob} (default \code{0.2}) — Bernoulli fraction of samples that
+get stripe noise this batch.
+\item \code{direction} (\code{"rt"} or \code{"cv"}, default \code{"rt"}) — direction
+along which the noise is 1-D correlated. \code{"rt"} gives
+horizontal bands (one noise value per row, tiled across
+cols); \code{"cv"} gives vertical bands.
+\item \code{intensity} (default \code{c(0.05, 0.15)}) — length-2 SD range
+for the 1-D noise. Drawn uniformly per sample.
+Applied to noisy only (before dust threshold).
+}}
+
+\item{rt_warp_config}{Optional list controlling smooth per-sample
+RT warp applied identically to clean and noisy. Simulates
+column-condition drift where later peaks shift more than early
+peaks. Fields:
+\itemize{
+\item \code{strength} (default \code{0.02}) — fractional shift at the LAST
+row (\code{s * H} pixels). Linear ramp from 0 at row 1. Sign is
+randomized per sample. \verb{|strength|} must be \verb{< 0.5}.
+\item \code{prob} (default \code{1.0}) — Bernoulli fraction of samples that
+get warped.
+Nearest-neighbor row indexing (O(H) per sample).
+}}
 
 \item{device}{"cpu" or "cuda".}
 

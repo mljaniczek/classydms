@@ -335,6 +335,48 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   Defaults `0L / 0L` (no shift, backward-compatible). Reasonable
 #'   values: `affine_shift_rt = 5L, affine_shift_cv = 1L` on
 #'   1400 x 90 images.
+#' @param affine_shift_prob Bernoulli probability that any given
+#'   sample gets an affine shift. Default `1.0` — every sample when
+#'   `affine_shift_rt`/`cv` > 0. Set to e.g. `0.6` to have 40% of
+#'   samples receive NO shift (better mimics real acquisition where
+#'   most runs are well-aligned and only some drift).
+#' @param anchor_dropout Per-sample Bernoulli drop probability applied
+#'   to the anchor set before rendering. Each sample, each anchor
+#'   compound is independently dropped with this probability;
+#'   surviving anchors fire as usual. Default `0.0` — all anchors
+#'   always fire (backward-compatible). Recommended `0.1`–`0.2` to
+#'   simulate real subject-to-subject compound absence.
+#' @param anchor_jitter_variability Optional length-2 numeric range
+#'   for a per-sample scalar multiplier applied to
+#'   `location_jitter_rt` and `location_jitter_cv`. When provided,
+#'   each sample draws `jm ~ Uniform(low, high)` and effective
+#'   jitter for that sample is `location_jitter_rt * jm` on RT and
+#'   `location_jitter_cv * jm` on CV. Whole-sample scalar
+#'   (per-anchor variation deferred as a follow-up refactor).
+#'   Default `NULL` disables (fixed jitter per sample).
+#' @param stripe_noise_config Optional list controlling row- or
+#'   column-correlated stripe noise added to the NOISY input on a
+#'   fraction of samples. Simulates thermal / electrical acquisition
+#'   artifacts. Fields:
+#'   - `prob` (default `0.2`) — Bernoulli fraction of samples that
+#'     get stripe noise this batch.
+#'   - `direction` (`"rt"` or `"cv"`, default `"rt"`) — direction
+#'     along which the noise is 1-D correlated. `"rt"` gives
+#'     horizontal bands (one noise value per row, tiled across
+#'     cols); `"cv"` gives vertical bands.
+#'   - `intensity` (default `c(0.05, 0.15)`) — length-2 SD range
+#'     for the 1-D noise. Drawn uniformly per sample.
+#'   Applied to noisy only (before dust threshold).
+#' @param rt_warp_config Optional list controlling smooth per-sample
+#'   RT warp applied identically to clean and noisy. Simulates
+#'   column-condition drift where later peaks shift more than early
+#'   peaks. Fields:
+#'   - `strength` (default `0.02`) — fractional shift at the LAST
+#'     row (`s * H` pixels). Linear ramp from 0 at row 1. Sign is
+#'     randomized per sample. `|strength|` must be `< 0.5`.
+#'   - `prob` (default `1.0`) — Bernoulli fraction of samples that
+#'     get warped.
+#'   Nearest-neighbor row indexing (O(H) per sample).
 #' @param val_real Optional list of real preprocessed, padded Z
 #'   matrices (each of size `H x W`) held out as a real-data
 #'   validation set. When provided, an additional per-epoch metric
@@ -474,6 +516,11 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        stem_stride_cv = 1L,
                                        encoder_channels = c(16L, 16L, 32L, 64L, 64L),
                                        encoder_dropout = 0.0,
+                                       anchor_dropout = 0.0,
+                                       anchor_jitter_variability = NULL,
+                                       affine_shift_prob = 1.0,
+                                       stripe_noise_config = NULL,
+                                       rt_warp_config = NULL,
                                        device = if (torch::cuda_is_available()) "cuda" else "cpu",
                                        num_threads = NULL,
                                        num_workers = 1L,
@@ -602,6 +649,38 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   if (affine_shift_rt < 0 || affine_shift_cv < 0)
     stop("affine_shift_rt / affine_shift_cv must be >= 0.")
   use_affine <- affine_shift_rt > 0L || affine_shift_cv > 0L
+  # Bernoulli gate on the affine shift — probability that a given
+  # sample gets a shift at all. When 1.0 (default) every sample gets
+  # a fresh dr/dc; when < 1, that fraction of samples gets NO shift
+  # (dr = dc = 0). Simulates real acquisitions where alignment is
+  # usually good and only some runs drift.
+  if (affine_shift_prob < 0 || affine_shift_prob > 1)
+    stop("affine_shift_prob must be in [0, 1].")
+  # anchor_dropout validation (passthrough — sample-time enforcement is
+  # inside generate_noisy_pretrain_sample).
+  if (anchor_dropout < 0 || anchor_dropout >= 1)
+    stop("anchor_dropout must be in [0, 1).")
+  # stripe_noise_config validation.
+  if (!is.null(stripe_noise_config)) {
+    stripe_noise_config$prob            <- stripe_noise_config$prob            %||% 0.2
+    stripe_noise_config$direction       <- stripe_noise_config$direction       %||% "rt"
+    stripe_noise_config$intensity       <- stripe_noise_config$intensity       %||% c(0.05, 0.15)
+    if (!stripe_noise_config$direction %in% c("rt", "cv"))
+      stop("stripe_noise_config$direction must be 'rt' or 'cv'.")
+    if (any(stripe_noise_config$intensity < 0))
+      stop("stripe_noise_config$intensity must be non-negative.")
+  }
+  # rt_warp_config validation. strength expresses the fractional shift
+  # applied at the LAST row (row H); the shift ramps linearly from 0
+  # at row 1 up to strength * H. Applied identically to clean and noisy.
+  if (!is.null(rt_warp_config)) {
+    rt_warp_config$strength <- rt_warp_config$strength %||% 0.02
+    rt_warp_config$prob     <- rt_warp_config$prob     %||% 1.0
+    if (abs(rt_warp_config$strength) >= 0.5)
+      stop("rt_warp_config$strength should be a small fraction (|strength| < 0.5).")
+    if (rt_warp_config$prob < 0 || rt_warp_config$prob > 1)
+      stop("rt_warp_config$prob must be in [0, 1].")
+  }
   # Resolve noisy_dust_threshold once at entry:
   #   NULL default:
   #     split-layer mode -> 0    (keep contamination/noise in noisy)
@@ -711,7 +790,29 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   if (use_affine) {
     message("  Affine shift augmentation: dRT +-", affine_shift_rt,
             " px, dCV +-", affine_shift_cv,
-            " px (coherent shift of clean + noisy)")
+            " px (prob = ", affine_shift_prob,
+            ", coherent shift of clean + noisy)")
+  }
+  if (anchor_dropout > 0) {
+    message("  Anchor dropout: ", anchor_dropout,
+            " (per-sample Bernoulli drop of anchor compounds)")
+  }
+  if (!is.null(anchor_jitter_variability)) {
+    message("  Anchor jitter variability: [",
+            anchor_jitter_variability[1], ", ",
+            anchor_jitter_variability[2],
+            "]x (per-sample scalar multiplier on location_jitter_rt/cv)")
+  }
+  if (!is.null(stripe_noise_config)) {
+    message("  Stripe noise: prob = ", stripe_noise_config$prob,
+            ", direction = ", stripe_noise_config$direction,
+            ", intensity = [", stripe_noise_config$intensity[1], ", ",
+            stripe_noise_config$intensity[2], "] (noisy-only)")
+  }
+  if (!is.null(rt_warp_config)) {
+    message("  RT warp: strength = ", rt_warp_config$strength,
+            ", prob = ", rt_warp_config$prob,
+            " (linear-ramp, applied to clean + noisy)")
   }
   message("  size_jitter: ", size_jitter)
   message("  dust_threshold (clean target): ", dust_threshold,
@@ -798,6 +899,11 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
           mask_config = mask_config,
           affine_shift_rt = affine_shift_rt,
           affine_shift_cv = affine_shift_cv,
+          affine_shift_prob = affine_shift_prob,
+          anchor_dropout = anchor_dropout,
+          anchor_jitter_variability = anchor_jitter_variability,
+          stripe_noise_config = stripe_noise_config,
+          rt_warp_config = rt_warp_config,
           stem_stride_rt = stem_stride_rt,
           stem_stride_cv = stem_stride_cv,
           encoder_channels = encoder_channels,
@@ -879,7 +985,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        size_jitter = size_jitter,
                                        location_jitter_rt = location_jitter_rt,
                                        location_jitter_cv = location_jitter_cv,
-                                       noise_scale = ns)
+                                       noise_scale = ns,
+                                       anchor_dropout = anchor_dropout,
+                                       anchor_jitter_variability = anchor_jitter_variability)
     } else if (!is.null(catalog)) {
       generate_one_synthetic_from_catalog(catalog, H, W,
                                     add_noise = add_noise,
@@ -915,8 +1023,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     # Coherent per-sample affine shift (data augmentation). Applied
     # to BOTH clean and noisy so the encoder is not asked to correct
     # the drift — it just sees peaks at different absolute row/col
-    # positions across samples.
-    if (use_affine) {
+    # positions across samples. Bernoulli-gated by affine_shift_prob:
+    # at 1.0 (default) every sample gets a shift; at 0.6 only 60% do.
+    if (use_affine && stats::runif(1) < affine_shift_prob) {
       dr <- if (affine_shift_rt > 0L)
               sample(-affine_shift_rt:affine_shift_rt, 1L) else 0L
       dc <- if (affine_shift_cv > 0L)
@@ -931,6 +1040,23 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
       }
       pair$clean <- shift_mat(pair$clean, dr, dc)
       pair$noisy <- shift_mat(pair$noisy, dr, dc)
+    }
+    # Non-linear RT warp: linear-ramp warp along RT applied to BOTH
+    # clean and noisy identically. Simulates smooth column-condition
+    # drift (later peaks shift more than early peaks). Nearest-neighbor
+    # row indexing so it's O(H) per sample.
+    if (!is.null(rt_warp_config) &&
+        stats::runif(1) < rt_warp_config$prob) {
+      s <- rt_warp_config$strength
+      # Randomize sign per sample so warp can compress OR stretch
+      s <- s * sample(c(-1, 1), 1L)
+      r_in <- seq_len(H)
+      # Sample source row for each output row: linear ramp from 0
+      # (top) to s*H (bottom). Nearest-neighbor with clipping.
+      src <- as.integer(round(r_in + s * (r_in - 1)))
+      src <- pmax(1L, pmin(H, src))
+      pair$clean <- pair$clean[src, , drop = FALSE]
+      pair$noisy <- pair$noisy[src, , drop = FALSE]
     }
     # Mask augmentation: zero out random rectangles from the NOISY
     # input only. Encoder reconstructs from surrounding context.
@@ -954,6 +1080,25 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         pair$noisy[r0:(r0 + rect_h - 1L),
                     c0:(c0 + rect_w - 1L)] <- 0
       }
+    }
+    # Stripe noise: row- or column-correlated band-limited noise added
+    # to the NOISY input only (fraction of samples set by
+    # stripe_noise_config$prob). Simulates thermal / electrical
+    # acquisition artifacts. RT direction gives horizontal bands
+    # (constant along CV within each row); CV gives vertical bands.
+    if (!is.null(stripe_noise_config) &&
+        stats::runif(1) < stripe_noise_config$prob) {
+      sn_amp <- stats::runif(1, stripe_noise_config$intensity[1],
+                                    stripe_noise_config$intensity[2])
+      if (stripe_noise_config$direction == "rt") {
+        # One noise value per row, tiled across all cols
+        stripe1d <- stats::rnorm(H, mean = 0, sd = sn_amp)
+        stripe <- matrix(stripe1d, nrow = H, ncol = W)
+      } else {
+        stripe1d <- stats::rnorm(W, mean = 0, sd = sn_amp)
+        stripe <- matrix(stripe1d, nrow = H, ncol = W, byrow = TRUE)
+      }
+      pair$noisy <- pair$noisy + stripe
     }
     # Dust thresholding matches real-data preprocessing (see
     # baseline_basement) so synthetic samples have the same sparsity
@@ -1097,6 +1242,11 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         stem_stride_rt = stem_stride_rt, stem_stride_cv = stem_stride_cv,
         encoder_channels = encoder_channels,
         encoder_dropout = encoder_dropout,
+        anchor_dropout = anchor_dropout,
+        anchor_jitter_variability = anchor_jitter_variability,
+        affine_shift_prob = affine_shift_prob,
+        stripe_noise_config = stripe_noise_config,
+        rt_warp_config = rt_warp_config,
         device = device, seed = seed),
       loss_history = loss_h, val_loss_history = val_h,
       real_val_loss_history = real_val_h,
