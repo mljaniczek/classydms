@@ -134,11 +134,28 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
     if (!got_valid) next
     fired[i] <- TRUE
 
-    # Place with location jitter (rt_place / cv_place are always in
-    # fraction — see coord_mode branch above).
-    mu_rt <- rt_place[i] * H +
+    # Placement: prefer per-observation positions (rt_frac_obs /
+    # cv_frac_obs list-columns, added in build_peak_catalog) so
+    # synthetic peaks span the natural cluster spread rather than
+    # collapsing to the centroid + tiny jitter. Uses the SAME
+    # bootstrap index j as morphology, preserving the physical
+    # coupling that a given real observation had a specific position
+    # AND a specific morphology together. Falls back to the centroid
+    # (rt_place[i]) if per-obs positions are absent (older catalogs
+    # built before this columnar addition).
+    if ("rt_frac_obs" %in% names(compounds) &&
+        length(compounds$rt_frac_obs[[i]]) >= j) {
+      rt_place_i <- compounds$rt_frac_obs[[i]][j]
+      cv_place_i <- compounds$cv_frac_obs[[i]][j]
+      if (!is.finite(rt_place_i)) rt_place_i <- rt_place[i]
+      if (!is.finite(cv_place_i)) cv_place_i <- cv_place[i]
+    } else {
+      rt_place_i <- rt_place[i]
+      cv_place_i <- cv_place[i]
+    }
+    mu_rt <- rt_place_i * H +
                stats::rnorm(1, 0, location_jitter_rt)
-    mu_cv <- cv_place[i] * W +
+    mu_cv <- cv_place_i * W +
                stats::rnorm(1, 0, location_jitter_cv)
     mu_rt <- max(1, min(H, mu_rt))
     mu_cv <- max(1, min(W, mu_cv))
@@ -578,8 +595,20 @@ simulate_case_control_from_catalog <- function(catalog,
         if (!got_valid) return()
         mult <- if (as.character(cid) %in% names(int_mult))
                   int_mult[[as.character(cid)]] else 1.0
-        mu_rt <- rt_place[crow] * H + stats::rnorm(1, 0, location_jitter_rt)
-        mu_cv <- cv_place[crow] * W + stats::rnorm(1, 0, location_jitter_cv)
+        # Bootstrap position jointly with morphology if per-obs
+        # positions available (post-refactor catalogs); fall back to
+        # centroid otherwise.
+        if ("rt_frac_obs" %in% names(catalog$compounds) &&
+            length(catalog$compounds$rt_frac_obs[[crow]]) >= j) {
+          rp <- catalog$compounds$rt_frac_obs[[crow]][j]
+          cp <- catalog$compounds$cv_frac_obs[[crow]][j]
+          if (!is.finite(rp)) rp <- rt_place[crow]
+          if (!is.finite(cp)) cp <- cv_place[crow]
+        } else {
+          rp <- rt_place[crow]; cp <- cv_place[crow]
+        }
+        mu_rt <- rp * H + stats::rnorm(1, 0, location_jitter_rt)
+        mu_cv <- cp * W + stats::rnorm(1, 0, location_jitter_cv)
         mu_rt <- max(1, min(H, mu_rt))
         mu_cv <- max(1, min(W, mu_cv))
         scale_factor <- exp(stats::rnorm(1, 0, size_jitter))

@@ -340,9 +340,19 @@ build_peak_catalog <- function(peak_params,
     sig_rt_m <- peak_params$sigma_rt_raw[members]
     sig_cv_m <- peak_params$sigma_cv_raw[members]
     int_m    <- intensity[members]
+    # Per-observation fraction positions of each cluster member.
+    # Stored as list-columns so synthesis can bootstrap position jointly
+    # with morphology (same random index j across all four vectors), which
+    # gives synthetic peaks a natural spread ~= location_sd_rt/cv rather
+    # than the tiny location_jitter that was previously the only source
+    # of positional variability. Preserves the physical coupling that
+    # peaks with certain morphologies also land at certain positions.
+    rt_frac_m <- rt_frac_ref[members]
+    cv_frac_m <- cv_frac_ref[members]
     keep_obs <- is.finite(sig_rt_m) & sig_rt_m > 0 &
                 is.finite(sig_cv_m) & sig_cv_m > 0 &
-                is.finite(int_m)    & int_m    > 0
+                is.finite(int_m)    & int_m    > 0 &
+                is.finite(rt_frac_m) & is.finite(cv_frac_m)
     row <- tibble::tibble(
       compound_id     = cid,
       rt_loc          = stats::median(rt[members], na.rm = TRUE),
@@ -357,6 +367,8 @@ build_peak_catalog <- function(peak_params,
       sigma_rt_obs    = list(sig_rt_m[keep_obs]),
       sigma_cv_obs    = list(sig_cv_m[keep_obs]),
       intensity_obs   = list(int_m[keep_obs]),
+      rt_frac_obs     = list(rt_frac_m[keep_obs]),
+      cv_frac_obs     = list(cv_frac_m[keep_obs]),
       member_indices  = list(members)
     )
     # If both physical + fraction are available, also store the OTHER
