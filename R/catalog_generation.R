@@ -150,9 +150,19 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
     sig_cv <- max(sig_cv * scale_factor, 0.8)
     amp <- base_amp * mult * (0.5 + 0.5 * scale_factor)
 
-    g_rt <- exp(-0.5 * ((rows - mu_rt) / sig_rt)^2)
-    g_cv <- exp(-0.5 * ((cols - mu_cv) / sig_cv)^2)
-    clean <- clean + amp * outer(g_rt, g_cv)
+    # Local-window Gaussian eval: only compute exp() over +-5 sigma
+    # around the peak center, then add to the corresponding slice of
+    # clean. Peak value at +-5 sigma is exp(-12.5) ~ 4e-6, well below
+    # any dust threshold, so accuracy is preserved. Full-grid H*W eval
+    # was pure waste on the >= 99% of pixels far from the peak.
+    r_lo <- max(1L, as.integer(floor(mu_rt - 5 * sig_rt)))
+    r_hi <- min(H,  as.integer(ceiling(mu_rt + 5 * sig_rt)))
+    c_lo <- max(1L, as.integer(floor(mu_cv - 5 * sig_cv)))
+    c_hi <- min(W,  as.integer(ceiling(mu_cv + 5 * sig_cv)))
+    rr <- r_lo:r_hi; cc <- c_lo:c_hi
+    g_rt <- exp(-0.5 * ((rr - mu_rt) / sig_rt)^2)
+    g_cv <- exp(-0.5 * ((cc - mu_cv) / sig_cv)^2)
+    clean[rr, cc] <- clean[rr, cc] + amp * outer(g_rt, g_cv)
     placements_cid    <- c(placements_cid,    compounds$compound_id[i])
     placements_mu_rt  <- c(placements_mu_rt,  mu_rt)
     placements_mu_cv  <- c(placements_mu_cv,  mu_cv)
@@ -530,11 +540,16 @@ simulate_case_control_from_catalog <- function(catalog,
         idxs <- placements_by_cid[[as.character(cid)]]
         if (is.null(idxs)) return()
         for (p in idxs) {
-          g_rt <- exp(-0.5 * ((seq_len(H) - placements$mu_rt[p]) /
-                                placements$sig_rt[p])^2)
-          g_cv <- exp(-0.5 * ((seq_len(W) - placements$mu_cv[p]) /
-                                placements$sig_cv[p])^2)
-          Z <<- Z - placements$amp[p] * outer(g_rt, g_cv)
+          mu_rt_p <- placements$mu_rt[p]; sig_rt_p <- placements$sig_rt[p]
+          mu_cv_p <- placements$mu_cv[p]; sig_cv_p <- placements$sig_cv[p]
+          r_lo <- max(1L, as.integer(floor(mu_rt_p - 5 * sig_rt_p)))
+          r_hi <- min(H,  as.integer(ceiling(mu_rt_p + 5 * sig_rt_p)))
+          c_lo <- max(1L, as.integer(floor(mu_cv_p - 5 * sig_cv_p)))
+          c_hi <- min(W,  as.integer(ceiling(mu_cv_p + 5 * sig_cv_p)))
+          rr <- r_lo:r_hi; cc <- c_lo:c_hi
+          g_rt <- exp(-0.5 * ((rr - mu_rt_p) / sig_rt_p)^2)
+          g_cv <- exp(-0.5 * ((cc - mu_cv_p) / sig_cv_p)^2)
+          Z[rr, cc] <<- Z[rr, cc] - placements$amp[p] * outer(g_rt, g_cv)
         }
       }
       add_compound <- function(cid) {
@@ -571,9 +586,14 @@ simulate_case_control_from_catalog <- function(catalog,
         sig_rt <- max(sig_rt * scale_factor, 0.8)
         sig_cv <- max(sig_cv * scale_factor, 0.8)
         amp <- base_amp * mult * (0.5 + 0.5 * scale_factor)
-        g_rt <- exp(-0.5 * ((seq_len(H) - mu_rt) / sig_rt)^2)
-        g_cv <- exp(-0.5 * ((seq_len(W) - mu_cv) / sig_cv)^2)
-        Z <<- Z + amp * outer(g_rt, g_cv)
+        r_lo <- max(1L, as.integer(floor(mu_rt - 5 * sig_rt)))
+        r_hi <- min(H,  as.integer(ceiling(mu_rt + 5 * sig_rt)))
+        c_lo <- max(1L, as.integer(floor(mu_cv - 5 * sig_cv)))
+        c_hi <- min(W,  as.integer(ceiling(mu_cv + 5 * sig_cv)))
+        rr <- r_lo:r_hi; cc <- c_lo:c_hi
+        g_rt <- exp(-0.5 * ((rr - mu_rt) / sig_rt)^2)
+        g_cv <- exp(-0.5 * ((cc - mu_cv) / sig_cv)^2)
+        Z[rr, cc] <<- Z[rr, cc] + amp * outer(g_rt, g_cv)
       }
 
       for (g in cofire) {

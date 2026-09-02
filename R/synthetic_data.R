@@ -422,9 +422,16 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
     sig_rt <- max(sig_rt * scale_factor, 0.8)
     sig_cv <- max(sig_cv * scale_factor, 0.8)
     amp <- base_amp * (0.5 + 0.5 * scale_factor)
-    g_rt <- exp(-0.5 * ((rows - mu_rt) / sig_rt)^2)
-    g_cv <- exp(-0.5 * ((cols - mu_cv) / sig_cv)^2)
-    clean <- clean + amp * outer(g_rt, g_cv)
+    # Local-window Gaussian eval — see generate_one_synthetic_from_catalog
+    # for rationale. +-5 sigma covers >99.99% of the peak's mass.
+    r_lo <- max(1L, as.integer(floor(mu_rt - 5 * sig_rt)))
+    r_hi <- min(H,  as.integer(ceiling(mu_rt + 5 * sig_rt)))
+    c_lo <- max(1L, as.integer(floor(mu_cv - 5 * sig_cv)))
+    c_hi <- min(W,  as.integer(ceiling(mu_cv + 5 * sig_cv)))
+    rr <- r_lo:r_hi; cc <- c_lo:c_hi
+    g_rt <- exp(-0.5 * ((rr - mu_rt) / sig_rt)^2)
+    g_cv <- exp(-0.5 * ((cc - mu_cv) / sig_cv)^2)
+    clean[rr, cc] <- clean[rr, cc] + amp * outer(g_rt, g_cv)
   }
   if (!add_noise) return(list(clean = clean, noisy = clean))
   # Belt-and-suspenders: if noise stats are somehow still non-finite,
