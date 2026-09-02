@@ -10,7 +10,8 @@ dms_denoising_autoencoder(
   in_channels = 1L,
   stem_stride_rt = 4L,
   stem_stride_cv = 1L,
-  encoder_channels = c(16L, 16L, 32L, 64L, 64L)
+  encoder_channels = c(16L, 16L, 32L, 64L, 64L),
+  dropout_p = 0
 )
 }
 \arguments{
@@ -22,6 +23,11 @@ dms_denoising_autoencoder(
 
 \item{encoder_channels}{Length-5 integer vector, same as the encoder's.
 Default \code{c(16L, 16L, 32L, 64L, 64L)} matches previous behavior.}
+
+\item{dropout_p}{Encoder-side channel dropout probability
+(see \code{\link[=dms_encoder]{dms_encoder()}}). Decoder stays clean — dropout is only
+applied to the encoder because that's the part transferred to
+downstream classification. Default \code{0.0}.}
 }
 \description{
 Forward pass: \code{x -> encoder -> z -> decoder -> reconstruction}. Trained

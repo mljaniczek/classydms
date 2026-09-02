@@ -33,15 +33,29 @@
 #'   examples: `c(16L, 32L, 64L, 128L, 128L)` for 128-dim latent;
 #'   `c(16L, 32L, 64L, 128L, 256L)` for 256-dim latent with a 1x1
 #'   projection on top.
+#' @param dropout_p Channel-dropout probability applied via
+#'   `nn_dropout2d` between residual block groups (after layer1,
+#'   layer2, layer3). Whole feature-map channels are zeroed independently
+#'   with probability `dropout_p`. Standard regularization for
+#'   convolutional encoders; more transferable than element-wise dropout
+#'   for spatially-correlated feature maps. Default `0.0` disables
+#'   dropout (identity behavior). Recommended try-values `0.1` and `0.2`
+#'   when overfit past a certain epoch is observed on real-validation
+#'   MSE. Applied only in `training` mode (encoder$eval() disables it
+#'   automatically for downstream feature extraction and inference).
 #' @export
 dms_encoder <- torch::nn_module(
   initialize = function(in_channels = 1L,
                         stem_stride_rt = 4L, stem_stride_cv = 1L,
-                        encoder_channels = c(16L, 16L, 32L, 64L, 64L)) {
+                        encoder_channels = c(16L, 16L, 32L, 64L, 64L),
+                        dropout_p = 0.0) {
     encoder_channels <- as.integer(encoder_channels)
     stopifnot(length(encoder_channels) == 5L,
               all(encoder_channels > 0))
+    if (dropout_p < 0 || dropout_p >= 1)
+      stop("dropout_p must be in [0, 1).")
     self$encoder_channels <- encoder_channels
+    self$dropout_p <- dropout_p
     c1 <- encoder_channels[1]; c2 <- encoder_channels[2]
     c3 <- encoder_channels[3]; c4 <- encoder_channels[4]
     c5 <- encoder_channels[5]
@@ -75,12 +89,22 @@ dms_encoder <- torch::nn_module(
         torch::nn_relu()
       )
     }
+    # Single stateless dropout module reused across the three
+    # inter-layer positions. Instantiated only when dropout is on so
+    # the default-arg encoder has zero extra parameters/modules.
+    self$use_dropout <- dropout_p > 0
+    if (self$use_dropout) {
+      self$drop <- torch::nn_dropout2d(p = dropout_p)
+    }
   },
   forward = function(x) {
     x <- self$stem(x)
     x <- self$layer1(x)
+    if (self$use_dropout) x <- self$drop(x)
     x <- self$layer2(x)
+    if (self$use_dropout) x <- self$drop(x)
     x <- self$layer3(x)
+    if (self$use_dropout) x <- self$drop(x)
     if (self$has_projection) x <- self$projection(x)
     x
   }
@@ -164,16 +188,22 @@ dms_decoder <- torch::nn_module(
 #'
 #' @inheritParams dms_decoder
 #' @param in_channels Input channels (default 1).
+#' @param dropout_p Encoder-side channel dropout probability
+#'   (see [dms_encoder()]). Decoder stays clean — dropout is only
+#'   applied to the encoder because that's the part transferred to
+#'   downstream classification. Default `0.0`.
 #' @export
 dms_denoising_autoencoder <- torch::nn_module(
   initialize = function(target_H, target_W, in_channels = 1L,
                         stem_stride_rt = 4L, stem_stride_cv = 1L,
-                        encoder_channels = c(16L, 16L, 32L, 64L, 64L)) {
+                        encoder_channels = c(16L, 16L, 32L, 64L, 64L),
+                        dropout_p = 0.0) {
     self$encoder_channels <- as.integer(encoder_channels)
     self$encoder <- dms_encoder(in_channels = in_channels,
                                  stem_stride_rt = stem_stride_rt,
                                  stem_stride_cv = stem_stride_cv,
-                                 encoder_channels = encoder_channels)
+                                 encoder_channels = encoder_channels,
+                                 dropout_p = dropout_p)
     self$decoder <- dms_decoder(target_H = target_H, target_W = target_W,
                                  stem_stride_rt = stem_stride_rt,
                                  stem_stride_cv = stem_stride_cv,

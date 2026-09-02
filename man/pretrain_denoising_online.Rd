@@ -41,6 +41,7 @@ pretrain_denoising_online(
   stem_stride_rt = 4L,
   stem_stride_cv = 1L,
   encoder_channels = c(16L, 16L, 32L, 64L, 64L),
+  encoder_dropout = 0,
   device = if (torch::cuda_is_available()) "cuda" else "cpu",
   num_threads = NULL,
   num_workers = 1L,
@@ -225,6 +226,19 @@ projection on top). Same 32x/4x RT/CV spatial downsample
 regardless — only channel counts differ. Downstream classifier
 and feature extractor auto-detect the latent dim from the
 trained encoder, so no other args need updating.}
+
+\item{encoder_dropout}{Channel-dropout probability for the encoder
+(see \code{\link[=dms_encoder]{dms_encoder()}}). Applied via \code{nn_dropout2d} between
+residual block groups — whole feature-map channels are zeroed
+independently with probability \code{encoder_dropout}. Standard
+regularization to reduce overfit to the synthetic distribution
+and improve transferability of encoder features to real data.
+Default \code{0.0} disables dropout (backward-compatible).
+Recommended try-values \code{0.1} and \code{0.2} when real-validation MSE
+plateaus or begins rising past a certain epoch. Decoder is left
+clean — only encoder-side matters for downstream transfer.
+Dropout is training-only; encoder$eval() disables it for
+feature extraction and inference automatically.}
 
 \item{device}{"cpu" or "cuda".}
 

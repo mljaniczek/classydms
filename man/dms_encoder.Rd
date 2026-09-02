@@ -8,7 +8,8 @@ dms_encoder(
   in_channels = 1L,
   stem_stride_rt = 4L,
   stem_stride_cv = 1L,
-  encoder_channels = c(16L, 16L, 32L, 64L, 64L)
+  encoder_channels = c(16L, 16L, 32L, 64L, 64L),
+  dropout_p = 0
 )
 }
 \arguments{
@@ -23,6 +24,17 @@ fixed architecture exactly (no projection layer added). Wider
 examples: \code{c(16L, 32L, 64L, 128L, 128L)} for 128-dim latent;
 \code{c(16L, 32L, 64L, 128L, 256L)} for 256-dim latent with a 1x1
 projection on top.}
+
+\item{dropout_p}{Channel-dropout probability applied via
+\code{nn_dropout2d} between residual block groups (after layer1,
+layer2, layer3). Whole feature-map channels are zeroed independently
+with probability \code{dropout_p}. Standard regularization for
+convolutional encoders; more transferable than element-wise dropout
+for spatially-correlated feature maps. Default \code{0.0} disables
+dropout (identity behavior). Recommended try-values \code{0.1} and \code{0.2}
+when overfit past a certain epoch is observed on real-validation
+MSE. Applied only in \code{training} mode (encoder$eval() disables it
+automatically for downstream feature extraction and inference).}
 }
 \description{
 Three residual block groups with an asymmetric stem stride that

@@ -359,6 +359,18 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   regardless — only channel counts differ. Downstream classifier
 #'   and feature extractor auto-detect the latent dim from the
 #'   trained encoder, so no other args need updating.
+#' @param encoder_dropout Channel-dropout probability for the encoder
+#'   (see [dms_encoder()]). Applied via `nn_dropout2d` between
+#'   residual block groups — whole feature-map channels are zeroed
+#'   independently with probability `encoder_dropout`. Standard
+#'   regularization to reduce overfit to the synthetic distribution
+#'   and improve transferability of encoder features to real data.
+#'   Default `0.0` disables dropout (backward-compatible).
+#'   Recommended try-values `0.1` and `0.2` when real-validation MSE
+#'   plateaus or begins rising past a certain epoch. Decoder is left
+#'   clean — only encoder-side matters for downstream transfer.
+#'   Dropout is training-only; encoder$eval() disables it for
+#'   feature extraction and inference automatically.
 #' @param device "cpu" or "cuda".
 #' @param num_threads If non-NULL, sets the number of CPU threads
 #'   used by torch for forward/backward passes via
@@ -461,6 +473,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        stem_stride_rt = 4L,
                                        stem_stride_cv = 1L,
                                        encoder_channels = c(16L, 16L, 32L, 64L, 64L),
+                                       encoder_dropout = 0.0,
                                        device = if (torch::cuda_is_available()) "cuda" else "cpu",
                                        num_threads = NULL,
                                        num_workers = 1L,
@@ -653,6 +666,10 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   message("  Encoder channels: [",
           paste(encoder_channels, collapse = ", "),
           "] (latent dim = ", tail(encoder_channels, 1L), ")")
+  message("  Encoder dropout: ", encoder_dropout,
+          if (encoder_dropout > 0)
+            " (nn_dropout2d between residual block groups)"
+          else " (off)")
   message("  R-side data workers: ", num_workers,
           if (use_parallel) " (parallel via future::multisession)" else " (serial)")
   message("  Source: ",
@@ -723,7 +740,8 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   model <- dms_denoising_autoencoder(target_H = H, target_W = W,
                                       stem_stride_rt = stem_stride_rt,
                                       stem_stride_cv = stem_stride_cv,
-                                      encoder_channels = encoder_channels)
+                                      encoder_channels = encoder_channels,
+                                      dropout_p = encoder_dropout)
   model$to(device = device)
 
   # ---- Resume from saved state if requested ----
@@ -782,7 +800,8 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
           affine_shift_cv = affine_shift_cv,
           stem_stride_rt = stem_stride_rt,
           stem_stride_cv = stem_stride_cv,
-          encoder_channels = encoder_channels
+          encoder_channels = encoder_channels,
+          encoder_dropout = encoder_dropout
         )
         hp <- tm$hyperparams
         mismatches <- character(0)
@@ -1077,6 +1096,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         checkpoint_every = checkpoint_every,
         stem_stride_rt = stem_stride_rt, stem_stride_cv = stem_stride_cv,
         encoder_channels = encoder_channels,
+        encoder_dropout = encoder_dropout,
         device = device, seed = seed),
       loss_history = loss_h, val_loss_history = val_h,
       real_val_loss_history = real_val_h,
