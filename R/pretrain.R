@@ -344,14 +344,22 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   Set to e.g. `0.6` to have 40% of samples receive NO shift
 #'   (better mimics real acquisition where most runs are well-aligned
 #'   and only some drift).
-#' @param shift_group_size Integer >= 1. When N > 1, the first N
-#'   samples in each batch share ONE shift draw (magnitude, direction,
-#'   and Bernoulli activation all coherent within the group), the
-#'   next N share another, etc. Default `1L` reproduces the current
-#'   per-sample-independent behavior. Setting to `batch_size` models
-#'   each batch as one "acquisition session" in which every sample
-#'   drifted the same way. Also gates whether stripe patterns are
-#'   grouped, when `stripe_noise_config$grouped = TRUE`.
+#' @param shift_group_size Group size for the coherent shift draw.
+#'   Accepts either shape:
+#'   - Scalar `N` (integer, default `1L`): fixed. The first N samples
+#'     in each batch share ONE shift draw (magnitude, direction, and
+#'     Bernoulli activation all coherent within the group), the next
+#'     N share another, etc. `1L` reproduces the current
+#'     per-sample-independent behavior.
+#'   - Length-2 vector `c(N_lo, N_hi)`: each successive group draws
+#'     its own size from `Uniform(N_lo, N_hi)`, so group boundaries
+#'     themselves vary within a batch. Matches real acquisitions
+#'     where sessions differ in length.
+#'
+#'   Setting scalar to `batch_size` models each batch as one
+#'   "acquisition session" in which every sample drifted the same
+#'   way. Also gates whether stripe patterns are grouped, when
+#'   `stripe_noise_config$grouped = TRUE`.
 #' @param baseline_drift_config Optional list controlling smooth
 #'   low-frequency baseline drift added to the NOISY input only
 #'   (clean target untouched — this is corruption the encoder must
@@ -762,13 +770,31 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   # Batch-correlated shift. shift_group_size = N means the first N
   # samples in a batch share ONE shift draw (magnitude, direction, and
   # Bernoulli activation all coherent), the next N share another, etc.
-  # Default 1L reproduces the current per-sample-independent behavior.
-  # Set to batch_size to model each batch as one "acquisition session"
-  # in which every sample drifted the same way; smaller values mix
-  # sessions within a batch.
-  shift_group_size <- as.integer(shift_group_size)
-  if (is.na(shift_group_size) || shift_group_size < 1L)
-    stop("shift_group_size must be a positive integer.")
+  # Also accepts c(N_lo, N_hi): each successive group draws its own
+  # size from Uniform(N_lo, N_hi) so group boundaries THEMSELVES vary
+  # within a batch — matches real acquisition where sessions differ
+  # in length. Default 1L reproduces the current per-sample-independent
+  # behavior. Scalar N = batch_size models each batch as one
+  # "acquisition session" in which every sample drifted the same way.
+  shift_group_size_spec <- if (length(shift_group_size) == 1L) {
+    n <- as.integer(shift_group_size)
+    if (is.na(n) || n < 1L)
+      stop("shift_group_size must be a positive integer.")
+    list(lo = n, hi = n, stochastic = FALSE)
+  } else if (length(shift_group_size) == 2L) {
+    n <- as.integer(shift_group_size)
+    if (any(is.na(n)) || any(n < 1L))
+      stop("shift_group_size = c(lo, hi) must be positive integers.")
+    if (n[1] > n[2])
+      stop("shift_group_size = c(lo, hi) must have lo <= hi.")
+    list(lo = n[1], hi = n[2], stochastic = TRUE)
+  } else {
+    stop("shift_group_size must be scalar or length-2 integer.")
+  }
+  # Keep original shape for manifest/log (scalar or length-2 vec).
+  shift_group_size <- if (shift_group_size_spec$stochastic)
+                        c(shift_group_size_spec$lo, shift_group_size_spec$hi)
+                      else shift_group_size_spec$hi
   # anchor_dropout validation (passthrough — sample-time enforcement is
   # inside generate_noisy_pretrain_sample).
   if (anchor_dropout < 0 || anchor_dropout >= 1)
@@ -942,11 +968,17 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
       else
         paste0("+-", spec$hi, " px")
     }
+    group_str <- if (shift_group_size_spec$stochastic)
+                    paste0("size in [", shift_group_size_spec$lo, ", ",
+                            shift_group_size_spec$hi, "]")
+                  else as.character(shift_group_size_spec$hi)
     message("  Affine shift augmentation: dRT ", fmt_spec(shift_rt_spec),
             ", dCV ", fmt_spec(shift_cv_spec),
             " (prob = ", affine_shift_prob,
-            ", group = ", shift_group_size,
-            if (shift_group_size == 1L) " -> per-sample" else " -> shared within group",
+            ", group = ", group_str,
+            if (identical(shift_group_size_spec$hi, 1L) &&
+                !shift_group_size_spec$stochastic)
+              " -> per-sample" else " -> shared within group",
             ", coherent shift of clean + noisy)")
   }
   if (anchor_dropout > 0) {
@@ -965,7 +997,12 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
             ", intensity = [", stripe_noise_config$intensity[1], ", ",
             stripe_noise_config$intensity[2], "]",
             if (stripe_noise_config$grouped)
-              paste0(" (grouped within shift group of ", shift_group_size, ")")
+              paste0(" (grouped within shift group of ",
+                     if (shift_group_size_spec$stochastic)
+                       paste0("size ", shift_group_size_spec$lo, "-",
+                              shift_group_size_spec$hi)
+                     else shift_group_size_spec$hi,
+                     ")")
             else " (independent per sample)",
             " (noisy-only)")
   }
@@ -1379,12 +1416,27 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   }
 
   generate_batch <- function(n = batch_size) {
-    # Precompute augment specs per sample. Shift is drawn once per
-    # contiguous group of shift_group_size samples; when the group
-    # size equals 1 (default) every sample gets an independent draw.
+    # Precompute augment specs per sample. Group sizes are either
+    # fixed (scalar shift_group_size) or drawn per-group from
+    # U(lo, hi) so group boundaries themselves vary within a batch.
     # Stripe is per-group when stripe_noise_config$grouped, else
     # per-sample. Baseline drift is always per-sample.
-    n_groups <- ceiling(n / shift_group_size)
+    draw_group_size <- function() {
+      if (shift_group_size_spec$stochastic)
+        sample(shift_group_size_spec$lo:shift_group_size_spec$hi, 1L)
+      else shift_group_size_spec$hi
+    }
+    group_ids  <- integer(n)
+    group_sizes <- integer(0L)
+    filled <- 0L; g <- 0L
+    while (filled < n) {
+      g <- g + 1L
+      sz <- min(draw_group_size(), n - filled)
+      group_ids[(filled + 1L):(filled + sz)] <- g
+      group_sizes <- c(group_sizes, sz)
+      filled <- filled + sz
+    }
+    n_groups <- g
     group_shifts <- lapply(seq_len(n_groups), function(.) draw_shift_spec())
     stripe_grouped <- !is.null(stripe_noise_config) &&
                         isTRUE(stripe_noise_config$grouped)
@@ -1392,9 +1444,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                         lapply(seq_len(n_groups), function(.) draw_stripe_pattern())
                       else NULL
     augment_specs <- lapply(seq_len(n), function(i) {
-      g <- ((i - 1L) %/% shift_group_size) + 1L
-      stripe_i <- if (stripe_grouped) group_stripes[[g]] else draw_stripe_pattern()
-      list(shift = group_shifts[[g]],
+      g_i <- group_ids[i]
+      stripe_i <- if (stripe_grouped) group_stripes[[g_i]] else draw_stripe_pattern()
+      list(shift = group_shifts[[g_i]],
            stripe = stripe_i,
            baseline = draw_baseline_drift())
     })

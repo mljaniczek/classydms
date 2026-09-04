@@ -213,14 +213,24 @@ not drift correction). Reasonable values on 1400 x 90 images:
 \verb{affine_shift_rt = c(5L, 25L), affine_shift_cv = c(1L, 5L)}
 (stochastic).}
 
-\item{shift_group_size}{Integer >= 1. When N > 1, the first N
-samples in each batch share ONE shift draw (magnitude, direction,
-and Bernoulli activation all coherent within the group), the
-next N share another, etc. Default \code{1L} reproduces the current
-per-sample-independent behavior. Setting to \code{batch_size} models
-each batch as one "acquisition session" in which every sample
-drifted the same way. Also gates whether stripe patterns are
-grouped, when \code{stripe_noise_config$grouped = TRUE}.}
+\item{shift_group_size}{Group size for the coherent shift draw.
+Accepts either shape:
+\itemize{
+\item Scalar \code{N} (integer, default \code{1L}): fixed. The first N samples
+in each batch share ONE shift draw (magnitude, direction, and
+Bernoulli activation all coherent within the group), the next
+N share another, etc. \code{1L} reproduces the current
+per-sample-independent behavior.
+\item Length-2 vector \code{c(N_lo, N_hi)}: each successive group draws
+its own size from \code{Uniform(N_lo, N_hi)}, so group boundaries
+themselves vary within a batch. Matches real acquisitions
+where sessions differ in length.
+}
+
+Setting scalar to \code{batch_size} models each batch as one
+"acquisition session" in which every sample drifted the same
+way. Also gates whether stripe patterns are grouped, when
+\code{stripe_noise_config$grouped = TRUE}.}
 
 \item{baseline_drift_config}{Optional list controlling smooth
 low-frequency baseline drift added to the NOISY input only
