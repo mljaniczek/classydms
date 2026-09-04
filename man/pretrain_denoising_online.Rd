@@ -34,6 +34,8 @@ pretrain_denoising_online(
   mask_config = NULL,
   affine_shift_rt = 0L,
   affine_shift_cv = 0L,
+  shift_group_size = 1L,
+  baseline_drift_config = NULL,
   val_real = NULL,
   val_n = 200L,
   checkpoint_every = 10L,
@@ -194,17 +196,51 @@ randomized per rectangle in \verb{[0.5, 2.0]}. \code{NULL} (default)
 disables masking. Regularizes against synthetic-pixel-pattern
 memorization; effective on top of split-layer denoising.}
 
-\item{affine_shift_rt, affine_shift_cv}{Integer max magnitudes for
-coherent per-sample affine shift augmentation. When > 0, each
-sample's clean and noisy matrices are shifted by
-\code{dr ~ U(-affine_shift_rt, affine_shift_rt)} rows and
-\code{dc ~ U(-affine_shift_cv, affine_shift_cv)} cols, with zero-fill
-at exposed edges. Applied to BOTH clean and noisy identically —
-this is data augmentation, not drift correction. Teaches the
-encoder that a compound at row r is the same as one at row r+k.
-Defaults \code{0L / 0L} (no shift, backward-compatible). Reasonable
-values: \verb{affine_shift_rt = 5L, affine_shift_cv = 1L} on
-1400 x 90 images.}
+\item{affine_shift_rt, affine_shift_cv}{Coherent per-sample affine
+shift augmentation, in pixels. Each accepts either shape:
+\itemize{
+\item Scalar \code{M} (integer, default \code{0L}): fixed maximum magnitude.
+Per-sample shift \code{dr ~ U(-M, +M)} (or \code{dc} for CV).
+\item Length-2 vector \code{c(M_lo, M_hi)}: stochastic magnitude. Each
+sample first draws a per-sample max \code{M ~ U(M_lo, M_hi)}, then
+\code{dr ~ U(-M, +M)}. Models real cohorts where drift magnitude
+itself varies session-to-session.
+}
+
+Applied to BOTH clean and noisy identically (data augmentation,
+not drift correction). Reasonable values on 1400 x 90 images:
+\verb{affine_shift_rt = 5L, affine_shift_cv = 1L} (fixed) or
+\verb{affine_shift_rt = c(5L, 25L), affine_shift_cv = c(1L, 5L)}
+(stochastic).}
+
+\item{shift_group_size}{Integer >= 1. When N > 1, the first N
+samples in each batch share ONE shift draw (magnitude, direction,
+and Bernoulli activation all coherent within the group), the
+next N share another, etc. Default \code{1L} reproduces the current
+per-sample-independent behavior. Setting to \code{batch_size} models
+each batch as one "acquisition session" in which every sample
+drifted the same way. Also gates whether stripe patterns are
+grouped, when \code{stripe_noise_config$grouped = TRUE}.}
+
+\item{baseline_drift_config}{Optional list controlling smooth
+low-frequency baseline drift added to the NOISY input only
+(clean target untouched — this is corruption the encoder must
+strip, teaching it to ignore residual baseline that AsLS didn't
+fully remove). Fields:
+\itemize{
+\item \code{prob} (default \code{0.3}) — Bernoulli fraction of samples that
+get baseline drift.
+\item \code{direction} (\code{"rt"}, \code{"cv"}, or \code{"both"}, default \code{"rt"}) —
+axis of variation. \code{"both"} adds an outer sum of two 1D drifts.
+May be a subset e.g. \code{c("rt", "cv")} — one sampled per sample.
+\item \code{shape} (\code{"polynomial"} or \code{"sinusoid"}, default
+\code{"polynomial"}) — smooth 1D function family.
+\item \code{order} (default \code{c(2L, 4L)}) — polynomial-order range; per
+sample an integer is drawn from this range (ignored for
+sinusoid).
+\item \code{amplitude} (default \code{c(0.02, 0.10)}) — peak-to-peak amplitude
+range as a fraction of image intensity units; drawn per sample.
+}}
 
 \item{val_real}{Optional list of real preprocessed, padded Z
 matrices (each of size \verb{H x W}) held out as a real-data
@@ -266,10 +302,11 @@ jitter for that sample is \code{location_jitter_rt * jm} on RT and
 Default \code{NULL} disables (fixed jitter per sample).}
 
 \item{affine_shift_prob}{Bernoulli probability that any given
-sample gets an affine shift. Default \code{1.0} — every sample when
-\code{affine_shift_rt}/\code{cv} > 0. Set to e.g. \code{0.6} to have 40\% of
-samples receive NO shift (better mimics real acquisition where
-most runs are well-aligned and only some drift).}
+sample (or group; see \code{shift_group_size}) gets an affine shift.
+Default \code{1.0} — every sample when \code{affine_shift_rt}/\code{cv} > 0.
+Set to e.g. \code{0.6} to have 40\% of samples receive NO shift
+(better mimics real acquisition where most runs are well-aligned
+and only some drift).}
 
 \item{stripe_noise_config}{Optional list controlling row- or
 column-correlated stripe noise added to the NOISY input on a
@@ -284,6 +321,10 @@ horizontal bands (one noise value per row, tiled across
 cols); \code{"cv"} gives vertical bands.
 \item \code{intensity} (default \code{c(0.05, 0.15)}) — length-2 SD range
 for the 1-D noise. Drawn uniformly per sample.
+\item \code{grouped} (default \code{FALSE}) — when \code{TRUE}, the stripe amplitude
+AND pattern are drawn once per shift group (see
+\code{shift_group_size}) and shared across all samples in that
+group, so a whole "acquisition session" gets the same stripe.
 Applied to noisy only (before dust threshold).
 }}
 
@@ -379,7 +420,8 @@ after a crash. All training-affecting args (\code{H}, \code{W},
 \code{size_jitter}, \code{dust_threshold}, \code{location_mode},
 \code{location_jitter_rt/cv}, \code{attribute_mode}, \code{stem_stride_rt/cv},
 \code{anchor_ids}, \code{variable_config}, \code{contamination_config},
-\code{clean_layers}, \code{noise_layers}, \code{mask_config}, \code{affine_shift_rt/cv})
+\code{clean_layers}, \code{noise_layers}, \code{mask_config}, \code{affine_shift_rt/cv},
+\code{shift_group_size}, \code{baseline_drift_config})
 should match the original run. Values that differ trigger a
 warning on load listing the mismatches — training continues with
 the CURRENT-call values, but the model was trained so far under

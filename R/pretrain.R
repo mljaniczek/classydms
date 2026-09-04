@@ -324,22 +324,51 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   randomized per rectangle in `[0.5, 2.0]`. `NULL` (default)
 #'   disables masking. Regularizes against synthetic-pixel-pattern
 #'   memorization; effective on top of split-layer denoising.
-#' @param affine_shift_rt,affine_shift_cv Integer max magnitudes for
-#'   coherent per-sample affine shift augmentation. When > 0, each
-#'   sample's clean and noisy matrices are shifted by
-#'   `dr ~ U(-affine_shift_rt, affine_shift_rt)` rows and
-#'   `dc ~ U(-affine_shift_cv, affine_shift_cv)` cols, with zero-fill
-#'   at exposed edges. Applied to BOTH clean and noisy identically —
-#'   this is data augmentation, not drift correction. Teaches the
-#'   encoder that a compound at row r is the same as one at row r+k.
-#'   Defaults `0L / 0L` (no shift, backward-compatible). Reasonable
-#'   values: `affine_shift_rt = 5L, affine_shift_cv = 1L` on
-#'   1400 x 90 images.
+#' @param affine_shift_rt,affine_shift_cv Coherent per-sample affine
+#'   shift augmentation, in pixels. Each accepts either shape:
+#'   - Scalar `M` (integer, default `0L`): fixed maximum magnitude.
+#'     Per-sample shift `dr ~ U(-M, +M)` (or `dc` for CV).
+#'   - Length-2 vector `c(M_lo, M_hi)`: stochastic magnitude. Each
+#'     sample first draws a per-sample max `M ~ U(M_lo, M_hi)`, then
+#'     `dr ~ U(-M, +M)`. Models real cohorts where drift magnitude
+#'     itself varies session-to-session.
+#'
+#'   Applied to BOTH clean and noisy identically (data augmentation,
+#'   not drift correction). Reasonable values on 1400 x 90 images:
+#'   `affine_shift_rt = 5L, affine_shift_cv = 1L` (fixed) or
+#'   `affine_shift_rt = c(5L, 25L), affine_shift_cv = c(1L, 5L)`
+#'   (stochastic).
 #' @param affine_shift_prob Bernoulli probability that any given
-#'   sample gets an affine shift. Default `1.0` — every sample when
-#'   `affine_shift_rt`/`cv` > 0. Set to e.g. `0.6` to have 40% of
-#'   samples receive NO shift (better mimics real acquisition where
-#'   most runs are well-aligned and only some drift).
+#'   sample (or group; see `shift_group_size`) gets an affine shift.
+#'   Default `1.0` — every sample when `affine_shift_rt`/`cv` > 0.
+#'   Set to e.g. `0.6` to have 40% of samples receive NO shift
+#'   (better mimics real acquisition where most runs are well-aligned
+#'   and only some drift).
+#' @param shift_group_size Integer >= 1. When N > 1, the first N
+#'   samples in each batch share ONE shift draw (magnitude, direction,
+#'   and Bernoulli activation all coherent within the group), the
+#'   next N share another, etc. Default `1L` reproduces the current
+#'   per-sample-independent behavior. Setting to `batch_size` models
+#'   each batch as one "acquisition session" in which every sample
+#'   drifted the same way. Also gates whether stripe patterns are
+#'   grouped, when `stripe_noise_config$grouped = TRUE`.
+#' @param baseline_drift_config Optional list controlling smooth
+#'   low-frequency baseline drift added to the NOISY input only
+#'   (clean target untouched — this is corruption the encoder must
+#'   strip, teaching it to ignore residual baseline that AsLS didn't
+#'   fully remove). Fields:
+#'   - `prob` (default `0.3`) — Bernoulli fraction of samples that
+#'     get baseline drift.
+#'   - `direction` (`"rt"`, `"cv"`, or `"both"`, default `"rt"`) —
+#'     axis of variation. `"both"` adds an outer sum of two 1D drifts.
+#'     May be a subset e.g. `c("rt", "cv")` — one sampled per sample.
+#'   - `shape` (`"polynomial"` or `"sinusoid"`, default
+#'     `"polynomial"`) — smooth 1D function family.
+#'   - `order` (default `c(2L, 4L)`) — polynomial-order range; per
+#'     sample an integer is drawn from this range (ignored for
+#'     sinusoid).
+#'   - `amplitude` (default `c(0.02, 0.10)`) — peak-to-peak amplitude
+#'     range as a fraction of image intensity units; drawn per sample.
 #' @param anchor_dropout Per-sample Bernoulli drop probability applied
 #'   to the anchor set before rendering. Each sample, each anchor
 #'   compound is independently dropped with this probability;
@@ -366,6 +395,10 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'     cols); `"cv"` gives vertical bands.
 #'   - `intensity` (default `c(0.05, 0.15)`) — length-2 SD range
 #'     for the 1-D noise. Drawn uniformly per sample.
+#'   - `grouped` (default `FALSE`) — when `TRUE`, the stripe amplitude
+#'     AND pattern are drawn once per shift group (see
+#'     `shift_group_size`) and shared across all samples in that
+#'     group, so a whole "acquisition session" gets the same stripe.
 #'   Applied to noisy only (before dust threshold).
 #' @param rt_warp_config Optional list controlling smooth per-sample
 #'   RT warp applied identically to clean and noisy. Simulates
@@ -482,7 +515,8 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   `size_jitter`, `dust_threshold`, `location_mode`,
 #'   `location_jitter_rt/cv`, `attribute_mode`, `stem_stride_rt/cv`,
 #'   `anchor_ids`, `variable_config`, `contamination_config`,
-#'   `clean_layers`, `noise_layers`, `mask_config`, `affine_shift_rt/cv`)
+#'   `clean_layers`, `noise_layers`, `mask_config`, `affine_shift_rt/cv`,
+#'   `shift_group_size`, `baseline_drift_config`)
 #'   should match the original run. Values that differ trigger a
 #'   warning on load listing the mismatches — training continues with
 #'   the CURRENT-call values, but the model was trained so far under
@@ -541,6 +575,8 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        mask_config = NULL,
                                        affine_shift_rt = 0L,
                                        affine_shift_cv = 0L,
+                                       shift_group_size = 1L,
+                                       baseline_drift_config = NULL,
                                        val_real = NULL,
                                        val_n = 200L,
                                        checkpoint_every = 10L,
@@ -676,17 +712,46 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         any(mask_config$size_frac > 1))
       stop("mask_config$size_frac must be within [0, 1].")
   }
-  # Affine shift augmentation. Draws per-sample dRT ~ U(-affine_shift_rt,
-  # affine_shift_rt) and dCV ~ U(-affine_shift_cv, affine_shift_cv) and
+  # Affine shift augmentation. Draws per-sample dRT and dCV and
   # coherently shifts BOTH the clean target and noisy input by the same
   # amount (zero-fill at newly-exposed edges). Data augmentation, not
   # drift correction — the encoder learns that a compound at row r is
   # the same compound as one at row r+k, without penalizing itself.
-  affine_shift_rt <- as.integer(affine_shift_rt)
-  affine_shift_cv <- as.integer(affine_shift_cv)
-  if (affine_shift_rt < 0 || affine_shift_cv < 0)
-    stop("affine_shift_rt / affine_shift_cv must be >= 0.")
-  use_affine <- affine_shift_rt > 0L || affine_shift_cv > 0L
+  #
+  # Each of affine_shift_rt / affine_shift_cv accepts:
+  #   scalar M         : max magnitude fixed;  shift ~ U(-M, +M) every sample
+  #   c(M_lo, M_hi)    : per-sample max M ~ U(M_lo, M_hi), then shift ~ U(-M, +M)
+  # The second form models real cohorts where drift magnitude itself
+  # varies session-to-session; matches the pattern already used by
+  # noise_scale = c(min, max).
+  parse_shift_arg <- function(x, name) {
+    if (length(x) == 1L) {
+      x <- as.integer(x)
+      if (is.na(x) || x < 0L)
+        stop(sprintf("%s must be a non-negative integer.", name))
+      list(lo = x, hi = x, stochastic = FALSE)
+    } else if (length(x) == 2L) {
+      x <- as.integer(x)
+      if (any(is.na(x)) || any(x < 0L))
+        stop(sprintf("%s = c(lo, hi) must be non-negative integers.", name))
+      if (x[1] > x[2])
+        stop(sprintf("%s = c(lo, hi) must have lo <= hi.", name))
+      list(lo = x[1], hi = x[2], stochastic = TRUE)
+    } else {
+      stop(sprintf("%s must be scalar or length-2 integer.", name))
+    }
+  }
+  shift_rt_spec <- parse_shift_arg(affine_shift_rt, "affine_shift_rt")
+  shift_cv_spec <- parse_shift_arg(affine_shift_cv, "affine_shift_cv")
+  # Keep original argument shapes for manifest/log; retain integer max
+  # summary too (used by "Affine shift ..." log line below).
+  affine_shift_rt <- if (shift_rt_spec$stochastic)
+                        c(shift_rt_spec$lo, shift_rt_spec$hi)
+                      else shift_rt_spec$hi
+  affine_shift_cv <- if (shift_cv_spec$stochastic)
+                        c(shift_cv_spec$lo, shift_cv_spec$hi)
+                      else shift_cv_spec$hi
+  use_affine <- shift_rt_spec$hi > 0L || shift_cv_spec$hi > 0L
   # Bernoulli gate on the affine shift — probability that a given
   # sample gets a shift at all. When 1.0 (default) every sample gets
   # a fresh dr/dc; when < 1, that fraction of samples gets NO shift
@@ -694,6 +759,16 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   # usually good and only some runs drift.
   if (affine_shift_prob < 0 || affine_shift_prob > 1)
     stop("affine_shift_prob must be in [0, 1].")
+  # Batch-correlated shift. shift_group_size = N means the first N
+  # samples in a batch share ONE shift draw (magnitude, direction, and
+  # Bernoulli activation all coherent), the next N share another, etc.
+  # Default 1L reproduces the current per-sample-independent behavior.
+  # Set to batch_size to model each batch as one "acquisition session"
+  # in which every sample drifted the same way; smaller values mix
+  # sessions within a batch.
+  shift_group_size <- as.integer(shift_group_size)
+  if (is.na(shift_group_size) || shift_group_size < 1L)
+    stop("shift_group_size must be a positive integer.")
   # anchor_dropout validation (passthrough — sample-time enforcement is
   # inside generate_noisy_pretrain_sample).
   if (anchor_dropout < 0 || anchor_dropout >= 1)
@@ -703,10 +778,39 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     stripe_noise_config$prob            <- stripe_noise_config$prob            %||% 0.2
     stripe_noise_config$direction       <- stripe_noise_config$direction       %||% "rt"
     stripe_noise_config$intensity       <- stripe_noise_config$intensity       %||% c(0.05, 0.15)
+    stripe_noise_config$grouped         <- isTRUE(stripe_noise_config$grouped)
     if (!stripe_noise_config$direction %in% c("rt", "cv"))
       stop("stripe_noise_config$direction must be 'rt' or 'cv'.")
     if (any(stripe_noise_config$intensity < 0))
       stop("stripe_noise_config$intensity must be non-negative.")
+  }
+  # baseline_drift_config validation. Adds a smooth low-frequency 1D
+  # baseline (polynomial or sinusoid) to the NOISY input only; the
+  # clean target is untouched, so the encoder must learn to strip
+  # residual baseline that AsLS didn't fully remove.
+  if (!is.null(baseline_drift_config)) {
+    baseline_drift_config$prob      <- baseline_drift_config$prob      %||% 0.3
+    baseline_drift_config$direction <- baseline_drift_config$direction %||% "rt"
+    baseline_drift_config$shape     <- baseline_drift_config$shape     %||% "polynomial"
+    baseline_drift_config$order     <- baseline_drift_config$order     %||% c(2L, 4L)
+    baseline_drift_config$amplitude <- baseline_drift_config$amplitude %||% c(0.02, 0.10)
+    if (length(baseline_drift_config$order) == 1L)
+      baseline_drift_config$order <- rep(baseline_drift_config$order, 2)
+    if (length(baseline_drift_config$amplitude) == 1L)
+      baseline_drift_config$amplitude <- rep(baseline_drift_config$amplitude, 2)
+    bd_dir <- baseline_drift_config$direction
+    if (!all(bd_dir %in% c("rt", "cv", "both")))
+      stop("baseline_drift_config$direction must be a subset of ",
+           "{'rt', 'cv', 'both'}.")
+    if (!baseline_drift_config$shape %in% c("polynomial", "sinusoid"))
+      stop("baseline_drift_config$shape must be 'polynomial' or 'sinusoid'.")
+    if (baseline_drift_config$prob < 0 || baseline_drift_config$prob > 1)
+      stop("baseline_drift_config$prob must be in [0, 1].")
+    if (any(baseline_drift_config$order < 1L))
+      stop("baseline_drift_config$order must be >= 1.")
+    if (any(baseline_drift_config$amplitude < 0))
+      stop("baseline_drift_config$amplitude must be non-negative.")
+    baseline_drift_config$order <- as.integer(baseline_drift_config$order)
   }
   # rt_warp_config validation. strength expresses the fractional shift
   # applied at the LAST row (row H); the shift ramps linearly from 0
@@ -832,9 +936,17 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
             "] (zeros noisy input, target unchanged)")
   }
   if (use_affine) {
-    message("  Affine shift augmentation: dRT +-", affine_shift_rt,
-            " px, dCV +-", affine_shift_cv,
-            " px (prob = ", affine_shift_prob,
+    fmt_spec <- function(spec) {
+      if (spec$stochastic)
+        paste0("max in [", spec$lo, ", ", spec$hi, "] px")
+      else
+        paste0("+-", spec$hi, " px")
+    }
+    message("  Affine shift augmentation: dRT ", fmt_spec(shift_rt_spec),
+            ", dCV ", fmt_spec(shift_cv_spec),
+            " (prob = ", affine_shift_prob,
+            ", group = ", shift_group_size,
+            if (shift_group_size == 1L) " -> per-sample" else " -> shared within group",
             ", coherent shift of clean + noisy)")
   }
   if (anchor_dropout > 0) {
@@ -851,7 +963,21 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     message("  Stripe noise: prob = ", stripe_noise_config$prob,
             ", direction = ", stripe_noise_config$direction,
             ", intensity = [", stripe_noise_config$intensity[1], ", ",
-            stripe_noise_config$intensity[2], "] (noisy-only)")
+            stripe_noise_config$intensity[2], "]",
+            if (stripe_noise_config$grouped)
+              paste0(" (grouped within shift group of ", shift_group_size, ")")
+            else " (independent per sample)",
+            " (noisy-only)")
+  }
+  if (!is.null(baseline_drift_config)) {
+    message("  Baseline drift: prob = ", baseline_drift_config$prob,
+            ", shape = ", baseline_drift_config$shape,
+            ", direction = ",
+            paste(baseline_drift_config$direction, collapse = "/"),
+            ", order = [", baseline_drift_config$order[1], ", ",
+            baseline_drift_config$order[2], "]",
+            ", amplitude = [", baseline_drift_config$amplitude[1], ", ",
+            baseline_drift_config$amplitude[2], "] (noisy-only)")
   }
   if (!is.null(rt_warp_config)) {
     message("  RT warp: strength = ", rt_warp_config$strength,
@@ -958,6 +1084,8 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
           affine_shift_rt = affine_shift_rt,
           affine_shift_cv = affine_shift_cv,
           affine_shift_prob = affine_shift_prob,
+          shift_group_size = shift_group_size,
+          baseline_drift_config = baseline_drift_config,
           anchor_dropout = anchor_dropout,
           anchor_jitter_variability = anchor_jitter_variability,
           stripe_noise_config = stripe_noise_config,
@@ -1015,7 +1143,83 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   # backed by future::multisession. Each task gets an independent
   # L'Ecuyer-CMRG substream (via future.seed = TRUE) so worker samples
   # are independent and reproducible.
-  generate_one_pair <- function(i) {
+  # Draw one shift spec (per-sample or per-group depending on caller).
+  # Encapsulates the stochastic-magnitude protocol: for each axis, if
+  # the arg was length-2, first draw the per-sample max M, then draw
+  # shift ~ U(-M, +M); if scalar, M is fixed. Bernoulli gate baked in.
+  draw_shift_spec <- function() {
+    if (!use_affine) return(list(dr = 0L, dc = 0L, active = FALSE))
+    active <- stats::runif(1) < affine_shift_prob
+    if (!active) return(list(dr = 0L, dc = 0L, active = FALSE))
+    draw_axis <- function(spec) {
+      if (spec$hi == 0L) return(0L)
+      M <- if (spec$stochastic)
+             if (spec$lo == spec$hi) spec$hi
+             else sample(spec$lo:spec$hi, 1L)
+           else spec$hi
+      if (M == 0L) return(0L)
+      sample(-M:M, 1L)
+    }
+    list(dr = draw_axis(shift_rt_spec),
+         dc = draw_axis(shift_cv_spec),
+         active = TRUE)
+  }
+  # Draw one stripe pattern (matrix H x W, or NULL if not firing).
+  # Called per-sample when stripe_noise_config$grouped = FALSE, or
+  # once per shift group when grouped = TRUE.
+  draw_stripe_pattern <- function() {
+    if (is.null(stripe_noise_config)) return(NULL)
+    if (stats::runif(1) >= stripe_noise_config$prob) return(NULL)
+    sn_amp <- stats::runif(1, stripe_noise_config$intensity[1],
+                                  stripe_noise_config$intensity[2])
+    if (stripe_noise_config$direction == "rt") {
+      stripe1d <- stats::rnorm(H, mean = 0, sd = sn_amp)
+      matrix(stripe1d, nrow = H, ncol = W)
+    } else {
+      stripe1d <- stats::rnorm(W, mean = 0, sd = sn_amp)
+      matrix(stripe1d, nrow = H, ncol = W, byrow = TRUE)
+    }
+  }
+  # Draw one baseline drift matrix (H x W, or NULL if not firing).
+  # Smooth low-frequency corruption applied to noisy input only.
+  draw_baseline_drift <- function() {
+    if (is.null(baseline_drift_config)) return(NULL)
+    cfg <- baseline_drift_config
+    if (stats::runif(1) >= cfg$prob) return(NULL)
+    A <- stats::runif(1, cfg$amplitude[1], cfg$amplitude[2])
+    order <- if (cfg$order[1] == cfg$order[2]) cfg$order[1]
+             else sample(seq(cfg$order[1], cfg$order[2]), 1L)
+    direction <- if (length(cfg$direction) > 1L)
+                    sample(cfg$direction, 1L) else cfg$direction
+    gen_1d <- function(len) {
+      if (cfg$shape == "polynomial") {
+        x <- seq(-1, 1, length.out = len)
+        coefs <- stats::rnorm(order + 1L)
+        y <- rowSums(vapply(0:order, function(k) coefs[k + 1L] * x^k,
+                             numeric(len)))
+      } else {  # sinusoid
+        x <- seq(0, 2 * pi, length.out = len)
+        freq <- stats::runif(1, 0.5, 2.0)
+        phase <- stats::runif(1, 0, 2 * pi)
+        y <- sin(freq * x + phase)
+      }
+      # Normalize to peak-to-peak = A and center on zero.
+      r <- diff(range(y))
+      if (r > 0) y <- y * (A / r)
+      y <- y - mean(y)
+      y
+    }
+    if (direction == "rt") {
+      matrix(gen_1d(H), nrow = H, ncol = W)
+    } else if (direction == "cv") {
+      matrix(gen_1d(W), nrow = H, ncol = W, byrow = TRUE)
+    } else {  # both — outer sum of two 1D drifts
+      d_rt <- gen_1d(H); d_cv <- gen_1d(W)
+      matrix(d_rt, nrow = H, ncol = W) +
+        matrix(d_cv, nrow = H, ncol = W, byrow = TRUE)
+    }
+  }
+  generate_one_pair <- function(i, augment_spec) {
     # Per-sample noise_scale draw (if range specified).
     ns <- if (!is.null(noise_scale_range))
             stats::runif(1, noise_scale_range[1], noise_scale_range[2])
@@ -1086,16 +1290,14 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
       pair$clean <- Z_clean
       pair$noisy <- Z_clean + Z_noise_add + Z_sensor
     }
-    # Coherent per-sample affine shift (data augmentation). Applied
-    # to BOTH clean and noisy so the encoder is not asked to correct
-    # the drift — it just sees peaks at different absolute row/col
-    # positions across samples. Bernoulli-gated by affine_shift_prob:
-    # at 1.0 (default) every sample gets a shift; at 0.6 only 60% do.
-    if (use_affine && stats::runif(1) < affine_shift_prob) {
-      dr <- if (affine_shift_rt > 0L)
-              sample(-affine_shift_rt:affine_shift_rt, 1L) else 0L
-      dc <- if (affine_shift_cv > 0L)
-              sample(-affine_shift_cv:affine_shift_cv, 1L) else 0L
+    # Coherent affine shift (data augmentation). Draw is precomputed
+    # in generate_batch so the same (dr, dc) can be shared across a
+    # shift group (shift_group_size > 1). Applied to BOTH clean and
+    # noisy so the encoder is not asked to correct the drift — it just
+    # sees peaks at different absolute row/col positions across samples.
+    if (isTRUE(augment_spec$shift$active) &&
+        (augment_spec$shift$dr != 0L || augment_spec$shift$dc != 0L)) {
+      dr <- augment_spec$shift$dr; dc <- augment_spec$shift$dc
       shift_mat <- function(M, dr, dc) {
         out <- matrix(0, nrow = nrow(M), ncol = ncol(M))
         src_r <- max(1L, 1L - dr):min(nrow(M), nrow(M) - dr)
@@ -1148,23 +1350,18 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
       }
     }
     # Stripe noise: row- or column-correlated band-limited noise added
-    # to the NOISY input only (fraction of samples set by
-    # stripe_noise_config$prob). Simulates thermal / electrical
-    # acquisition artifacts. RT direction gives horizontal bands
-    # (constant along CV within each row); CV gives vertical bands.
-    if (!is.null(stripe_noise_config) &&
-        stats::runif(1) < stripe_noise_config$prob) {
-      sn_amp <- stats::runif(1, stripe_noise_config$intensity[1],
-                                    stripe_noise_config$intensity[2])
-      if (stripe_noise_config$direction == "rt") {
-        # One noise value per row, tiled across all cols
-        stripe1d <- stats::rnorm(H, mean = 0, sd = sn_amp)
-        stripe <- matrix(stripe1d, nrow = H, ncol = W)
-      } else {
-        stripe1d <- stats::rnorm(W, mean = 0, sd = sn_amp)
-        stripe <- matrix(stripe1d, nrow = H, ncol = W, byrow = TRUE)
-      }
-      pair$noisy <- pair$noisy + stripe
+    # to the NOISY input only. The stripe matrix is precomputed in
+    # generate_batch: per-sample by default, or once per shift group
+    # when stripe_noise_config$grouped = TRUE. Simulates thermal /
+    # electrical acquisition artifacts.
+    if (!is.null(augment_spec$stripe)) {
+      pair$noisy <- pair$noisy + augment_spec$stripe
+    }
+    # Baseline drift: smooth low-frequency baseline added to NOISY
+    # input only (clean target untouched). The encoder learns to strip
+    # residual baseline that AsLS didn't fully remove.
+    if (!is.null(augment_spec$baseline)) {
+      pair$noisy <- pair$noisy + augment_spec$baseline
     }
     # Dust thresholding matches real-data preprocessing (see
     # baseline_basement) so synthetic samples have the same sparsity
@@ -1182,13 +1379,34 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   }
 
   generate_batch <- function(n = batch_size) {
+    # Precompute augment specs per sample. Shift is drawn once per
+    # contiguous group of shift_group_size samples; when the group
+    # size equals 1 (default) every sample gets an independent draw.
+    # Stripe is per-group when stripe_noise_config$grouped, else
+    # per-sample. Baseline drift is always per-sample.
+    n_groups <- ceiling(n / shift_group_size)
+    group_shifts <- lapply(seq_len(n_groups), function(.) draw_shift_spec())
+    stripe_grouped <- !is.null(stripe_noise_config) &&
+                        isTRUE(stripe_noise_config$grouped)
+    group_stripes <- if (stripe_grouped)
+                        lapply(seq_len(n_groups), function(.) draw_stripe_pattern())
+                      else NULL
+    augment_specs <- lapply(seq_len(n), function(i) {
+      g <- ((i - 1L) %/% shift_group_size) + 1L
+      stripe_i <- if (stripe_grouped) group_stripes[[g]] else draw_stripe_pattern()
+      list(shift = group_shifts[[g]],
+           stripe = stripe_i,
+           baseline = draw_baseline_drift())
+    })
     pairs <- if (use_parallel) {
       # future.seed = TRUE gives each parallel task an independent
       # L'Ecuyer-CMRG substream, so worker samples don't collide.
-      future.apply::future_lapply(seq_len(n), generate_one_pair,
-                                    future.seed = TRUE)
+      future.apply::future_lapply(seq_len(n),
+        function(i) generate_one_pair(i, augment_specs[[i]]),
+        future.seed = TRUE)
     } else {
-      lapply(seq_len(n), generate_one_pair)
+      lapply(seq_len(n),
+             function(i) generate_one_pair(i, augment_specs[[i]]))
     }
 
     clean_arr <- array(0, dim = c(n, 1L, H, W))
@@ -1311,6 +1529,8 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         anchor_dropout = anchor_dropout,
         anchor_jitter_variability = anchor_jitter_variability,
         affine_shift_prob = affine_shift_prob,
+        shift_group_size = shift_group_size,
+        baseline_drift_config = baseline_drift_config,
         stripe_noise_config = stripe_noise_config,
         rt_warp_config = rt_warp_config,
         variable_source_peak_params_n_peaks =
