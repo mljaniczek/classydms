@@ -48,6 +48,9 @@ pretrain_denoising_online(
   stripe_noise_config = NULL,
   rt_warp_config = NULL,
   variable_source_peak_params = NULL,
+  peak_shape = c("gaussian", "emg", "mix"),
+  emg_tau_range = c(0.2, 0.8),
+  emg_mix_prob = 0.3,
   device = if (torch::cuda_is_available()) "cuda" else "cpu",
   num_threads = NULL,
   num_workers = 1L,
@@ -311,6 +314,30 @@ passing both errors. Recommended when you want the variable layer
 to reflect real skin-VOC morphology diversity that clustering
 averages out. \code{NULL} (default) uses the catalog-based path
 controlled by \code{variable_config}.}
+
+\item{peak_shape}{One of \code{"gaussian"} (default), \code{"emg"}, or
+\code{"mix"}. Selects the per-peak shape family:
+\itemize{
+\item \code{"gaussian"} — symmetric Gaussian on both axes. Preserves
+previous behavior exactly.
+\item \code{"emg"} — bi-Gaussian along RT (symmetric on the left of the
+peak center, tail-stretched on the right). CV stays symmetric.
+Approximates the asymmetric shape of real GC peaks (sharp
+leading edge, gentle trailing edge). Tau (right-side widening
+factor) drawn per peak from \code{emg_tau_range}.
+\item \code{"mix"} — per peak, Bernoulli(\code{emg_mix_prob}) picks EMG;
+otherwise Gaussian. Gives a natural mix of symmetric and
+asymmetric peaks per sample. Recommended when transitioning
+from pure-Gaussian to EMG since real cohorts have both.
+}}
+
+\item{emg_tau_range}{Length-2 numeric range for the EMG tau
+parameter (right-side sigma widening factor). Default
+\code{c(0.2, 0.8)} corresponds to right side 20-80\% wider than left.
+Drawn per peak uniformly.}
+
+\item{emg_mix_prob}{Probability of EMG shape per peak in \code{"mix"}
+mode. Default \code{0.3}.}
 
 \item{device}{"cpu" or "cuda".}
 

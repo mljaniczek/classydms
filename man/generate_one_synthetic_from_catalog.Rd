@@ -15,7 +15,10 @@ generate_one_synthetic_from_catalog(
   noise_scale = 1,
   prevalence_override = NULL,
   intensity_mult = NULL,
-  compound_ids = NULL
+  compound_ids = NULL,
+  peak_shape = c("gaussian", "emg", "mix"),
+  emg_tau_range = c(0.2, 0.8),
+  emg_mix_prob = 0.3
 )
 }
 \arguments{

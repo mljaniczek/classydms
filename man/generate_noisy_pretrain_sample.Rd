@@ -18,7 +18,10 @@ generate_noisy_pretrain_sample(
   noise_scale = 1,
   anchor_dropout = 0,
   anchor_jitter_variability = NULL,
-  variable_source_peak_params = NULL
+  variable_source_peak_params = NULL,
+  peak_shape = c("gaussian", "emg", "mix"),
+  emg_tau_range = c(0.2, 0.8),
+  emg_mix_prob = 0.3
 )
 }
 \arguments{

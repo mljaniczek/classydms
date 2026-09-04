@@ -5,6 +5,54 @@
 # positions, with per-compound prevalence controlling how often each
 # compound fires.
 
+# Internal helper: render one peak with local-window Gaussian OR bi-Gaussian
+# (EMG-like: symmetric on the left, tail-stretched on the right along RT).
+# Returns the modified Z. CV direction stays symmetric — GC peak asymmetry
+# is a time-domain phenomenon.
+#
+# Bi-Gaussian model: sigma on the left of mu_rt equals sig_rt; sigma on the
+# right equals sig_rt * (1 + tau). tau = 0 recovers pure Gaussian. Typical
+# GC peaks have tau ~ 0.2-0.8 (right side 20-80% wider than left).
+render_peak_local <- function(Z, H, W, mu_rt, mu_cv, sig_rt, sig_cv, amp,
+                                shape = "gaussian", tau = 0) {
+  # Widen the local window on the right when tau > 0 so we don't clip
+  # the extended trailing edge.
+  sig_right <- if (shape == "emg") sig_rt * (1 + tau) else sig_rt
+  r_lo <- max(1L, as.integer(floor(mu_rt - 5 * sig_rt)))
+  r_hi <- min(H,  as.integer(ceiling(mu_rt + 5 * sig_right)))
+  c_lo <- max(1L, as.integer(floor(mu_cv - 5 * sig_cv)))
+  c_hi <- min(W,  as.integer(ceiling(mu_cv + 5 * sig_cv)))
+  rr <- r_lo:r_hi; cc <- c_lo:c_hi
+  if (shape == "emg" && tau > 0) {
+    # Different sigma per row depending on side of mu_rt
+    sig_per_row <- ifelse(rr <= mu_rt, sig_rt, sig_right)
+    g_rt <- exp(-0.5 * ((rr - mu_rt) / sig_per_row)^2)
+  } else {
+    g_rt <- exp(-0.5 * ((rr - mu_rt) / sig_rt)^2)
+  }
+  g_cv <- exp(-0.5 * ((cc - mu_cv) / sig_cv)^2)
+  Z[rr, cc] <- Z[rr, cc] + amp * outer(g_rt, g_cv)
+  Z
+}
+
+# Internal helper: pick per-peak shape/tau from a config
+# (peak_shape %in% c("gaussian", "emg", "mix")).
+# Returns list(shape = "gaussian"|"emg", tau = numeric).
+draw_peak_shape <- function(peak_shape, emg_tau_range, emg_mix_prob) {
+  if (peak_shape == "gaussian") return(list(shape = "gaussian", tau = 0))
+  if (peak_shape == "emg") {
+    tau <- stats::runif(1, emg_tau_range[1], emg_tau_range[2])
+    return(list(shape = "emg", tau = tau))
+  }
+  # "mix" — Bernoulli(emg_mix_prob) picks EMG, else Gaussian
+  if (stats::runif(1) < emg_mix_prob) {
+    tau <- stats::runif(1, emg_tau_range[1], emg_tau_range[2])
+    list(shape = "emg", tau = tau)
+  } else {
+    list(shape = "gaussian", tau = 0)
+  }
+}
+
 #' Generate one synthetic sample from a peak catalog
 #'
 #' For each compound in the catalog, a `Bernoulli(prevalence)` draw
@@ -50,7 +98,11 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
                                                  noise_scale = 1.0,
                                                  prevalence_override = NULL,
                                                  intensity_mult = NULL,
-                                                 compound_ids = NULL) {
+                                                 compound_ids = NULL,
+                                                 peak_shape = c("gaussian", "emg", "mix"),
+                                                 emg_tau_range = c(0.2, 0.8),
+                                                 emg_mix_prob = 0.3) {
+  peak_shape <- match.arg(peak_shape)
   stopifnot(inherits(catalog, "peak_catalog"))
   compounds <- catalog$compounds
   if (!is.null(compound_ids)) {
@@ -91,6 +143,8 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
   placements_sig_rt <- numeric(0)
   placements_sig_cv <- numeric(0)
   placements_amp   <- numeric(0)
+  placements_shape <- character(0)
+  placements_tau   <- numeric(0)
 
   # Precompute lookup tables for override vectors
   po_names <- if (!is.null(prevalence_override))
@@ -167,32 +221,31 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
     sig_cv <- max(sig_cv * scale_factor, 0.8)
     amp <- base_amp * mult * (0.5 + 0.5 * scale_factor)
 
-    # Local-window Gaussian eval: only compute exp() over +-5 sigma
-    # around the peak center, then add to the corresponding slice of
-    # clean. Peak value at +-5 sigma is exp(-12.5) ~ 4e-6, well below
-    # any dust threshold, so accuracy is preserved. Full-grid H*W eval
-    # was pure waste on the >= 99% of pixels far from the peak.
-    r_lo <- max(1L, as.integer(floor(mu_rt - 5 * sig_rt)))
-    r_hi <- min(H,  as.integer(ceiling(mu_rt + 5 * sig_rt)))
-    c_lo <- max(1L, as.integer(floor(mu_cv - 5 * sig_cv)))
-    c_hi <- min(W,  as.integer(ceiling(mu_cv + 5 * sig_cv)))
-    rr <- r_lo:r_hi; cc <- c_lo:c_hi
-    g_rt <- exp(-0.5 * ((rr - mu_rt) / sig_rt)^2)
-    g_cv <- exp(-0.5 * ((cc - mu_cv) / sig_cv)^2)
-    clean[rr, cc] <- clean[rr, cc] + amp * outer(g_rt, g_cv)
+    # Per-peak shape draw + local-window render (delegates to
+    # render_peak_local for the actual pixel math). Records shape/tau
+    # on placements so cofire's subtract_compound can undo the same
+    # asymmetric peak later.
+    shp <- draw_peak_shape(peak_shape, emg_tau_range, emg_mix_prob)
+    clean <- render_peak_local(clean, H, W, mu_rt, mu_cv,
+                                 sig_rt, sig_cv, amp,
+                                 shape = shp$shape, tau = shp$tau)
     placements_cid    <- c(placements_cid,    compounds$compound_id[i])
     placements_mu_rt  <- c(placements_mu_rt,  mu_rt)
     placements_mu_cv  <- c(placements_mu_cv,  mu_cv)
     placements_sig_rt <- c(placements_sig_rt, sig_rt)
     placements_sig_cv <- c(placements_sig_cv, sig_cv)
     placements_amp    <- c(placements_amp,    amp)
+    placements_shape  <- c(placements_shape,  shp$shape)
+    placements_tau    <- c(placements_tau,    shp$tau)
   }
 
   placements <- tibble::tibble(
     compound_id = placements_cid,
     mu_rt = placements_mu_rt, mu_cv = placements_mu_cv,
     sig_rt = placements_sig_rt, sig_cv = placements_sig_cv,
-    amp = placements_amp
+    amp = placements_amp,
+    shape = placements_shape,
+    tau   = placements_tau
   )
 
   if (!add_noise || is.null(catalog$noise) ||
@@ -402,7 +455,11 @@ simulate_case_control_from_catalog <- function(catalog,
                                                  noise_scale = 1.0,
                                                  cofire = NULL,
                                                  off_catalog_peaks = NULL,
+                                                 peak_shape = c("gaussian", "emg", "mix"),
+                                                 emg_tau_range = c(0.2, 0.8),
+                                                 emg_mix_prob = 0.3,
                                                  seed = NULL) {
+  peak_shape <- match.arg(peak_shape)
   stopifnot(inherits(catalog, "peak_catalog"))
   needed <- c("compound_id", "case_prevalence", "control_prevalence",
               "case_intensity_mult", "control_intensity_mult")
@@ -537,7 +594,10 @@ simulate_case_control_from_catalog <- function(catalog,
       location_jitter_cv  = location_jitter_cv,
       noise_scale         = noise_scale,
       prevalence_override = prev_override,
-      intensity_mult      = int_mult
+      intensity_mult      = int_mult,
+      peak_shape          = peak_shape,
+      emg_tau_range       = emg_tau_range,
+      emg_mix_prob        = emg_mix_prob
     )
 
     Z <- result$clean          # work on clean, add noise last
@@ -557,16 +617,18 @@ simulate_case_control_from_catalog <- function(catalog,
         idxs <- placements_by_cid[[as.character(cid)]]
         if (is.null(idxs)) return()
         for (p in idxs) {
-          mu_rt_p <- placements$mu_rt[p]; sig_rt_p <- placements$sig_rt[p]
-          mu_cv_p <- placements$mu_cv[p]; sig_cv_p <- placements$sig_cv[p]
-          r_lo <- max(1L, as.integer(floor(mu_rt_p - 5 * sig_rt_p)))
-          r_hi <- min(H,  as.integer(ceiling(mu_rt_p + 5 * sig_rt_p)))
-          c_lo <- max(1L, as.integer(floor(mu_cv_p - 5 * sig_cv_p)))
-          c_hi <- min(W,  as.integer(ceiling(mu_cv_p + 5 * sig_cv_p)))
-          rr <- r_lo:r_hi; cc <- c_lo:c_hi
-          g_rt <- exp(-0.5 * ((rr - mu_rt_p) / sig_rt_p)^2)
-          g_cv <- exp(-0.5 * ((cc - mu_cv_p) / sig_cv_p)^2)
-          Z[rr, cc] <<- Z[rr, cc] - placements$amp[p] * outer(g_rt, g_cv)
+          # Read shape/tau from placements — was recorded at render
+          # time so the subtracted Gaussian matches the added one
+          # exactly (Gaussian or bi-Gaussian both undone cleanly).
+          shp <- if ("shape" %in% names(placements)) placements$shape[p]
+                 else "gaussian"
+          tau <- if ("tau"   %in% names(placements)) placements$tau[p]
+                 else 0
+          Z <<- render_peak_local(Z, H, W,
+                                    placements$mu_rt[p], placements$mu_cv[p],
+                                    placements$sig_rt[p], placements$sig_cv[p],
+                                    -placements$amp[p],
+                                    shape = shp, tau = tau)
         }
       }
       add_compound <- function(cid) {
@@ -615,14 +677,10 @@ simulate_case_control_from_catalog <- function(catalog,
         sig_rt <- max(sig_rt * scale_factor, 0.8)
         sig_cv <- max(sig_cv * scale_factor, 0.8)
         amp <- base_amp * mult * (0.5 + 0.5 * scale_factor)
-        r_lo <- max(1L, as.integer(floor(mu_rt - 5 * sig_rt)))
-        r_hi <- min(H,  as.integer(ceiling(mu_rt + 5 * sig_rt)))
-        c_lo <- max(1L, as.integer(floor(mu_cv - 5 * sig_cv)))
-        c_hi <- min(W,  as.integer(ceiling(mu_cv + 5 * sig_cv)))
-        rr <- r_lo:r_hi; cc <- c_lo:c_hi
-        g_rt <- exp(-0.5 * ((rr - mu_rt) / sig_rt)^2)
-        g_cv <- exp(-0.5 * ((cc - mu_cv) / sig_cv)^2)
-        Z[rr, cc] <<- Z[rr, cc] + amp * outer(g_rt, g_cv)
+        # Same shape drawing convention as the main generator.
+        shp <- draw_peak_shape(peak_shape, emg_tau_range, emg_mix_prob)
+        Z <<- render_peak_local(Z, H, W, mu_rt, mu_cv, sig_rt, sig_cv, amp,
+                                  shape = shp$shape, tau = shp$tau)
       }
 
       for (g in cofire) {
@@ -1023,7 +1081,11 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
                                              noise_scale = 1.0,
                                              anchor_dropout = 0.0,
                                              anchor_jitter_variability = NULL,
-                                             variable_source_peak_params = NULL) {
+                                             variable_source_peak_params = NULL,
+                                             peak_shape = c("gaussian", "emg", "mix"),
+                                             emg_tau_range = c(0.2, 0.8),
+                                             emg_mix_prob = 0.3) {
+  peak_shape <- match.arg(peak_shape)
   if (!is.null(variable_source_peak_params) && !is.null(variable_config)) {
     stop("variable_source_peak_params and variable_config are ",
          "mutually exclusive — pass one or the other, not both.")
@@ -1112,7 +1174,10 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
       location_jitter_cv  = eff_jitter_cv,
       prevalence_override = prev_ov_l,
       intensity_mult      = int_ov_l,
-      compound_ids        = ids
+      compound_ids        = ids,
+      peak_shape          = peak_shape,
+      emg_tau_range       = emg_tau_range,
+      emg_mix_prob        = emg_mix_prob
     )
     res$clean
   }
@@ -1130,7 +1195,10 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
       location_mode = "empirical",
       location_jitter_rt = eff_jitter_rt,
       location_jitter_cv = eff_jitter_cv,
-      attribute_mode = "joint")
+      attribute_mode = "joint",
+      peak_shape = peak_shape,
+      emg_tau_range = emg_tau_range,
+      emg_mix_prob = emg_mix_prob)
     res$clean
   } else {
     render_layer(variable_ids, variable_int_mult)

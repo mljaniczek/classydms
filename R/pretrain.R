@@ -391,6 +391,25 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   to reflect real skin-VOC morphology diversity that clustering
 #'   averages out. `NULL` (default) uses the catalog-based path
 #'   controlled by `variable_config`.
+#' @param peak_shape One of `"gaussian"` (default), `"emg"`, or
+#'   `"mix"`. Selects the per-peak shape family:
+#'   - `"gaussian"` — symmetric Gaussian on both axes. Preserves
+#'     previous behavior exactly.
+#'   - `"emg"` — bi-Gaussian along RT (symmetric on the left of the
+#'     peak center, tail-stretched on the right). CV stays symmetric.
+#'     Approximates the asymmetric shape of real GC peaks (sharp
+#'     leading edge, gentle trailing edge). Tau (right-side widening
+#'     factor) drawn per peak from `emg_tau_range`.
+#'   - `"mix"` — per peak, Bernoulli(`emg_mix_prob`) picks EMG;
+#'     otherwise Gaussian. Gives a natural mix of symmetric and
+#'     asymmetric peaks per sample. Recommended when transitioning
+#'     from pure-Gaussian to EMG since real cohorts have both.
+#' @param emg_tau_range Length-2 numeric range for the EMG tau
+#'   parameter (right-side sigma widening factor). Default
+#'   `c(0.2, 0.8)` corresponds to right side 20-80% wider than left.
+#'   Drawn per peak uniformly.
+#' @param emg_mix_prob Probability of EMG shape per peak in `"mix"`
+#'   mode. Default `0.3`.
 #' @param val_real Optional list of real preprocessed, padded Z
 #'   matrices (each of size `H x W`) held out as a real-data
 #'   validation set. When provided, an additional per-epoch metric
@@ -536,6 +555,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        stripe_noise_config = NULL,
                                        rt_warp_config = NULL,
                                        variable_source_peak_params = NULL,
+                                       peak_shape = c("gaussian", "emg", "mix"),
+                                       emg_tau_range = c(0.2, 0.8),
+                                       emg_mix_prob = 0.3,
                                        device = if (torch::cuda_is_available()) "cuda" else "cpu",
                                        num_threads = NULL,
                                        num_workers = 1L,
@@ -697,6 +719,12 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     if (rt_warp_config$prob < 0 || rt_warp_config$prob > 1)
       stop("rt_warp_config$prob must be in [0, 1].")
   }
+  # peak_shape validation (defaults preserve gaussian behavior).
+  peak_shape <- match.arg(peak_shape)
+  if (length(emg_tau_range) != 2L || any(emg_tau_range < 0))
+    stop("emg_tau_range must be length-2 non-negative.")
+  if (emg_mix_prob < 0 || emg_mix_prob > 1)
+    stop("emg_mix_prob must be in [0, 1].")
   # Resolve noisy_dust_threshold once at entry:
   #   NULL default:
   #     split-layer mode -> 0    (keep contamination/noise in noisy)
@@ -837,6 +865,13 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
             variable_source_peak_params$n_samples,
             " source samples) — bypasses variable_config")
   }
+  if (peak_shape != "gaussian") {
+    message("  Peak shape: ", peak_shape,
+            " (tau range [", emg_tau_range[1], ", ", emg_tau_range[2], "]",
+            if (peak_shape == "mix")
+              paste0(", mix prob = ", emg_mix_prob) else "",
+            "; bi-Gaussian right-side tailing along RT)")
+  }
   message("  size_jitter: ", size_jitter)
   message("  dust_threshold (clean target): ", dust_threshold,
           if (dust_threshold > 0)
@@ -928,6 +963,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
           stripe_noise_config = stripe_noise_config,
           rt_warp_config = rt_warp_config,
           variable_source_peak_params = variable_source_peak_params,
+          peak_shape = peak_shape,
+          emg_tau_range = emg_tau_range,
+          emg_mix_prob = emg_mix_prob,
           stem_stride_rt = stem_stride_rt,
           stem_stride_cv = stem_stride_cv,
           encoder_channels = encoder_channels,
@@ -1012,7 +1050,10 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        noise_scale = ns,
                                        anchor_dropout = anchor_dropout,
                                        anchor_jitter_variability = anchor_jitter_variability,
-                                       variable_source_peak_params = variable_source_peak_params)
+                                       variable_source_peak_params = variable_source_peak_params,
+                                       peak_shape = peak_shape,
+                                       emg_tau_range = emg_tau_range,
+                                       emg_mix_prob = emg_mix_prob)
     } else if (!is.null(catalog)) {
       generate_one_synthetic_from_catalog(catalog, H, W,
                                     add_noise = add_noise,
@@ -1275,6 +1316,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         variable_source_peak_params_n_peaks =
           if (!is.null(variable_source_peak_params))
             variable_source_peak_params$n_peaks_detected else NULL,
+        peak_shape = peak_shape,
+        emg_tau_range = emg_tau_range,
+        emg_mix_prob = emg_mix_prob,
         device = device, seed = seed),
       loss_history = loss_h, val_loss_history = val_h,
       real_val_loss_history = real_val_h,

@@ -339,9 +339,13 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
                                     location_jitter_rt = 2,
                                     location_jitter_cv = 1,
                                     attribute_mode = c("joint", "marginal"),
-                                    noise_scale = 1.0) {
+                                    noise_scale = 1.0,
+                                    peak_shape = c("gaussian", "emg", "mix"),
+                                    emg_tau_range = c(0.2, 0.8),
+                                    emg_mix_prob = 0.3) {
   location_mode  <- match.arg(location_mode)
   attribute_mode <- match.arg(attribute_mode)
+  peak_shape     <- match.arg(peak_shape)
 
   if (params$n_peaks_detected == 0) {
     stop("generate_one_synthetic: params contain 0 detected peaks.")
@@ -422,16 +426,12 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
     sig_rt <- max(sig_rt * scale_factor, 0.8)
     sig_cv <- max(sig_cv * scale_factor, 0.8)
     amp <- base_amp * (0.5 + 0.5 * scale_factor)
-    # Local-window Gaussian eval — see generate_one_synthetic_from_catalog
-    # for rationale. +-5 sigma covers >99.99% of the peak's mass.
-    r_lo <- max(1L, as.integer(floor(mu_rt - 5 * sig_rt)))
-    r_hi <- min(H,  as.integer(ceiling(mu_rt + 5 * sig_rt)))
-    c_lo <- max(1L, as.integer(floor(mu_cv - 5 * sig_cv)))
-    c_hi <- min(W,  as.integer(ceiling(mu_cv + 5 * sig_cv)))
-    rr <- r_lo:r_hi; cc <- c_lo:c_hi
-    g_rt <- exp(-0.5 * ((rr - mu_rt) / sig_rt)^2)
-    g_cv <- exp(-0.5 * ((cc - mu_cv) / sig_cv)^2)
-    clean[rr, cc] <- clean[rr, cc] + amp * outer(g_rt, g_cv)
+    # Per-peak shape draw + local-window render (delegates to
+    # render_peak_local for the actual pixel math).
+    shp <- draw_peak_shape(peak_shape, emg_tau_range, emg_mix_prob)
+    clean <- render_peak_local(clean, H, W, mu_rt, mu_cv,
+                                 sig_rt, sig_cv, amp,
+                                 shape = shp$shape, tau = shp$tau)
   }
   if (!add_noise) return(list(clean = clean, noisy = clean))
   # Belt-and-suspenders: if noise stats are somehow still non-finite,

@@ -18,6 +18,9 @@ simulate_case_control_from_catalog(
   noise_scale = 1,
   cofire = NULL,
   off_catalog_peaks = NULL,
+  peak_shape = c("gaussian", "emg", "mix"),
+  emg_tau_range = c(0.2, 0.8),
+  emg_mix_prob = 0.3,
   seed = NULL
 )
 }

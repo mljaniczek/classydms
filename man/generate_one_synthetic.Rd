@@ -14,7 +14,10 @@ generate_one_synthetic(
   location_jitter_rt = 2,
   location_jitter_cv = 1,
   attribute_mode = c("joint", "marginal"),
-  noise_scale = 1
+  noise_scale = 1,
+  peak_shape = c("gaussian", "emg", "mix"),
+  emg_tau_range = c(0.2, 0.8),
+  emg_mix_prob = 0.3
 )
 }
 \arguments{
