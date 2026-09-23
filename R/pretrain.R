@@ -451,6 +451,29 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   Drawn per peak uniformly.
 #' @param emg_mix_prob Probability of EMG shape per peak in `"mix"`
 #'   mode. Default `0.3`.
+#' @param presence_head If `TRUE`, trains a [dms_presence_head()]
+#'   jointly with the autoencoder: from the encoder feature map it
+#'   predicts which catalog compounds were rendered in the clean target
+#'   layers (ground truth comes straight from the generator). Total loss
+#'   is `reconstruction MSE + presence_weight * BCE`. Requires the
+#'   three-layer path (`catalog` + `anchor_ids`). The head is saved as
+#'   `*_presence_head.pt` next to the encoder and returned as
+#'   `$presence_head`; use it downstream via
+#'   [extract_encoder_features()] / [cv_encoder_elastic_net()] with
+#'   `readout = "presence"`, or [build_pretrained_classifier()] with
+#'   `readout = "presence"`. Default `FALSE`.
+#' @param presence_weight Weight on the presence BCE term. Default `1.0`.
+#' @param presence_compounds Optional subset of `compound_id`s the head
+#'   covers. Default `NULL` = every catalog compound with a finite
+#'   position. Compounds that never fire during pretraining (e.g.
+#'   outside `variable_config$prevalence_range` and not anchors) only
+#'   ever see negative labels.
+#' @param presence_pos_weight_max Cap on the per-compound positive
+#'   weight `(1 - f) / f`, where `f` is the compound's running firing
+#'   frequency. Rarity weighting keeps rarely-rendered compounds from
+#'   being ignored by the loss. Default `20`.
+#' @param presence_d_attn Query/key dimension of the head's attention.
+#'   Default `32L`.
 #' @param val_real Optional list of real preprocessed, padded Z
 #'   matrices (each of size `H x W`) held out as a real-data
 #'   validation set. When provided, an additional per-epoch metric
@@ -551,8 +574,11 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'      target, the latter to overwrite the same encoder file.
 #' @param seed RNG seed.
 #' @param verbose Whether to print epoch progress.
-#' @return List with `encoder`, `autoencoder`, `loss_history`,
-#'   `val_loss_history`, `batch_loss_stats`, and `total_samples`.
+#' @return List with `encoder`, `autoencoder`, `presence_head` (`NULL`
+#'   unless `presence_head = TRUE`), `loss_history` (reconstruction MSE),
+#'   `val_loss_history`, `real_val_loss_history`, `presence_loss_history`,
+#'   `val_presence_auc_history` (macro per-compound AUC on the synthetic
+#'   val set), `batch_loss_stats`, and `total_samples`.
 #' @export
 pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        steps_per_epoch = 500L,
@@ -602,6 +628,11 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        peak_shape = c("gaussian", "emg", "mix"),
                                        emg_tau_range = c(0.2, 0.8),
                                        emg_mix_prob = 0.3,
+                                       presence_head = FALSE,
+                                       presence_weight = 1.0,
+                                       presence_compounds = NULL,
+                                       presence_pos_weight_max = 20,
+                                       presence_d_attn = 32L,
                                        device = if (torch::cuda_is_available()) "cuda" else "cpu",
                                        num_threads = NULL,
                                        num_workers = 1L,
@@ -855,6 +886,42 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     stop("emg_tau_range must be length-2 non-negative.")
   if (emg_mix_prob < 0 || emg_mix_prob > 1)
     stop("emg_mix_prob must be in [0, 1].")
+  # Compound-presence auxiliary head: the generator knows exactly which
+  # catalog compounds it rendered, so the encoder can additionally be
+  # trained to report them. Labels cover the compounds in the CLEAN
+  # target layers (anchors / variable), matching the denoising semantics:
+  # anything in noise_layers is nuisance, not signal.
+  presence_head <- isTRUE(presence_head)
+  presence_geometry <- NULL; presence_ids <- integer(0)
+  presence_mask <- numeric(0); presence_layers <- character(0)
+  if (presence_head) {
+    if (!use_noisy)
+      stop("presence_head = TRUE requires catalog + anchor_ids (the ",
+           "three-layer path), which records the compounds it renders.")
+    if (presence_weight < 0) stop("presence_weight must be >= 0.")
+    if (presence_pos_weight_max < 1)
+      stop("presence_pos_weight_max must be >= 1.")
+    extra_rt <- shift_rt_spec$hi +
+      if (!is.null(rt_warp_config)) abs(rt_warp_config$strength) * H else 0
+    presence_geometry <- compound_head_geometry(
+      catalog, H, W, compound_ids = presence_compounds,
+      extra_rt_px = extra_rt, extra_cv_px = shift_cv_spec$hi)
+    presence_ids <- presence_geometry$compound_id
+    presence_layers <- if (split_layers)
+                         intersect(clean_layers, c("anchors", "variable"))
+                       else c("anchors", "variable")
+    presence_mask <- rep(1, length(presence_ids))
+    # variable_source_peak_params renders the variable layer from raw
+    # peaks with no compound identity, so only anchors can be scored.
+    if (!is.null(variable_source_peak_params)) {
+      presence_mask <- as.numeric(presence_ids %in% anchor_ids)
+      message("  presence_head: variable layer comes from ",
+              "variable_source_peak_params (no compound ids); scoring ",
+              "anchor compounds only.")
+    }
+    if (sum(presence_mask) == 0)
+      stop("presence_head: no scoreable compounds (check presence_compounds).")
+  }
   # Resolve noisy_dust_threshold once at entry:
   #   NULL default:
   #     split-layer mode -> 0    (keep contamination/noise in noisy)
@@ -1035,6 +1102,12 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
               paste0(", mix prob = ", emg_mix_prob) else "",
             "; bi-Gaussian right-side tailing along RT)")
   }
+  if (presence_head) {
+    message("  Presence head: ", sum(presence_mask), " scored compounds",
+            " (labels from layers: ", paste(presence_layers, collapse = ", "),
+            "), weight = ", presence_weight,
+            ", rarity pos_weight cap = ", presence_pos_weight_max)
+  }
   message("  size_jitter: ", size_jitter)
   message("  dust_threshold (clean target): ", dust_threshold,
           if (dust_threshold > 0)
@@ -1065,6 +1138,15 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                       encoder_channels = encoder_channels,
                                       dropout_p = encoder_dropout)
   model$to(device = device)
+  presence_mod <- NULL
+  if (presence_head) {
+    presence_mod <- dms_presence_head(as.integer(tail(encoder_channels, 1L)),
+                                       presence_geometry,
+                                       d_attn = presence_d_attn)
+    presence_mod$to(device = device)
+  }
+  prior_presence_loss_history <- NULL
+  prior_val_presence_auc_history <- NULL
 
   # ---- Resume from saved state if requested ----
   start_epoch <- 1L
@@ -1082,6 +1164,21 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     message("Resuming from: ", ae_path)
     model <- torch::torch_load(ae_path)
     model$to(device = device)
+    if (presence_head) {
+      head_path <- sub("\\.pt$", "_presence_head.pt", resume_from)
+      if (file.exists(head_path)) {
+        loaded_head <- torch::torch_load(head_path)
+        if (!identical(as.integer(loaded_head$compound_ids),
+                       as.integer(presence_ids)))
+          stop("resume_from: saved presence head covers different ",
+               "compounds than the current presence_compounds / catalog.")
+        presence_mod <- loaded_head
+        presence_mod$to(device = device)
+      } else {
+        message("  No presence head at ", head_path,
+                "; starting a fresh presence head on the resumed encoder.")
+      }
+    }
 
     if (file.exists(manifest_path)) {
       e <- new.env()
@@ -1092,6 +1189,8 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         prior_loss_history     <- tm$loss_history
         prior_val_loss_history <- tm$val_loss_history
         prior_batch_loss_stats <- tm$batch_loss_stats
+        prior_presence_loss_history    <- tm$presence_loss_history
+        prior_val_presence_auc_history <- tm$val_presence_auc_history
         message("  Manifest shows last_epoch_completed = ",
                 tm$last_epoch_completed,
                 "; continuing from epoch ", start_epoch)
@@ -1131,6 +1230,11 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
           peak_shape = peak_shape,
           emg_tau_range = emg_tau_range,
           emg_mix_prob = emg_mix_prob,
+          presence_head = presence_head,
+          presence_weight = presence_weight,
+          presence_compounds = presence_compounds,
+          presence_pos_weight_max = presence_pos_weight_max,
+          presence_d_attn = presence_d_attn,
           stem_stride_rt = stem_stride_rt,
           stem_stride_cv = stem_stride_cv,
           encoder_channels = encoder_channels,
@@ -1155,6 +1259,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         if (start_epoch > epochs) {
           message("  Already at or past requested epochs; nothing to do.")
           return(list(encoder = model$encoder, autoencoder = model,
+                       presence_head = presence_mod,
                        loss_history = tm$loss_history,
                        val_loss_history = tm$val_loss_history,
                        real_val_loss_history = tm$real_val_loss_history,
@@ -1171,8 +1276,29 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   # Build optimizer AFTER any resume so it binds to the (possibly loaded)
   # model's parameters. Note: Adam moment estimates are not restored
   # from disk; resumed training effectively re-warms Adam from scratch.
-  opt <- torch::optim_adam(model$parameters, lr = lr, weight_decay = weight_decay)
+  train_params <- c(model$parameters,
+                    if (presence_head) presence_mod$parameters)
+  opt <- torch::optim_adam(train_params, lr = lr, weight_decay = weight_decay)
   loss_fn <- torch::nn_mse_loss()
+
+  # Rarity-weighted, masked BCE for the presence head. Each compound's
+  # positive weight is (1 - f) / f from its running firing frequency f
+  # (Laplace-smoothed), clamped to [1, presence_pos_weight_max], so a
+  # compound that fires in 5% of samples counts as much as an anchor.
+  presence_bce <- function(logits, target) {
+    f <- (presence_mod$fire_count + 1) / (presence_mod$n_seen + 2)
+    pw <- pmin(pmax((1 - f) / f, 1), presence_pos_weight_max)
+    tt <- function(x) torch::torch_tensor(x, dtype = torch::torch_float(),
+                                            device = device)
+    total <- torch::nnf_binary_cross_entropy_with_logits(
+      logits, target, weight = tt(presence_mask), pos_weight = tt(pw),
+      reduction = "sum")
+    total / (logits$size(1) * sum(presence_mask))
+  }
+  update_fire_counts <- function(pm) {
+    presence_mod$fire_count <- presence_mod$fire_count + colSums(pm)
+    presence_mod$n_seen <- presence_mod$n_seen + nrow(pm)
+  }
 
   # generate_batch: builds clean + noisy synthetic batches. When
   # use_parallel = TRUE, the per-sample loop is dispatched to
@@ -1409,9 +1535,16 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     if (noisy_dust_threshold > 0) {
       pair$noisy[pair$noisy < noisy_dust_threshold] <- 0
     }
+    presence_vec <- NULL
+    if (presence_head) {
+      present_ids <- unlist(pair$rendered_ids[presence_layers],
+                            use.names = FALSE)
+      presence_vec <- as.numeric(presence_ids %in% present_ids)
+    }
     list(
       clean = pmin(normalize_sample(pair$clean), norm_clamp),
-      noisy = pmin(normalize_sample(pair$noisy), norm_clamp)
+      noisy = pmin(normalize_sample(pair$noisy), norm_clamp),
+      presence = presence_vec
     )
   }
 
@@ -1467,10 +1600,16 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
       clean_arr[i, 1, , ] <- pairs[[i]]$clean
       noisy_arr[i, 1, , ] <- pairs[[i]]$noisy
     }
-    list(
+    out <- list(
       clean = torch::torch_tensor(clean_arr, dtype = torch::torch_float()),
       noisy = torch::torch_tensor(noisy_arr, dtype = torch::torch_float())
     )
+    if (presence_head) {
+      pm <- do.call(rbind, lapply(pairs, `[[`, "presence"))
+      out$presence_mat <- pm
+      out$presence <- torch::torch_tensor(pm, dtype = torch::torch_float())
+    }
+    out
   }
 
   val_batches <- NULL
@@ -1481,6 +1620,31 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     val_batches <- vector("list", n_val_batches)
     for (b in seq_len(n_val_batches)) val_batches[[b]] <- generate_batch(batch_size)
     .Random.seed <<- val_seed_state
+    # Seed the rarity weights with the val set's firing frequencies so
+    # the very first training steps aren't weighted from one batch.
+    if (presence_head && presence_mod$n_seen == 0)
+      for (vb in val_batches) update_fire_counts(vb$presence_mat)
+  }
+
+  # Validation presence AUC: macro-average over scored compounds that
+  # both fire and don't fire somewhere in the val set.
+  eval_val_presence <- function() {
+    if (!presence_head || is.null(val_batches)) return(NA_real_)
+    model$eval(); presence_mod$eval()
+    logit_list <- list(); target_list <- list()
+    torch::with_no_grad({
+      for (vb in val_batches) {
+        fmap <- model$encoder(vb$noisy$to(device = device))
+        logit_list[[length(logit_list) + 1L]] <-
+          as.matrix(presence_mod(fmap)$to(device = "cpu"))
+        target_list[[length(target_list) + 1L]] <- vb$presence_mat
+      }
+    })
+    model$train(); presence_mod$train()
+    L <- do.call(rbind, logit_list); Y <- do.call(rbind, target_list)
+    aucs <- vapply(which(presence_mask > 0),
+                   function(k) rank_auc(Y[, k], L[, k]), numeric(1))
+    mean(aucs, na.rm = TRUE)
   }
 
   eval_val <- function() {
@@ -1591,9 +1755,16 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         peak_shape = peak_shape,
         emg_tau_range = emg_tau_range,
         emg_mix_prob = emg_mix_prob,
+        presence_head = presence_head,
+        presence_weight = presence_weight,
+        presence_compounds = presence_compounds,
+        presence_pos_weight_max = presence_pos_weight_max,
+        presence_d_attn = presence_d_attn,
         device = device, seed = seed),
       loss_history = loss_h, val_loss_history = val_h,
       real_val_loss_history = real_val_h,
+      presence_loss_history = presence_loss_history,
+      val_presence_auc_history = val_presence_auc_history,
       batch_loss_stats = stats, total_samples = total_samples,
       last_epoch_completed = last_ep, complete = final,
       timestamp = Sys.time(), r_version = R.version.string)
@@ -1605,6 +1776,14 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   val_loss_history <- rep(NA_real_, epochs)
   real_val_loss_history <- rep(NA_real_, epochs)
   batch_loss_stats <- vector("list", epochs)
+  presence_loss_history <- rep(NA_real_, epochs)
+  val_presence_auc_history <- rep(NA_real_, epochs)
+  if (!is.null(prior_presence_loss_history)) {
+    n_p <- min(length(prior_presence_loss_history), epochs)
+    presence_loss_history[seq_len(n_p)] <- prior_presence_loss_history[seq_len(n_p)]
+    val_presence_auc_history[seq_len(n_p)] <-
+      prior_val_presence_auc_history[seq_len(n_p)]
+  }
   if (!is.null(prior_loss_history)) {
     n_prior <- min(length(prior_loss_history), epochs)
     loss_history[seq_len(n_prior)]     <- prior_loss_history[seq_len(n_prior)]
@@ -1617,20 +1796,37 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     model$train()
     ep_start <- Sys.time()
     batch_losses <- numeric(steps_per_epoch)
+    presence_losses <- rep(NA_real_, steps_per_epoch)
     for (step in seq_len(steps_per_epoch)) {
       batch <- generate_batch()
       noisy <- batch$noisy$to(device = device)
       clean <- batch$clean$to(device = device)
       opt$zero_grad()
-      recon <- model(noisy)
-      loss <- loss_fn(recon, clean)
+      if (presence_head) {
+        fmap <- model$encoder(noisy)
+        recon <- model$decoder(fmap)
+        recon_loss <- loss_fn(recon, clean)
+        update_fire_counts(batch$presence_mat)
+        pres_loss <- presence_bce(presence_mod(fmap),
+                                  batch$presence$to(device = device))
+        loss <- recon_loss + presence_weight * pres_loss
+        presence_losses[step] <- as.numeric(pres_loss$item())
+      } else {
+        recon <- model(noisy)
+        recon_loss <- loss_fn(recon, clean)
+        loss <- recon_loss
+      }
       loss$backward()
       if (grad_clip > 0) {
-        torch::nn_utils_clip_grad_norm_(model$parameters, max_norm = grad_clip)
+        torch::nn_utils_clip_grad_norm_(train_params, max_norm = grad_clip)
       }
       opt$step()
-      batch_losses[step] <- as.numeric(loss$item())
+      # Loss history stays reconstruction MSE so runs remain comparable
+      # with and without the presence head.
+      batch_losses[step] <- as.numeric(recon_loss$item())
     }
+    presence_loss_history[ep] <- mean(presence_losses)
+    val_presence_auc_history[ep] <- eval_val_presence()
     batch_loss_stats[[ep]] <- list(
       mean = mean(batch_losses), median = stats::median(batch_losses),
       max = max(batch_losses), min = min(batch_losses),
@@ -1651,9 +1847,14 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         " | median: ", round(batch_loss_stats[[ep]]$median, 4),
         " | p95: ",    round(batch_loss_stats[[ep]]$p95,    4),
         " | max: ",    round(batch_loss_stats[[ep]]$max,    4)) else ""
+      pres_str <- if (presence_head) paste0(
+        " | presence BCE: ", round(presence_loss_history[ep], 4),
+        if (!is.na(val_presence_auc_history[ep]))
+          paste0(" | val presence AUC: ",
+                 round(val_presence_auc_history[ep], 3)) else "") else ""
       message("Epoch ", ep, "/", epochs,
               " | train MSE: ", round(batch_loss_stats[[ep]]$mean, 4),
-              val_str, real_val_str, diag_str,
+              val_str, real_val_str, pres_str, diag_str,
               " | Time: ", round(ep_time, 2), " min",
               " | ETA: ", round(eta_min, 0), " min")
     }
@@ -1670,6 +1871,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
       ae_path <- sub("\\.pt$", "_autoencoder.pt", save_path)
       if (ae_path == save_path) ae_path <- paste0(save_path, "_autoencoder.pt")
       torch::torch_save(model, ae_path)
+      if (presence_head)
+        torch::torch_save(presence_mod,
+                          sub("\\.pt$", "_presence_head.pt", save_path))
     }
 
     # Additionally: save a numbered checkpoint every `checkpoint_every`
@@ -1679,6 +1883,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         ep %% checkpoint_every == 0L && ep < epochs) {
       ckpt_path <- sub("\\.pt$", paste0("_epoch", ep, ".pt"), save_path)
       torch::torch_save(model$encoder, ckpt_path)
+      if (presence_head)
+        torch::torch_save(presence_mod,
+                          sub("\\.pt$", "_presence_head.pt", ckpt_path))
       if (verbose) message("  -> Checkpoint saved: ", ckpt_path)
     }
 
@@ -1686,7 +1893,8 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     # collect. Helps prevent slow memory growth across long runs and
     # reduces the chance of OS-level memory-pressure kills, especially
     # on machines with limited RAM (e.g., laptops).
-    rm(batch, noisy, clean, recon, loss, batch_losses)
+    rm(batch, noisy, clean, recon, recon_loss, loss, batch_losses)
+    if (presence_head) rm(fmap, pres_loss)
     gc(verbose = FALSE, full = FALSE)
   }
 
@@ -1697,11 +1905,17 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     message("Autoencoder saved to: ", ae_path)
     manifest_path <- sub("\\.pt$", "_manifest.Rdata", save_path)
     message("Manifest saved to: ", manifest_path)
+    if (presence_head)
+      message("Presence head saved to: ",
+              sub("\\.pt$", "_presence_head.pt", save_path))
   }
 
   list(encoder = model$encoder, autoencoder = model,
+       presence_head = presence_mod,
        loss_history = loss_history, val_loss_history = val_loss_history,
        real_val_loss_history = real_val_loss_history,
+       presence_loss_history = presence_loss_history,
+       val_presence_auc_history = val_presence_auc_history,
        batch_loss_stats = batch_loss_stats, total_samples = total_samples)
 }
 

@@ -84,7 +84,9 @@ render. Mutually exclusive with \code{variable_config}.}
 \value{
 List with \code{clean} (H x W), \code{noisy} (H x W), and per-layer
 composition metadata (\code{anchor_ids}, \code{variable_ids},
-\code{contamination_positions}).
+\code{contamination_positions}, and \code{rendered_ids} — the compound_ids
+actually drawn in the anchors / variable layers, used as
+ground-truth presence labels).
 }
 \description{
 Builds a synthetic GC-DMS image by stacking three layers of peaks:

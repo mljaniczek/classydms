@@ -9,7 +9,10 @@ build_pretrained_classifier(
   num_classes = 2L,
   dropout_p = 0.3,
   freeze_backbone = TRUE,
-  unfreeze_last_block = TRUE
+  unfreeze_last_block = TRUE,
+  readout = c("gap", "attention", "presence"),
+  presence_head = NULL,
+  n_queries = 4L
 )
 }
 \arguments{
@@ -23,12 +26,35 @@ build_pretrained_classifier(
 
 \item{unfreeze_last_block}{If TRUE, the encoder's last residual block
 (layer3) is set trainable even if \code{freeze_backbone = TRUE}.}
+
+\item{readout}{One of \code{"gap"} (default), \code{"attention"}, \code{"presence"}.}
+
+\item{presence_head}{Required when \code{readout = "presence"}: the
+\code{presence_head} returned by \code{\link[=pretrain_denoising_online]{pretrain_denoising_online()}} (or loaded
+from its \verb{*_presence_head.pt}).}
+
+\item{n_queries}{Number of queries for \code{readout = "attention"}.}
 }
 \value{
 An instantiated torch module.
 }
 \description{
 Deep-copies the encoder so each fold gets its own independent weights
-(prevents cross-fold leakage when \code{unfreeze_last_block = TRUE}), wraps
-it with adaptive average pooling and a dropout + linear classifier head.
+(prevents cross-fold leakage when \code{unfreeze_last_block = TRUE}), then
+adds a readout that turns the \verb{(B, C, h, w)} feature map into a vector,
+followed by dropout + linear classifier.
+}
+\details{
+Readouts:
+\itemize{
+\item \code{"gap"}: global average pooling (the original readout). Averages
+over all of RT x CV, so it discards where activation occurred.
+\item \code{"attention"}: \code{\link[=attention_pool_readout]{attention_pool_readout()}} — \code{n_queries} learned
+queries with 2D positional encoding, trained end-to-end. Works with
+any existing encoder.
+\item \code{"presence"}: a pretrained \code{\link[=dms_presence_head]{dms_presence_head()}} producing one logit
+per catalog compound; the classifier is then a linear model over
+compound presence evidence. The head is deep-copied and follows
+\code{freeze_backbone} (frozen by default).
+}
 }

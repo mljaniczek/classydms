@@ -21,6 +21,9 @@ cv_pretrained_oof(
   cv_shift = 5L,
   intensity_scale = c(0.9, 1.1),
   noise_sd = 0,
+  readout = c("gap", "attention", "presence"),
+  presence_head = NULL,
+  n_queries = 4L,
   seed = 1L
 )
 }
@@ -60,6 +63,9 @@ random intensity rescaling.}
 
 \item{noise_sd}{SD of Gaussian noise added to augmented images
 (0 disables).}
+
+\item{readout, presence_head, n_queries}{Readout replacing GAP; see
+\code{\link[=build_pretrained_classifier]{build_pretrained_classifier()}}.}
 
 \item{seed}{RNG seed for fold assignment and training.}
 }

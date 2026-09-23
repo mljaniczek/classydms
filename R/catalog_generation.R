@@ -1069,7 +1069,9 @@ catalog_biomarkers_universal_backdrop <- function(
 #'   render. Mutually exclusive with `variable_config`.
 #' @return List with `clean` (H x W), `noisy` (H x W), and per-layer
 #'   composition metadata (`anchor_ids`, `variable_ids`,
-#'   `contamination_positions`).
+#'   `contamination_positions`, and `rendered_ids` — the compound_ids
+#'   actually drawn in the anchors / variable layers, used as
+#'   ground-truth presence labels).
 #' @export
 generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
                                              variable_config = NULL,
@@ -1158,7 +1160,8 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
   # Render anchors and variable as SEPARATE layers so callers can
   # compose them independently (see clean_layers / noise_layers in
   # pretrain_denoising_online — needed for a proper denoising loss).
-  render_layer <- function(ids, int_mult) {
+  rendered_ids <- list()
+  render_layer <- function(ids, int_mult, layer_name) {
     if (length(ids) == 0L) return(matrix(0, nrow = H, ncol = W))
     prev_ov_l <- stats::setNames(rep(1.0, length(ids)),
                                    as.character(ids))
@@ -1179,9 +1182,11 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
       emg_tau_range       = emg_tau_range,
       emg_mix_prob        = emg_mix_prob
     )
+    rendered_ids[[layer_name]] <<- unique(res$placements$compound_id)
     res$clean
   }
-  Z_anchors  <- render_layer(anchor_ids, setNames(numeric(0), character(0)))
+  Z_anchors  <- render_layer(anchor_ids, setNames(numeric(0), character(0)),
+                             "anchors")
   # Variable layer: default is catalog-clustered medians via
   # render_layer; override with variable_source_peak_params to draw
   # from real observed peaks (bootstraps morphology from raw _obs
@@ -1201,7 +1206,7 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
       emg_mix_prob = emg_mix_prob)
     res$clean
   } else {
-    render_layer(variable_ids, variable_int_mult)
+    render_layer(variable_ids, variable_int_mult, "variable")
   }
 
   Z <- Z_anchors + Z_variable
@@ -1276,6 +1281,9 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
   list(clean = Z, noisy = noisy,
        anchor_ids = anchor_ids,
        variable_ids = variable_ids,
+       rendered_ids = list(
+         anchors  = rendered_ids$anchors  %||% integer(0),
+         variable = rendered_ids$variable %||% integer(0)),
        contamination_positions = contamination_positions,
        layers = list(
          anchors       = Z_anchors,

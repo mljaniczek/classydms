@@ -2,7 +2,7 @@
 % Please edit documentation in R/classify.R
 \name{cv_encoder_elastic_net}
 \alias{cv_encoder_elastic_net}
-\title{Elastic net classification on 64-dim encoder features}
+\title{Elastic net classification on encoder features}
 \usage{
 cv_encoder_elastic_net(
   encoder,
@@ -12,7 +12,9 @@ cv_encoder_elastic_net(
   alpha = 0.5,
   nlambda = 100L,
   seed = 1L,
-  device = "cpu"
+  device = "cpu",
+  readout = c("gap", "presence"),
+  presence_head = NULL
 )
 }
 \arguments{
@@ -31,6 +33,8 @@ cv_encoder_elastic_net(
 \item{seed}{RNG seed for fold assignment.}
 
 \item{device}{"cpu" or "cuda".}
+
+\item{readout, presence_head}{See \code{\link[=extract_encoder_features]{extract_encoder_features()}}.}
 }
 \value{
 List with \code{probs}, \code{auc}, \code{features}, and \code{coefs}.
@@ -39,6 +43,6 @@ List with \code{probs}, \code{auc}, \code{features}, and \code{coefs}.
 Performs stratified k-fold CV: extract features once via the frozen
 encoder, then fit \code{cv.glmnet} independently on each fold. Returns
 out-of-fold predictions, AUC, the feature matrix, and elastic net
-coefficients (which map directly to encoder channels and are the
-starting point for spatial saliency interpretation).
+coefficients. With \code{readout = "gap"} coefficients map to encoder
+channels; with \code{readout = "presence"} they map to catalog compounds.
 }

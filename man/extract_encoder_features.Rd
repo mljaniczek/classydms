@@ -2,9 +2,15 @@
 % Please edit documentation in R/classify.R
 \name{extract_encoder_features}
 \alias{extract_encoder_features}
-\title{Extract encoder features for all samples (GAP-pooled)}
+\title{Extract encoder features for all samples}
 \usage{
-extract_encoder_features(encoder, Z_list, device = "cpu")
+extract_encoder_features(
+  encoder,
+  Z_list,
+  device = "cpu",
+  readout = c("gap", "presence"),
+  presence_head = NULL
+)
 }
 \arguments{
 \item{encoder}{A pre-trained \code{dms_encoder}.}
@@ -12,16 +18,28 @@ extract_encoder_features(encoder, Z_list, device = "cpu")
 \item{Z_list}{List of preprocessed, padded intensity matrices.}
 
 \item{device}{"cpu" or "cuda".}
+
+\item{readout}{\code{"gap"} or \code{"presence"}.}
+
+\item{presence_head}{Required for \code{readout = "presence"}.}
 }
 \value{
-Numeric matrix with one row per sample, \code{latent_dim} columns.
+Numeric matrix with one row per sample and named columns.
 }
 \description{
-Runs each sample through the (frozen) encoder, applies global average
-pooling to its feature map, and stacks the result into an
-\verb{(N, latent_dim)} matrix suitable for use as input to a classical
-classifier. Latent dim is auto-detected from the encoder (either via
-its \code{encoder_channels} attribute or by peeking at its output shape
-on the first sample), so encoders built with wider
-\code{encoder_channels} work without additional args.
+Runs each sample through the (frozen) encoder and reduces its feature
+map to a vector, stacking the results into a matrix suitable for a
+classical classifier.
+}
+\details{
+Readouts:
+\itemize{
+\item \code{"gap"} (default): global average pooling -> \verb{(N, latent_dim)},
+columns \code{encoder_ch_1..}.
+\item \code{"presence"}: per-compound presence logits from a pretrained
+\code{\link[=dms_presence_head]{dms_presence_head()}} -> \verb{(N, K)}, columns \verb{cmp_<compound_id>}. Each
+column is evidence that one catalog compound is present, so an
+elastic net on these can sum evidence across biomarkers and its
+coefficients name compounds directly.
+}
 }

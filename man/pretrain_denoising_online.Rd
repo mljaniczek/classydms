@@ -53,6 +53,11 @@ pretrain_denoising_online(
   peak_shape = c("gaussian", "emg", "mix"),
   emg_tau_range = c(0.2, 0.8),
   emg_mix_prob = 0.3,
+  presence_head = FALSE,
+  presence_weight = 1,
+  presence_compounds = NULL,
+  presence_pos_weight_max = 20,
+  presence_d_attn = 32L,
   device = if (torch::cuda_is_available()) "cuda" else "cpu",
   num_threads = NULL,
   num_workers = 1L,
@@ -390,6 +395,34 @@ Drawn per peak uniformly.}
 \item{emg_mix_prob}{Probability of EMG shape per peak in \code{"mix"}
 mode. Default \code{0.3}.}
 
+\item{presence_head}{If \code{TRUE}, trains a \code{\link[=dms_presence_head]{dms_presence_head()}}
+jointly with the autoencoder: from the encoder feature map it
+predicts which catalog compounds were rendered in the clean target
+layers (ground truth comes straight from the generator). Total loss
+is \verb{reconstruction MSE + presence_weight * BCE}. Requires the
+three-layer path (\code{catalog} + \code{anchor_ids}). The head is saved as
+\verb{*_presence_head.pt} next to the encoder and returned as
+\verb{$presence_head}; use it downstream via
+\code{\link[=extract_encoder_features]{extract_encoder_features()}} / \code{\link[=cv_encoder_elastic_net]{cv_encoder_elastic_net()}} with
+\code{readout = "presence"}, or \code{\link[=build_pretrained_classifier]{build_pretrained_classifier()}} with
+\code{readout = "presence"}. Default \code{FALSE}.}
+
+\item{presence_weight}{Weight on the presence BCE term. Default \code{1.0}.}
+
+\item{presence_compounds}{Optional subset of \code{compound_id}s the head
+covers. Default \code{NULL} = every catalog compound with a finite
+position. Compounds that never fire during pretraining (e.g.
+outside \code{variable_config$prevalence_range} and not anchors) only
+ever see negative labels.}
+
+\item{presence_pos_weight_max}{Cap on the per-compound positive
+weight \code{(1 - f) / f}, where \code{f} is the compound's running firing
+frequency. Rarity weighting keeps rarely-rendered compounds from
+being ignored by the loss. Default \code{20}.}
+
+\item{presence_d_attn}{Query/key dimension of the head's attention.
+Default \code{32L}.}
+
 \item{device}{"cpu" or "cuda".}
 
 \item{num_threads}{If non-NULL, sets the number of CPU threads
@@ -463,8 +496,11 @@ target, the latter to overwrite the same encoder file.
 \item{verbose}{Whether to print epoch progress.}
 }
 \value{
-List with \code{encoder}, \code{autoencoder}, \code{loss_history},
-\code{val_loss_history}, \code{batch_loss_stats}, and \code{total_samples}.
+List with \code{encoder}, \code{autoencoder}, \code{presence_head} (\code{NULL}
+unless \code{presence_head = TRUE}), \code{loss_history} (reconstruction MSE),
+\code{val_loss_history}, \code{real_val_loss_history}, \code{presence_loss_history},
+\code{val_presence_auc_history} (macro per-compound AUC on the synthetic
+val set), \code{batch_loss_stats}, and \code{total_samples}.
 }
 \description{
 Generates fresh synthetic batches on-the-fly during training, giving
