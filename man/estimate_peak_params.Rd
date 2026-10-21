@@ -37,7 +37,10 @@ suitable for passing to \code{\link[=generate_one_synthetic]{generate_one_synthe
 \code{sigma_rt_raw}, \code{sigma_cv_raw}, and \code{intensity_raw} are parallel
 per-peak vectors; \code{sample_idx_raw} gives the 1-based index of the
 source sample for each peak (parallel to the other \verb{*_raw} vectors),
-and \code{sample_names} is \code{names(Z_list)} for lookup. These enable
+and \code{sample_names} is \code{names(Z_list)} for lookup. \code{data_dims} is an
+\verb{n_samples x 2} matrix (\code{rows}, \code{cols}) of each sample's matrix
+dims, which the generators use to place fraction positions on a
+centre-padded canvas. These enable
 per-sample analyses (e.g. sample-level shift/clustering) without
 changing existing callers.
 }

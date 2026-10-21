@@ -127,6 +127,14 @@ raw .xls -> read_dms_file -> load_dms_directory  (returns samples + y)
   sparse synthetic images can have near-zero Q_0.95 after log-transform,
   which would blow up the normalization denominator. The clamp keeps such
   outliers from destabilizing training.
+- **Placement on the padded canvas** (`R/placement.R`): positions are
+  fractions of each sample's *unpadded* matrix (`r0 / rows`), but real
+  images are centre-padded by `pad_to_target`. Generators and the
+  presence head place at `floor((H - rows) / 2) + frac * rows` using
+  `peak_params$data_dims` / `catalog$parameters$data_dims` and the
+  per-observation `sample_idx_obs`. Never place at `frac * H` directly:
+  with 73 CV columns padded to 96 that stretched CV by 1.31x (±12
+  columns at the edges) relative to real images.
 - **`size_jitter = 0.6` per-peak log-normal scale factor**: adds size
   diversity beyond what the fitted sigma distributions alone provide.
   Exposed as a function parameter (default 0.6).
@@ -201,7 +209,19 @@ raw .xls -> read_dms_file -> load_dms_directory  (returns samples + y)
    into apparent importance. Diagnose by inspecting feature variances:
    `apply(elnet$features, 2, var)`. Mitigations: longer pretraining,
    larger `size_jitter`, more synthetic diversity.
-5. **R session crashes during long pretrain runs** on Apple Silicon —
+5. **Misaligned per-peak vectors in peak_params** — before the
+   `validate_peak_params()` fix, `subset_peak_params()` (and
+   `holdout_biomarkers()`) subset only a hand-written list of `*_raw`
+   fields, leaving `rt_seconds_raw` / `cv_volts_raw` full length.
+   Physical-mode catalogs built from subsetted params then clustered on
+   the long vector and read rt_frac / morphology / intensity /
+   sample_idx from the wrong peaks (and included held-out samples).
+   Rule: every field ending in `_raw` is per-peak and parallel; drop
+   peaks / samples only via `.subset_peaks()` / `.subset_samples()`, and
+   end every transform with `validate_peak_params()`. Also use
+   `pp[["n_peaks"]]`, not `pp$n_peaks` — `$` partially matches
+   `n_peaks_detected` when `n_peaks` is absent.
+6. **R session crashes during long pretrain runs** on Apple Silicon —
    sometimes due to memory pressure or MPS issues. Mitigations:
    `gc()` between epochs, every-epoch save, `resume_from` for recovery.
 

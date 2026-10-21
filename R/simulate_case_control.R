@@ -141,6 +141,13 @@ holdout_biomarkers <- function(peak_params,
     sigma_cv  = peak_params$sigma_cv_raw[biomarker_idx],
     intensity = peak_params$intensity_raw[biomarker_idx]
   )
+  # Source sample's unpadded data dims, so injection can place the
+  # template on a centre-padded canvas (see R/placement.R).
+  if (!is.null(peak_params$data_dims) && !is.null(peak_params$sample_idx_raw)) {
+    src <- peak_params$sample_idx_raw[biomarker_idx]
+    templates$data_rows <- unname(peak_params$data_dims[src, 1])
+    templates$data_cols <- unname(peak_params$data_dims[src, 2])
+  }
 
   # Find every pool peak within the protected radius of ANY biomarker
   protected_mask <- logical(n_pool)   # FALSE by default
@@ -155,14 +162,15 @@ holdout_biomarkers <- function(peak_params,
   protected_mask[biomarker_idx] <- TRUE
   keep_mask <- !protected_mask
 
-  bg <- peak_params
-  for (nm in c("rt_loc_raw", "cv_loc_raw", "sigma_rt_raw",
-               "sigma_cv_raw", "intensity_raw")) {
-    bg[[nm]] <- peak_params[[nm]][keep_mask]
+  # Drop the protected peaks from EVERY per-peak vector (rt_seconds_raw /
+  # cv_volts_raw included) so the background stays internally aligned.
+  bg <- .subset_peaks(peak_params, keep_mask)
+  if (!is.null(bg[["n_peaks"]][["values"]]) && !is.null(peak_params$sample_idx_raw)) {
+    removed <- tabulate(peak_params$sample_idx_raw[!keep_mask],
+                        nbins = length(bg[["n_peaks"]][["values"]]))
+    bg$n_peaks$values <- pmax(0L, bg[["n_peaks"]][["values"]] - removed)
   }
-  if (!is.null(bg$sample_idx_raw))
-    bg$sample_idx_raw <- peak_params$sample_idx_raw[keep_mask]
-  bg$n_peaks_detected <- sum(keep_mask)
+  validate_peak_params(bg, "holdout_biomarkers")
 
   list(
     biomarker_templates    = templates,
@@ -417,6 +425,14 @@ simulate_case_control_cohort <- function(background_peak_params,
   names(samples) <- sample_names
 
   n_biomarkers <- nrow(biomarkers)
+  # Unpadded data dims of each template's source sample (NA: unknown,
+  # place at fraction * H / W).
+  bm_rows <- if ("data_rows" %in% names(biomarkers)) biomarkers$data_rows
+             else rep(NA_real_, n_biomarkers)
+  bm_cols <- if ("data_cols" %in% names(biomarkers)) biomarkers$data_cols
+             else rep(NA_real_, n_biomarkers)
+  if (anyNA(bm_rows) || anyNA(bm_cols))
+    .warn_scaled_placement("simulate_case_control_cohort")
   firing <- matrix(FALSE, nrow = N, ncol = n_biomarkers,
                    dimnames = list(sample_names, NULL))
 
@@ -447,9 +463,9 @@ simulate_case_control_cohort <- function(background_peak_params,
       mult <- if (is_case) biomarkers$case_intensity_mult[b]
               else         biomarkers$control_intensity_mult[b]
 
-      mu_rt <- biomarkers$rt_loc[b] * H +
+      mu_rt <- .pad_frac_to_px(biomarkers$rt_loc[b], bm_rows[b], H) +
                  stats::rnorm(1, 0, location_jitter_rt)
-      mu_cv <- biomarkers$cv_loc[b] * W +
+      mu_cv <- .pad_frac_to_px(biomarkers$cv_loc[b], bm_cols[b], W) +
                  stats::rnorm(1, 0, location_jitter_cv)
       mu_rt <- max(1, min(H, mu_rt))
       mu_cv <- max(1, min(W, mu_cv))

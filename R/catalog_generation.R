@@ -113,24 +113,13 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
   }
   n_compounds <- nrow(compounds)
 
-  # Placement uses FRACTION coordinates so peaks land at fraction * H / W.
-  # For physical-mode catalogs, rt_loc / cv_loc are in seconds / volts and
-  # rt_frac / cv_frac carry the fraction. Read coord_mode to pick the
-  # right columns. Older catalogs (no coord_mode field) are treated as
-  # fraction for backward compatibility.
-  coord_mode <- catalog$parameters$coord_mode %||% "fraction"
-  if (coord_mode == "physical") {
-    if (is.null(compounds$rt_frac) || is.null(compounds$cv_frac)) {
-      stop("generate_one_synthetic_from_catalog: physical-mode catalog ",
-           "must carry rt_frac and cv_frac columns. Rebuild the catalog ",
-           "with a recent build_peak_catalog().")
-    }
-    rt_place <- compounds$rt_frac
-    cv_place <- compounds$cv_frac
-  } else {
-    rt_place <- compounds$rt_loc
-    cv_place <- compounds$cv_loc
-  }
+  # Placement: fraction positions are mapped onto the H x W canvas the
+  # way pad_to_target() centre-pads real samples, using each
+  # observation's own sample data dims (see R/placement.R). For
+  # physical-mode catalogs rt_frac / cv_frac carry the centroid fraction;
+  # older catalogs (no coord_mode field) are treated as fraction.
+  pl <- .catalog_placement(catalog, compounds, H, W,
+                           "generate_one_synthetic_from_catalog")
 
   clean  <- matrix(0, nrow = H, ncol = W)
   rows   <- seq_len(H); cols <- seq_len(W)
@@ -162,7 +151,7 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
     # entry that slipped through), skip it. This can happen if the
     # catalog was built from peak_params containing NAs in
     # rt_loc_raw / cv_loc_raw and the median aggregation produced NaN.
-    if (!is.finite(rt_place[i]) || !is.finite(cv_place[i])) next
+    if (!is.finite(pl$rt_cent[i]) || !is.finite(pl$cv_cent[i])) next
 
     mult <- if (cid %in% im_names) intensity_mult[[cid]] else 1.0
 
@@ -195,22 +184,11 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
     # bootstrap index j as morphology, preserving the physical
     # coupling that a given real observation had a specific position
     # AND a specific morphology together. Falls back to the centroid
-    # (rt_place[i]) if per-obs positions are absent (older catalogs
+    # (pl$rt_cent[i]) if per-obs positions are absent (older catalogs
     # built before this columnar addition).
-    if ("rt_frac_obs" %in% names(compounds) &&
-        length(compounds$rt_frac_obs[[i]]) >= j) {
-      rt_place_i <- compounds$rt_frac_obs[[i]][j]
-      cv_place_i <- compounds$cv_frac_obs[[i]][j]
-      if (!is.finite(rt_place_i)) rt_place_i <- rt_place[i]
-      if (!is.finite(cv_place_i)) cv_place_i <- cv_place[i]
-    } else {
-      rt_place_i <- rt_place[i]
-      cv_place_i <- cv_place[i]
-    }
-    mu_rt <- rt_place_i * H +
-               stats::rnorm(1, 0, location_jitter_rt)
-    mu_cv <- cv_place_i * W +
-               stats::rnorm(1, 0, location_jitter_cv)
+    pos <- .place_obs(pl, compounds, i, j)
+    mu_rt <- pos[1] + stats::rnorm(1, 0, location_jitter_rt)
+    mu_cv <- pos[2] + stats::rnorm(1, 0, location_jitter_cv)
     mu_rt <- max(1, min(H, mu_rt))
     mu_cv <- max(1, min(W, mu_cv))
 
@@ -422,7 +400,10 @@ build_biomarker_spec_catalog <- function(compound_ids,
 #'   - `n_cases`, `n_controls`: integer peaks to inject per case /
 #'     control sample.
 #'   - `rt_range`, `cv_range`: length-2 numerics in [0,1] giving the
-#'     fractional (RT, CV) placement region.
+#'     placement region as fractions of the padded `H x W` canvas
+#'     (position = fraction * H). On a centre-padded canvas the data
+#'     block occupies only part of this range; see
+#'     [catalog_pixel_positions()].
 #'   - `intensity_range`: length-2 numeric giving uniform bounds for
 #'     the injected peak amplitude.
 #'   - `exclusion_eps_rt`, `exclusion_eps_cv`: fractional radius; a
@@ -530,10 +511,12 @@ simulate_case_control_from_catalog <- function(catalog,
     if (length(ocp$sigma_rt_pool) == 0L || length(ocp$sigma_cv_pool) == 0L)
       stop("off_catalog_peaks: catalog has no usable sigma observations ",
            "to draw peak shapes from.")
-    # Catalog compound positions in fraction space (for exclusion)
-    cmp <- catalog$compounds
-    ocp$cat_rt_frac <- if (!is.null(cmp$rt_frac)) cmp$rt_frac else cmp$rt_loc
-    ocp$cat_cv_frac <- if (!is.null(cmp$cv_frac)) cmp$cv_frac else cmp$cv_loc
+    # Catalog compound centroids as canvas fractions (px / H), the frame
+    # inject_off_catalog() samples contamination positions in.
+    pl_ex <- .catalog_placement(catalog, catalog$compounds, H, W,
+                                "simulate_case_control_from_catalog")
+    ocp$cat_rt_frac <- pl_ex$rt_cent / H
+    ocp$cat_cv_frac <- pl_ex$cv_cent / W
     # Filter to finite so exclusion check doesn't compare against NA
     keep_pos <- is.finite(ocp$cat_rt_frac) & is.finite(ocp$cat_cv_frac)
     ocp$cat_rt_frac <- ocp$cat_rt_frac[keep_pos]
@@ -568,12 +551,10 @@ simulate_case_control_from_catalog <- function(catalog,
          paste(bad, collapse = ", "))
   }
 
-  # Coord-mode-aware placement columns (same convention as
-  # generate_one_synthetic_from_catalog).
-  coord_mode <- catalog$parameters$coord_mode %||% "fraction"
-  cmp <- catalog$compounds
-  rt_place <- if (coord_mode == "physical") cmp$rt_frac else cmp$rt_loc
-  cv_place <- if (coord_mode == "physical") cmp$cv_frac else cmp$cv_loc
+  # Canvas placement (same convention as
+  # generate_one_synthetic_from_catalog; see R/placement.R).
+  pl <- .catalog_placement(catalog, catalog$compounds, H, W,
+                           "simulate_case_control_from_catalog")
 
   off_catalog_positions <- if (!is.null(ocp)) vector("list", N) else NULL
   if (!is.null(off_catalog_positions))
@@ -635,7 +616,7 @@ simulate_case_control_from_catalog <- function(catalog,
         crow <- cid_to_row[[as.character(cid)]]
         if (is.na(crow)) return()
         # Skip if placement fraction non-finite (catalog defense).
-        if (!is.finite(rt_place[crow]) || !is.finite(cv_place[crow])) return()
+        if (!is.finite(pl$rt_cent[crow]) || !is.finite(pl$cv_cent[crow])) return()
         # Draw fresh morphology (same convention as generator, with the
         # same resample-on-bad-triple loop so a stale NA in the per-obs
         # lists doesn't render a NaN Gaussian and break subtract later).
@@ -660,17 +641,9 @@ simulate_case_control_from_catalog <- function(catalog,
         # Bootstrap position jointly with morphology if per-obs
         # positions available (post-refactor catalogs); fall back to
         # centroid otherwise.
-        if ("rt_frac_obs" %in% names(catalog$compounds) &&
-            length(catalog$compounds$rt_frac_obs[[crow]]) >= j) {
-          rp <- catalog$compounds$rt_frac_obs[[crow]][j]
-          cp <- catalog$compounds$cv_frac_obs[[crow]][j]
-          if (!is.finite(rp)) rp <- rt_place[crow]
-          if (!is.finite(cp)) cp <- cv_place[crow]
-        } else {
-          rp <- rt_place[crow]; cp <- cv_place[crow]
-        }
-        mu_rt <- rp * H + stats::rnorm(1, 0, location_jitter_rt)
-        mu_cv <- cp * W + stats::rnorm(1, 0, location_jitter_cv)
+        pos <- .place_obs(pl, catalog$compounds, crow, j)
+        mu_rt <- pos[1] + stats::rnorm(1, 0, location_jitter_rt)
+        mu_cv <- pos[2] + stats::rnorm(1, 0, location_jitter_cv)
         mu_rt <- max(1, min(H, mu_rt))
         mu_cv <- max(1, min(W, mu_cv))
         scale_factor <- exp(stats::rnorm(1, 0, size_jitter))
@@ -1047,8 +1020,10 @@ catalog_biomarkers_universal_backdrop <- function(
 #'   injection. Same fields as `off_catalog_peaks` in
 #'   [simulate_case_control_from_catalog()] except with `n_per_sample`
 #'   instead of `n_cases` / `n_controls`. Default field values:
-#'   `n_per_sample = c(5, 30)`, `rt_range = c(0.05, 0.95)`,
-#'   `cv_range = c(0.05, 0.95)`, `intensity_range = c(0.1, 0.5)`,
+#'   `n_per_sample = c(5, 30)`, `rt_range` / `cv_range` = 5-95% of the
+#'   catalog's (median) unpadded data block expressed as canvas
+#'   fractions (5-95% of the canvas for catalogs without data dims),
+#'   `intensity_range = c(0.1, 0.5)`,
 #'   `exclusion_eps_rt = 0.02`, `exclusion_eps_cv = 0.05`. Pass `NULL`
 #'   to skip this layer.
 #' @param add_noise Whether to add folded-Normal background noise on
@@ -1219,8 +1194,15 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
   if (!is.null(contamination_config)) {
     cc <- contamination_config
     cc$n_per_sample       <- cc$n_per_sample       %||% c(5, 30)
-    cc$rt_range           <- cc$rt_range           %||% c(0.05, 0.95)
-    cc$cv_range           <- cc$cv_range           %||% c(0.05, 0.95)
+    # Canvas placement frame (see R/placement.R). Default contamination
+    # ranges cover 5-95% of the data block, not of the padded canvas, so
+    # clutter never lands in the zero-padding bands real images have.
+    pl_con <- .catalog_placement(catalog, cmp, H, W,
+                                 "generate_noisy_pretrain_sample")
+    cc$rt_range           <- cc$rt_range %||%
+                               .data_band_range(pl_con, c(0.05, 0.95), "rt")
+    cc$cv_range           <- cc$cv_range %||%
+                               .data_band_range(pl_con, c(0.05, 0.95), "cv")
     cc$intensity_range    <- cc$intensity_range    %||% c(0.1, 0.5)
     cc$exclusion_eps_rt   <- cc$exclusion_eps_rt   %||% 0.02
     cc$exclusion_eps_cv   <- cc$exclusion_eps_cv   %||% 0.05
@@ -1230,8 +1212,8 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
                                                     cc$n_per_sample[2] + 1))
     if (n_con > 0L) {
       srp <- unlist(cmp$sigma_rt_obs); scp <- unlist(cmp$sigma_cv_obs)
-      pos_rt <- if (!is.null(cmp$rt_frac)) cmp$rt_frac else cmp$rt_loc
-      pos_cv <- if (!is.null(cmp$cv_frac)) cmp$cv_frac else cmp$cv_loc
+      pos_rt <- pl_con$rt_cent / H
+      pos_cv <- pl_con$cv_cent / W
       keep_pos <- is.finite(pos_rt) & is.finite(pos_cv)
       ocp <- list(
         rt_range = cc$rt_range, cv_range = cc$cv_range,

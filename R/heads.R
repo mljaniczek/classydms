@@ -11,14 +11,18 @@
 
 #' Catalog geometry for a compound-anchored head
 #'
-#' Collects each compound's centroid position (as a fraction of image
-#' height / width, the same convention the synthetic generator uses to
-#' place peaks) and a positional spread used as the width of the head's
-#' location prior. The spread combines the compound's observed
-#' per-observation position SD (`rt_frac_obs` / `cv_frac_obs`) with any
-#' extra displacement the pretraining augmentation can introduce
-#' (affine shift, RT warp), so the prior stays wide enough to find a
-#' shifted peak.
+#' Collects each compound's position on the `H x W` canvas, expressed as
+#' a fraction in the same convention as the head's token centres (pixel
+#' `p` sits at `(p - 0.5) / H`), and a positional spread used as the
+#' width of the head's location prior. Positions come from
+#' [catalog_pixel_positions()], which maps every observation onto the
+#' canvas the way [pad_to_target()] centre-pads real samples, so the
+#' prior is centred where the peak sits in both synthetic and real
+#' images. The spread is the SD of the observations' canvas positions
+#' combined with any extra displacement the pretraining augmentation can
+#' introduce (affine shift, RT warp), so the prior stays wide enough to
+#' find a shifted peak. (The head additionally floors the width at one
+#' feature-map cell.)
 #'
 #' @param catalog A `peak_catalog`.
 #' @param H,W Image dimensions in pixels.
@@ -27,33 +31,26 @@
 #' @param extra_rt_px,extra_cv_px Additional displacement (pixels) to fold
 #'   into the prior width, e.g. the maximum affine shift.
 #' @return List with `compound_id`, `rt_frac`, `cv_frac`, `sd_rt_frac`,
-#'   `sd_cv_frac`.
+#'   `sd_cv_frac`, all as fractions of `H` / `W`.
 #' @export
 compound_head_geometry <- function(catalog, H, W, compound_ids = NULL,
                                     extra_rt_px = 0, extra_cv_px = 0) {
   stopifnot(inherits(catalog, "peak_catalog"))
   cmp <- catalog$compounds
-  coord_mode <- catalog$parameters$coord_mode %||% "fraction"
-  rt <- if (coord_mode == "physical") cmp$rt_frac else cmp$rt_loc
-  cv <- if (coord_mode == "physical") cmp$cv_frac else cmp$cv_loc
-  keep <- is.finite(rt) & is.finite(cv)
   if (!is.null(compound_ids)) {
     missing <- setdiff(compound_ids, cmp$compound_id)
     if (length(missing))
       stop("compound_head_geometry: compound_id(s) not in catalog: ",
            paste(utils::head(missing, 5), collapse = ", "))
-    keep <- keep & cmp$compound_id %in% compound_ids
   }
+  pos <- catalog_pixel_positions(catalog, H, W)
+  rt <- (pos$rt_px - 0.5) / H
+  cv <- (pos$cv_px - 0.5) / W
+  keep <- is.finite(rt) & is.finite(cv)
+  if (!is.null(compound_ids)) keep <- keep & cmp$compound_id %in% compound_ids
   if (!any(keep)) stop("compound_head_geometry: no compounds with finite positions.")
-  obs_sd <- function(col) {
-    if (!col %in% names(cmp)) return(rep(0, nrow(cmp)))
-    vapply(cmp[[col]], function(v) {
-      v <- v[is.finite(v)]
-      if (length(v) < 2L) 0 else stats::sd(v)
-    }, numeric(1))
-  }
-  sd_rt <- sqrt(obs_sd("rt_frac_obs")^2 + (extra_rt_px / H)^2)
-  sd_cv <- sqrt(obs_sd("cv_frac_obs")^2 + (extra_cv_px / W)^2)
+  sd_rt <- sqrt((pos$rt_px_sd / H)^2 + (extra_rt_px / H)^2)
+  sd_cv <- sqrt((pos$cv_px_sd / W)^2 + (extra_cv_px / W)^2)
   list(compound_id = cmp$compound_id[keep],
        rt_frac = rt[keep], cv_frac = cv[keep],
        sd_rt_frac = sd_rt[keep], sd_cv_frac = sd_cv[keep])
