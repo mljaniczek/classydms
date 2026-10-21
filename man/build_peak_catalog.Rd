@@ -67,7 +67,9 @@ dims are known.}
 \verb{rows, cols} (from \code{peak_params$data_dims}, or the axis lengths
 in \code{time_ranges} / \code{cv_ranges}), which generators use to place
 observations on a centre-padded canvas
-(\code{\link[=catalog_pixel_positions]{catalog_pixel_positions()}}).}
+(\code{\link[=catalog_pixel_positions]{catalog_pixel_positions()}}); and \code{grid}, the \code{\link[=dms_grid]{dms_grid()}} the
+samples were resampled onto (if recorded), through which
+generators map \code{rt_seconds_obs} / \code{cv_volts_obs} to pixels.}
 }
 }
 \description{

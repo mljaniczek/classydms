@@ -19,8 +19,11 @@ observations, or the centroid when it has none), and \code{rt_px_sd},
 than two).
 }
 \description{
-Maps every compound's observations onto an \verb{H x W} canvas laid out the
-way \code{\link[=pad_to_target]{pad_to_target()}} lays out real samples: each observation's
+Maps every compound's observations onto an \verb{H x W} canvas. When the
+catalog records a \code{\link[=dms_grid]{dms_grid()}}, observations are placed from their
+seconds / volts through the grid (centred if the canvas is larger).
+Otherwise they are laid out the way \code{\link[=pad_to_target]{pad_to_target()}} lays out real
+samples: each observation's
 fraction position is converted with its own sample's unpadded data
 dims (\code{catalog$parameters$data_dims}) and centre-padding offset. This
 is the frame the synthetic generators render in and the frame the

@@ -127,7 +127,17 @@ raw .xls -> read_dms_file -> load_dms_directory  (returns samples + y)
   sparse synthetic images can have near-zero Q_0.95 after log-transform,
   which would blow up the normalization denominator. The clamp keeps such
   outliers from destabilizing training.
-- **Placement on the padded canvas** (`R/placement.R`): positions are
+- **One physical grid for every cohort** (`R/grid.R`, preferred): pick a
+  CV window with `choose_cv_window()` on dust-thresholded samples from
+  all cohorts (excluding holdouts), build `make_dms_grid(H, W, ...)` at
+  the model input size, and `resample_to_grid()` every sample (RT and
+  CV; some runs record 100 instead of 101 CV columns over -40..15 V, so
+  CV is interpolated, not cropped). Pass `grid =` to
+  `estimate_peak_params()`; catalogs then carry `parameters$grid` and
+  generators / heads place from seconds / volts via the grid. Per-cohort
+  CV trimming gave each cohort a different column window -- a
+  cohort- (and so disease-) correlated cue in the real images.
+- **Placement on the padded canvas** (fallback without a grid; `R/placement.R`): positions are
   fractions of each sample's *unpadded* matrix (`r0 / rows`), but real
   images are centre-padded by `pad_to_target`. Generators and the
   presence head place at `floor((H - rows) / 2) + frac * rows` using

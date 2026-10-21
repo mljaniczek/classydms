@@ -8,8 +8,13 @@
 # stretches the data block over the padding bands (about 1.31x in CV for
 # 73 data columns padded to 96), so synthetic and real images disagree.
 #
-# Every generator and the presence head therefore place positions through
-# .pad_frac_to_px(), using the per-sample data dims recorded on
+# Preferred path: samples resampled onto one dms_grid (R/grid.R). Then
+# catalogs record the grid and positions are placed from seconds / volts
+# through it (.grid_px), centred on the canvas if the canvas is larger.
+#
+# Fallback for objects without a grid: generators and the presence head
+# place positions through .pad_frac_to_px(), using the per-sample data
+# dims recorded on
 # peak_params$data_dims and carried onto catalogs as
 # catalog$parameters$data_dims plus the per-observation sample_idx_obs
 # list-column. When the target canvas is smaller than the data grid along
@@ -74,11 +79,29 @@
   }
 }
 
+# Placement setup when the catalog records a dms_grid and physical
+# per-observation positions; NULL otherwise.
+.grid_placement <- function(catalog, compounds, H, W, fn) {
+  g <- catalog$parameters$grid
+  need <- c("rt_seconds", "cv_volts", "rt_seconds_obs", "cv_volts_obs")
+  if (is.null(g) || !all(need %in% names(compounds))) return(NULL)
+  if (H < g$H || W < g$W)
+    stop(fn, ": canvas ", H, "x", W, " is smaller than the catalog's grid (",
+         g$H, "x", g$W, "). Generate on the grid size.", call. = FALSE)
+  off_r <- floor((H - g$H) / 2); off_c <- floor((W - g$W) / 2)
+  cent <- .grid_px(g, compounds$rt_seconds, compounds$cv_volts)
+  list(mode = "grid", grid = g, H = H, W = W, off_r = off_r, off_c = off_c,
+       has_obs = TRUE, dims = NULL, ref_rows = g$H, ref_cols = g$W,
+       rt_cent = cent[, 1] + off_r, cv_cent = cent[, 2] + off_c)
+}
+
 # One-time placement setup for a catalog on an H x W canvas: centroid
 # pixels (placed with the median data dims) and what per-observation
 # placement needs. Generators call this once per sample, then .place_obs()
 # per firing, which is O(1).
 .catalog_placement <- function(catalog, compounds, H, W, fn) {
+  gp <- .grid_placement(catalog, compounds, H, W, fn)
+  if (!is.null(gp)) return(gp)
   dims <- catalog$parameters$data_dims
   if (is.null(dims)) .warn_scaled_placement(fn)
   has_obs <- all(c("rt_frac_obs", "cv_frac_obs") %in% names(compounds))
@@ -90,7 +113,7 @@
                                 parameters = catalog$parameters))
   ref_r <- if (is.null(dims)) NA_real_ else stats::median(dims[, 1])
   ref_c <- if (is.null(dims)) NA_real_ else stats::median(dims[, 2])
-  list(H = H, W = W, dims = obs_dims, has_obs = has_obs,
+  list(mode = "fraction", H = H, W = W, dims = obs_dims, has_obs = has_obs,
        ref_rows = ref_r, ref_cols = ref_c,
        rt_cent = .pad_frac_to_px(fr$rt, ref_r, H),
        cv_cent = .pad_frac_to_px(fr$cv, ref_c, W))
@@ -108,6 +131,14 @@
 # Canvas pixel (unjittered) for observation j of compound row i, falling
 # back to the centroid when per-observation positions are unavailable.
 .place_obs <- function(pl, compounds, i, j) {
+  if (pl$mode == "grid") {
+    if (length(compounds$rt_seconds_obs[[i]]) >= j) {
+      p <- .grid_px(pl$grid, compounds$rt_seconds_obs[[i]][j],
+                    compounds$cv_volts_obs[[i]][j])
+      if (all(is.finite(p))) return(c(p[1] + pl$off_r, p[2] + pl$off_c))
+    }
+    return(c(pl$rt_cent[i], pl$cv_cent[i]))
+  }
   if (pl$has_obs && length(compounds$rt_frac_obs[[i]]) >= j) {
     rf <- compounds$rt_frac_obs[[i]][j]
     cf <- compounds$cv_frac_obs[[i]][j]
@@ -124,8 +155,11 @@
 
 #' Catalog compound positions on a padded canvas
 #'
-#' Maps every compound's observations onto an `H x W` canvas laid out the
-#' way [pad_to_target()] lays out real samples: each observation's
+#' Maps every compound's observations onto an `H x W` canvas. When the
+#' catalog records a [dms_grid()], observations are placed from their
+#' seconds / volts through the grid (centred if the canvas is larger).
+#' Otherwise they are laid out the way [pad_to_target()] lays out real
+#' samples: each observation's
 #' fraction position is converted with its own sample's unpadded data
 #' dims (`catalog$parameters$data_dims`) and centre-padding offset. This
 #' is the frame the synthetic generators render in and the frame the
@@ -150,11 +184,15 @@ catalog_pixel_positions <- function(catalog, H, W) {
   rt_px <- pl$rt_cent; cv_px <- pl$cv_cent
   rt_sd <- cv_sd <- numeric(n)
   if (pl$has_obs && n > 0L) {
-    len <- lengths(cmp$rt_frac_obs)
+    len <- lengths(if (pl$mode == "grid") cmp$rt_seconds_obs else cmp$rt_frac_obs)
     row <- rep(seq_len(n), len)
     rf <- unlist(cmp$rt_frac_obs, use.names = FALSE)
     cf <- unlist(cmp$cv_frac_obs, use.names = FALSE)
-    if (is.null(pl$dims)) {
+    if (pl$mode == "grid") {
+      gp <- .grid_px(pl$grid, unlist(cmp$rt_seconds_obs, use.names = FALSE),
+                     unlist(cmp$cv_volts_obs, use.names = FALSE))
+      rp <- gp[, 1] + pl$off_r; cp <- gp[, 2] + pl$off_c
+    } else if (is.null(pl$dims)) {
       rp <- rf * H; cp <- cf * W
     } else {
       s  <- unlist(cmp$sample_idx_obs, use.names = FALSE)
@@ -179,6 +217,14 @@ catalog_pixel_positions <- function(catalog, H, W) {
 
 # Canvas pixel positions for peak_params peaks `j` (vectorised).
 .place_pp_peaks <- function(params, j, H, W) {
+  g <- params$grid
+  if (!is.null(g) && !is.null(params$rt_seconds_raw)) {
+    if (H < g$H || W < g$W)
+      stop("canvas ", H, "x", W, " is smaller than the peak_params grid (",
+           g$H, "x", g$W, ").", call. = FALSE)
+    p <- .grid_px(g, params$rt_seconds_raw[j], params$cv_volts_raw[j])
+    return(cbind(p[, 1] + floor((H - g$H) / 2), p[, 2] + floor((W - g$W) / 2)))
+  }
   dims <- params$data_dims
   if (is.null(dims) || is.null(params$sample_idx_raw)) {
     .warn_scaled_placement("generate_one_synthetic")

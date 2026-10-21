@@ -21,6 +21,11 @@
 #' @param frac_height Fraction of peak height defining the width (default 0.25;
 #'   0.5 corresponds to FWHM).
 #' @param min_sep_rt,min_sep_cv Minimum pixel separation between peaks.
+#' @param grid Optional [dms_grid()] every matrix in `Z_list` was
+#'   resampled onto ([resample_to_grid()]). Supplies `time_axes` /
+#'   `cv_axes` for every sample, requires each matrix to be exactly
+#'   `grid$H x grid$W`, and is recorded on the result so catalogs and
+#'   generators place peaks from seconds / volts through it.
 #' @param verbose Whether to print diagnostic messages (default TRUE).
 #' @return A list of fitted distributions and raw observation vectors,
 #'   suitable for passing to [generate_one_synthetic()] or
@@ -43,8 +48,21 @@ estimate_peak_params <- function(Z_list,
                                   frac_height = 0.25,
                                   min_sep_rt = 8,
                                   min_sep_cv = 2,
+                                  grid = NULL,
                                   verbose = TRUE) {
   stopifnot(length(Z_list) > 0)
+  if (!is.null(grid)) {
+    stopifnot(inherits(grid, "dms_grid"))
+    bad <- which(vapply(Z_list, function(Z)
+      NROW(Z) != grid$H || NCOL(Z) != grid$W, logical(1)))
+    if (length(bad))
+      stop("estimate_peak_params: Z_list[[", bad[1], "]] is ",
+           NROW(Z_list[[bad[1]]]), "x", NCOL(Z_list[[bad[1]]]),
+           " but grid is ", grid$H, "x", grid$W,
+           ". Resample samples with resample_to_grid() first.")
+    time_axes <- rep(list(grid$time), length(Z_list))
+    cv_axes   <- rep(list(grid$cv),   length(Z_list))
+  }
   use_pretrim <- !is.null(Z_pretrim_list) &&
     length(Z_pretrim_list) == length(Z_list)
 
@@ -284,6 +302,7 @@ estimate_peak_params <- function(Z_list,
       c(min = min(c), max = max(c), n = length(c))
     }))
   }
+  if (!is.null(grid)) result$grid <- grid
   if (verbose && result$n_peaks_detected == 0) {
     warning("estimate_peak_params: 0 peaks detected.")
   }

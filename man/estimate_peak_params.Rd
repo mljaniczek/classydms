@@ -13,6 +13,7 @@ estimate_peak_params(
   frac_height = 0.25,
   min_sep_rt = 8,
   min_sep_cv = 2,
+  grid = NULL,
   verbose = TRUE
 )
 }
@@ -27,6 +28,12 @@ estimate_peak_params(
 0.5 corresponds to FWHM).}
 
 \item{min_sep_rt, min_sep_cv}{Minimum pixel separation between peaks.}
+
+\item{grid}{Optional \code{\link[=dms_grid]{dms_grid()}} every matrix in \code{Z_list} was
+resampled onto (\code{\link[=resample_to_grid]{resample_to_grid()}}). Supplies \code{time_axes} /
+\code{cv_axes} for every sample, requires each matrix to be exactly
+\verb{grid$H x grid$W}, and is recorded on the result so catalogs and
+generators place peaks from seconds / volts through it.}
 
 \item{verbose}{Whether to print diagnostic messages (default TRUE).}
 }

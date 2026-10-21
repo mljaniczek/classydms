@@ -68,6 +68,14 @@ validate_peak_params <- function(peak_params, context = "peak_params") {
           is.null(peak_params$cv_volts_raw))) {
     fail("has only one of rt_seconds_raw / cv_volts_raw.")
   }
+  g <- peak_params$grid
+  if (!is.null(g)) {
+    if (!inherits(g, "dms_grid")) fail("grid must be a dms_grid.")
+    dd <- peak_params$data_dims
+    if (!is.null(dd) && any(dd[, 1] != g$H | dd[, 2] != g$W))
+      fail("data_dims differ from the grid (", g$H, "x", g$W, "); every ",
+           "sample must be resampled onto the grid.")
+  }
   for (nm in c("rt_loc", "cv_loc")) {
     v <- peak_params[[nm]]$values
     if (!is.null(v) && length(v) != n_peaks)
@@ -356,7 +364,9 @@ subset_peak_params <- function(peak_params, sample_indices) {
 #'     `rows, cols` (from `peak_params$data_dims`, or the axis lengths
 #'     in `time_ranges` / `cv_ranges`), which generators use to place
 #'     observations on a centre-padded canvas
-#'     ([catalog_pixel_positions()]).}
+#'     ([catalog_pixel_positions()]); and `grid`, the [dms_grid()] the
+#'     samples were resampled onto (if recorded), through which
+#'     generators map `rt_seconds_obs` / `cv_volts_obs` to pixels.}
 #' }
 #' @param align Optional per-sample drift correction applied to
 #'   `peak_params` before clustering. `FALSE` (default) skips
@@ -615,7 +625,8 @@ build_peak_catalog <- function(peak_params,
         n_samples           = n_samples,
         n_total_clusters    = n_clusters,
         coord_mode          = coord_mode,
-        data_dims           = data_dims
+        data_dims           = data_dims,
+        grid                = peak_params$grid
       )
     ),
     class = "peak_catalog"
@@ -845,6 +856,15 @@ merge_peak_params <- function(pp_list) {
   for (nm in .pp_per_sample_matrices)
     if (all_have(nm)) merged[[nm]] <- do.call(rbind, lapply(pp_list, `[[`, nm))
   if (!is.null(merged$rt_seconds_raw)) merged$coord_mode <- "physical"
+  # A shared grid survives the merge only if every input is on the same one.
+  grids <- lapply(pp_list, `[[`, "grid")
+  if (!any(vapply(grids, is.null, logical(1))) &&
+      all(vapply(grids, identical, logical(1), grids[[1]]))) {
+    merged$grid <- grids[[1]]
+  } else if (!all(vapply(grids, is.null, logical(1)))) {
+    message("merge_peak_params: inputs are not all on the same dms_grid; ",
+            "the merged object carries no grid.")
+  }
   merged <- .refresh_location_summaries(merged)
   merged <- .refit_lognormal_summaries(merged)
 
