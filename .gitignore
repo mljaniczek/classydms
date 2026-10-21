@@ -14,3 +14,7 @@ inst/tutorials/*_cache/
 inst/reports/*.html
 inst/reports/*_files/
 inst/reports/*_cache/
+
+# Claude Code: per-session worktrees and personal settings
+.claude/worktrees/
+.claude/settings.local.json
