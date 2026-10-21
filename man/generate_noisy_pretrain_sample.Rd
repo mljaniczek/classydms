@@ -54,8 +54,10 @@ Pass \code{NULL} to skip this layer.
 injection. Same fields as \code{off_catalog_peaks} in
 \code{\link[=simulate_case_control_from_catalog]{simulate_case_control_from_catalog()}} except with \code{n_per_sample}
 instead of \code{n_cases} / \code{n_controls}. Default field values:
-\code{n_per_sample = c(5, 30)}, \code{rt_range = c(0.05, 0.95)},
-\code{cv_range = c(0.05, 0.95)}, \code{intensity_range = c(0.1, 0.5)},
+\code{n_per_sample = c(5, 30)}, \code{rt_range} / \code{cv_range} = 5-95\% of the
+catalog's (median) unpadded data block expressed as canvas
+fractions (5-95\% of the canvas for catalogs without data dims),
+\code{intensity_range = c(0.1, 0.5)},
 \code{exclusion_eps_rt = 0.02}, \code{exclusion_eps_cv = 0.05}. Pass \code{NULL}
 to skip this layer.}
 

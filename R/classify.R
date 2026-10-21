@@ -197,7 +197,14 @@ train_one_fold_pretrained <- function(ds, train_idx, test_idx, encoder,
 #'   (0 disables).
 #' @param readout,presence_head,n_queries Readout replacing GAP; see
 #'   [build_pretrained_classifier()].
-#' @param seed RNG seed for fold assignment and training.
+#' @param seed RNG seed for fold assignment and training. Folds are
+#'   drawn with this seed after the tensor dataset is built, so they do
+#'   not depend on how much of R's RNG stream torch consumed on its lazy
+#'   first-use initialisation. Fold `j` trains with seed `seed + 99 + j`
+#'   (which is `100 + j` at the default `seed = 1`).
+#' @param device Torch device for fine-tuning, e.g. `"cpu"`, `"cuda"`,
+#'   or `"mps"`. Defaults to CUDA when available, else CPU (the previous
+#'   behaviour).
 #' @return List with `probs` (out-of-fold predictions) and `auc`.
 #' @export
 cv_pretrained_oof <- function(Z_list, y, encoder,
@@ -211,10 +218,12 @@ cv_pretrained_oof <- function(Z_list, y, encoder,
                                 noise_sd = 0.0,
                                 readout = c("gap", "attention", "presence"),
                                 presence_head = NULL, n_queries = 4L,
-                                seed = 1L) {
+                                seed = 1L,
+                                device = if (torch::cuda_is_available())
+                                           "cuda" else "cpu") {
   readout <- match.arg(readout)
   ds <- build_tensor_dataset(Z_list, y)
-  folds <- make_stratified_folds(y, k = k)
+  folds <- make_stratified_folds(y, k = k, seed = seed)
   oof <- rep(NA_real_, length(y))
   for (j in seq_len(k)) {
     message("Fold ", j, "/", k)
@@ -230,7 +239,8 @@ cv_pretrained_oof <- function(Z_list, y, encoder,
       intensity_scale = intensity_scale, noise_sd = noise_sd,
       readout = readout, presence_head = presence_head,
       n_queries = n_queries,
-      seed = 100L + j
+      seed = seed + 99L + j,
+      device = device
     )
     oof[te] <- fit$probs
   }

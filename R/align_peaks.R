@@ -89,51 +89,12 @@ align_across_cohorts <- function(pp_list,
     }
   }
 
-  # Build merged peak_params
-  merged <- list(
-    rt_loc_raw    = unlist(lapply(pp_list, `[[`, "rt_loc_raw")),
-    cv_loc_raw    = unlist(lapply(pp_list, `[[`, "cv_loc_raw")),
-    sigma_rt_raw  = unlist(lapply(pp_list, `[[`, "sigma_rt_raw")),
-    sigma_cv_raw  = unlist(lapply(pp_list, `[[`, "sigma_cv_raw")),
-    intensity_raw = unlist(lapply(pp_list, `[[`, "intensity_raw")),
-    n_samples     = total_n_samples,
-    noise         = pp_list[[1]]$noise
-  )
-  # Also merge physical fields + per-sample ranges when ALL cohorts have
-  # them. Without these, align_via_catalog can't back-sync the physical
-  # coordinates and downstream physical-mode catalog will see zero effect
-  # from alignment (see the corresponding note in align_via_catalog).
-  all_have_phys <- all(vapply(pp_list, function(pp) {
-    !is.null(pp$rt_seconds_raw) && !is.null(pp$cv_volts_raw) &&
-    !is.null(pp$time_ranges) && !is.null(pp$cv_ranges)
-  }, logical(1)))
-  if (all_have_phys) {
-    merged$rt_seconds_raw <- unlist(lapply(pp_list, `[[`, "rt_seconds_raw"))
-    merged$cv_volts_raw   <- unlist(lapply(pp_list, `[[`, "cv_volts_raw"))
-    merged$time_ranges    <- do.call(rbind, lapply(pp_list, `[[`,
-                                                     "time_ranges"))
-    merged$cv_ranges      <- do.call(rbind, lapply(pp_list, `[[`,
-                                                     "cv_ranges"))
-    merged$coord_mode     <- "physical"
-  }
-  # Renumber sample_idx_raw to be globally unique
-  new_sample_idx <- integer(0)
-  for (i in seq_len(n_cohorts)) {
-    new_sample_idx <- c(new_sample_idx,
-                        pp_list[[i]]$sample_idx_raw + cohort_offsets[i])
-  }
-  merged$sample_idx_raw <- new_sample_idx
-  merged$n_peaks_detected <- length(merged$rt_loc_raw)
-  # Per-sample counts for backfill compatibility
-  merged$n_peaks <- list(
-    values = as.integer(unlist(lapply(pp_list, function(pp) {
-      if (!is.null(pp$n_peaks$values)) pp$n_peaks$values
-      else tabulate(pp$sample_idx_raw, nbins = pp$n_samples)
-    }))),
-    mean = 0, sd = 0)
-  merged$n_peaks$mean <- mean(merged$n_peaks$values)
-  merged$n_peaks$sd   <- if (length(merged$n_peaks$values) > 1L)
-                          stats::sd(merged$n_peaks$values) else 0
+  # Build merged peak_params. merge_peak_params validates each cohort and
+  # concatenates every per-peak field (physical rt_seconds_raw /
+  # cv_volts_raw included) plus time_ranges / cv_ranges when all cohorts
+  # have them, so align_via_catalog can back-sync the physical
+  # coordinates.
+  merged <- merge_peak_params(pp_list)
 
   # Align merged
   aligned <- align_via_catalog(merged,
@@ -159,26 +120,10 @@ align_across_cohorts <- function(pp_list,
                   aligned$sample_idx_raw <= off + n_s
 
     new_pp <- orig
-    new_pp$rt_loc_raw    <- aligned$rt_loc_raw[peak_mask]
-    new_pp$cv_loc_raw    <- aligned$cv_loc_raw[peak_mask]
-    new_pp$sigma_rt_raw  <- aligned$sigma_rt_raw[peak_mask]
-    new_pp$sigma_cv_raw  <- aligned$sigma_cv_raw[peak_mask]
-    new_pp$intensity_raw <- aligned$intensity_raw[peak_mask]
+    for (nm in setdiff(pp_per_peak_fields(aligned), "sample_idx_raw"))
+      new_pp[[nm]] <- aligned[[nm]][peak_mask]
     new_pp$sample_idx_raw <- aligned$sample_idx_raw[peak_mask] - off
-    if (all_have_phys) {
-      new_pp$rt_seconds_raw <- aligned$rt_seconds_raw[peak_mask]
-      new_pp$cv_volts_raw   <- aligned$cv_volts_raw[peak_mask]
-    }
-
-    # Recompute derived summaries
-    new_pp$rt_loc <- list(
-      values = new_pp$rt_loc_raw,
-      mean = mean(new_pp$rt_loc_raw, na.rm = TRUE),
-      sd = stats::sd(new_pp$rt_loc_raw, na.rm = TRUE))
-    new_pp$cv_loc <- list(
-      values = new_pp$cv_loc_raw,
-      mean = mean(new_pp$cv_loc_raw, na.rm = TRUE),
-      sd = stats::sd(new_pp$cv_loc_raw, na.rm = TRUE))
+    new_pp <- .refresh_location_summaries(new_pp)
 
     cohort_samples <- (off + 1L):(off + n_s)
     new_pp$alignment <- list(
@@ -190,7 +135,8 @@ align_across_cohorts <- function(pp_list,
       iterations         = aligned$alignment$iterations,
       cohort             = names(pp_list)[i]
     )
-    out[[i]] <- new_pp
+    out[[i]] <- validate_peak_params(
+      new_pp, paste0("align_across_cohorts: ", names(pp_list)[i]))
   }
   out
 }
@@ -263,6 +209,7 @@ align_via_catalog <- function(peak_params,
          paste(missing, collapse = ", "),
          ". Call backfill_sample_idx_raw() if needed.")
   }
+  validate_peak_params(peak_params, "align_via_catalog")
   n_samples <- peak_params$n_samples
   if (is.null(min_samples_per_anchor)) {
     min_samples_per_anchor <- max(3L, floor(0.30 * n_samples))
@@ -377,31 +324,11 @@ align_via_catalog <- function(peak_params,
   # building uses rt_seconds_raw / cv_volts_raw — without this sync, the
   # physical catalog is built from un-shifted positions and alignment
   # appears to do nothing.
-  has_physical <- !is.null(current_pp$rt_seconds_raw) &&
-                  !is.null(current_pp$cv_volts_raw)
+  current_pp <- .sync_physical_shifts(current_pp, total_shift_rt,
+                                      total_shift_cv, "align_via_catalog")
+  has_physical <- !is.null(current_pp$rt_seconds_raw)
   has_ranges   <- !is.null(current_pp$time_ranges) &&
                   !is.null(current_pp$cv_ranges)
-  if (has_physical && has_ranges) {
-    tr <- current_pp$time_ranges
-    cr <- current_pp$cv_ranges
-    for (s in seq_len(n_samples)) {
-      mask <- current_pp$sample_idx_raw == s
-      if (!any(mask)) next
-      # Fraction is (physical - min) / (max - min), so a fraction shift
-      # Δfrac maps to a physical shift of Δfrac * (max - min).
-      rt_range <- tr[s, "max"] - tr[s, "min"]
-      cv_range <- cr[s, "max"] - cr[s, "min"]
-      current_pp$rt_seconds_raw[mask] <- current_pp$rt_seconds_raw[mask] -
-                                          total_shift_rt[s] * rt_range
-      current_pp$cv_volts_raw[mask]   <- current_pp$cv_volts_raw[mask] -
-                                          total_shift_cv[s] * cv_range
-    }
-  } else if (has_physical && !has_ranges) {
-    warning("align_via_catalog: peak_params has physical fields ",
-            "(rt_seconds_raw / cv_volts_raw) but no time_ranges / ",
-            "cv_ranges, so physical fields cannot be back-synced. ",
-            "Downstream physical-mode catalog will not see alignment shifts.")
-  }
 
   current_pp$alignment <- list(
     method = "cluster_membership",
@@ -425,7 +352,29 @@ align_via_catalog <- function(peak_params,
       "  max |total shift|: RT = %.4f, CV = %.4f\n",
       max(abs(total_shift_rt)), max(abs(total_shift_cv))))
   }
-  current_pp
+  validate_peak_params(current_pp, "align_via_catalog")
+}
+
+# Apply per-sample fraction shifts to the physical per-peak coordinates.
+# Fraction is row / nrow(Z), so a fraction shift maps to approximately
+# shift * (axis max - axis min) in seconds / volts (exact up to a factor
+# n / (n - 1), i.e. < 1.5% for >= 70 grid points).
+.sync_physical_shifts <- function(pp, shift_rt, shift_cv, fn) {
+  if (is.null(pp$rt_seconds_raw)) return(pp)
+  if (is.null(pp$time_ranges) || is.null(pp$cv_ranges)) {
+    warning(fn, ": peak_params has physical fields ",
+            "(rt_seconds_raw / cv_volts_raw) but no time_ranges / ",
+            "cv_ranges, so physical fields cannot be back-synced. ",
+            "Downstream physical-mode catalog will not see alignment shifts.",
+            call. = FALSE)
+    return(pp)
+  }
+  rt_range <- pp$time_ranges[, "max"] - pp$time_ranges[, "min"]
+  cv_range <- pp$cv_ranges[, "max"]   - pp$cv_ranges[, "min"]
+  s <- pp$sample_idx_raw
+  pp$rt_seconds_raw <- pp$rt_seconds_raw - shift_rt[s] * rt_range[s]
+  pp$cv_volts_raw   <- pp$cv_volts_raw   - shift_cv[s] * cv_range[s]
+  pp
 }
 
 #' Align samples to anchor peak positions
@@ -502,6 +451,7 @@ align_peak_params <- function(peak_params,
          paste(missing, collapse = ", "),
          ". Call backfill_sample_idx_raw() if needed.")
   }
+  validate_peak_params(peak_params, "align_peak_params")
   n_samples <- peak_params$n_samples
 
   # Track total accumulated shifts across iterations
@@ -625,9 +575,15 @@ align_peak_params <- function(peak_params,
     mean = mean(current_pp$cv_loc_raw, na.rm = TRUE),
     sd = stats::sd(current_pp$cv_loc_raw, na.rm = TRUE))
 
+  # Keep physical coordinates consistent with the shifted fractions.
+  current_pp <- .sync_physical_shifts(current_pp, total_shift_rt,
+                                      total_shift_cv, "align_peak_params")
+
   current_pp$alignment <- list(
     shifts_rt = total_shift_rt,
     shifts_cv = total_shift_cv,
+    physical_synced = !is.null(current_pp$rt_seconds_raw) &&
+                      !is.null(current_pp$time_ranges),
     n_anchors_matched = n_matched,
     n_anchors_total   = nrow(anchors),
     iterations        = iterations_run,
@@ -650,5 +606,5 @@ align_peak_params <- function(peak_params,
                   under, min_anchors_per_sample))
     }
   }
-  current_pp
+  validate_peak_params(current_pp, "align_peak_params")
 }

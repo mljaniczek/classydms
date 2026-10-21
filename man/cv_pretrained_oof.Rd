@@ -24,7 +24,8 @@ cv_pretrained_oof(
   readout = c("gap", "attention", "presence"),
   presence_head = NULL,
   n_queries = 4L,
-  seed = 1L
+  seed = 1L,
+  device = if (torch::cuda_is_available()) "cuda" else "cpu"
 )
 }
 \arguments{
@@ -67,7 +68,15 @@ random intensity rescaling.}
 \item{readout, presence_head, n_queries}{Readout replacing GAP; see
 \code{\link[=build_pretrained_classifier]{build_pretrained_classifier()}}.}
 
-\item{seed}{RNG seed for fold assignment and training.}
+\item{seed}{RNG seed for fold assignment and training. Folds are
+drawn with this seed after the tensor dataset is built, so they do
+not depend on how much of R's RNG stream torch consumed on its lazy
+first-use initialisation. Fold \code{j} trains with seed \code{seed + 99 + j}
+(which is \code{100 + j} at the default \code{seed = 1}).}
+
+\item{device}{Torch device for fine-tuning, e.g. \code{"cpu"}, \code{"cuda"},
+or \code{"mps"}. Defaults to CUDA when available, else CPU (the previous
+behaviour).}
 }
 \value{
 List with \code{probs} (out-of-fold predictions) and \code{auc}.

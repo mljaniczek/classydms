@@ -13,6 +13,7 @@ estimate_peak_params(
   frac_height = 0.25,
   min_sep_rt = 8,
   min_sep_cv = 2,
+  grid = NULL,
   verbose = TRUE
 )
 }
@@ -28,6 +29,12 @@ estimate_peak_params(
 
 \item{min_sep_rt, min_sep_cv}{Minimum pixel separation between peaks.}
 
+\item{grid}{Optional \code{\link[=dms_grid]{dms_grid()}} every matrix in \code{Z_list} was
+resampled onto (\code{\link[=resample_to_grid]{resample_to_grid()}}). Supplies \code{time_axes} /
+\code{cv_axes} for every sample, requires each matrix to be exactly
+\verb{grid$H x grid$W}, and is recorded on the result so catalogs and
+generators place peaks from seconds / volts through it.}
+
 \item{verbose}{Whether to print diagnostic messages (default TRUE).}
 }
 \value{
@@ -37,7 +44,10 @@ suitable for passing to \code{\link[=generate_one_synthetic]{generate_one_synthe
 \code{sigma_rt_raw}, \code{sigma_cv_raw}, and \code{intensity_raw} are parallel
 per-peak vectors; \code{sample_idx_raw} gives the 1-based index of the
 source sample for each peak (parallel to the other \verb{*_raw} vectors),
-and \code{sample_names} is \code{names(Z_list)} for lookup. These enable
+and \code{sample_names} is \code{names(Z_list)} for lookup. \code{data_dims} is an
+\verb{n_samples x 2} matrix (\code{rows}, \code{cols}) of each sample's matrix
+dims, which the generators use to place fraction positions on a
+centre-padded canvas. These enable
 per-sample analyses (e.g. sample-level shift/clustering) without
 changing existing callers.
 }

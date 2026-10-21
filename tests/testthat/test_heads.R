@@ -6,7 +6,8 @@ toy_catalog <- function() {
     compounds = tibble::tibble(compound_id = 1:5,
                                rt_loc = c(.1, .3, .5, .7, .9),
                                cv_loc = c(.2, .4, .5, .6, .8)),
-    parameters = list(coord_mode = "fraction")),
+    parameters = list(coord_mode = "fraction",
+                      data_dims = cbind(rows = 1000, cols = 90))),
     class = "peak_catalog")
 }
 

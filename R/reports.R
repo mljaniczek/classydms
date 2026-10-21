@@ -59,11 +59,8 @@ render_peak_params_report <- function(peak_params,
          "on a version of classydms that emits sample_idx_raw (added in the ",
          "'Add sample_idx_raw' commit).")
   }
+  validate_peak_params(peak_params, "render_peak_params_report")
   n_raw <- length(peak_params$rt_loc_raw)
-  if (length(peak_params$sample_idx_raw) != n_raw) {
-    stop("sample_idx_raw length (", length(peak_params$sample_idx_raw),
-         ") does not match rt_loc_raw length (", n_raw, ").")
-  }
   needed <- c("rmarkdown", "knitr", "ggplot2", "dplyr", "tibble")
   missing <- needed[!vapply(needed,
                             requireNamespace, logical(1),

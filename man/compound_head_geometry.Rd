@@ -26,15 +26,19 @@ into the prior width, e.g. the maximum affine shift.}
 }
 \value{
 List with \code{compound_id}, \code{rt_frac}, \code{cv_frac}, \code{sd_rt_frac},
-\code{sd_cv_frac}.
+\code{sd_cv_frac}, all as fractions of \code{H} / \code{W}.
 }
 \description{
-Collects each compound's centroid position (as a fraction of image
-height / width, the same convention the synthetic generator uses to
-place peaks) and a positional spread used as the width of the head's
-location prior. The spread combines the compound's observed
-per-observation position SD (\code{rt_frac_obs} / \code{cv_frac_obs}) with any
-extra displacement the pretraining augmentation can introduce
-(affine shift, RT warp), so the prior stays wide enough to find a
-shifted peak.
+Collects each compound's position on the \verb{H x W} canvas, expressed as
+a fraction in the same convention as the head's token centres (pixel
+\code{p} sits at \code{(p - 0.5) / H}), and a positional spread used as the
+width of the head's location prior. Positions come from
+\code{\link[=catalog_pixel_positions]{catalog_pixel_positions()}}, which maps every observation onto the
+canvas the way \code{\link[=pad_to_target]{pad_to_target()}} centre-pads real samples, so the
+prior is centred where the peak sits in both synthetic and real
+images. The spread is the SD of the observations' canvas positions
+combined with any extra displacement the pretraining augmentation can
+introduce (affine shift, RT warp), so the prior stays wide enough to
+find a shifted peak. (The head additionally floors the width at one
+feature-map cell.)
 }

@@ -4,6 +4,178 @@
 # data generation. See PIPELINE_KNOBS.md and the case-control tutorial
 # for context.
 
+# ---------------------------------------------------------------------------
+# peak_params field registry
+#
+# Every top-level field ending in `_raw` is a per-peak vector, parallel to
+# every other `_raw` field (same length, same peak order). Per-sample fields
+# are listed explicitly below. Transforms that drop or reorder peaks /
+# samples must go through .subset_peaks() / .subset_samples() so new fields
+# that follow these conventions are carried along automatically.
+# ---------------------------------------------------------------------------
+.pp_per_sample_vectors   <- c("sample_names", "sample_cohort")
+.pp_per_sample_matrices  <- c("time_ranges", "cv_ranges", "data_dims")
+.pp_alignment_per_sample <- c("shifts_rt", "shifts_cv", "n_anchors_matched")
+
+pp_per_peak_fields <- function(peak_params) {
+  nm <- grep("_raw$", names(peak_params), value = TRUE)
+  nm[!vapply(peak_params[nm], is.null, logical(1))]
+}
+
+#' Validate the internal consistency of a peak_params object
+#'
+#' Checks the invariants every function that consumes `peak_params`
+#' relies on:
+#' \itemize{
+#'   \item all per-peak vectors (every field ending in `_raw`, e.g.
+#'     `rt_loc_raw`, `rt_seconds_raw`, `sample_idx_raw`) have one
+#'     common length;
+#'   \item `rt_seconds_raw` and `cv_volts_raw` are present together or
+#'     not at all;
+#'   \item `sample_idx_raw`, if present, is integer-valued with no `NA`
+#'     and lies in `1..n_samples`;
+#'   \item per-sample fields (`sample_names`, `sample_cohort`,
+#'     `n_peaks$values`, the per-sample vectors in `alignment`) have
+#'     length `n_samples`, and `time_ranges` / `cv_ranges` have
+#'     `n_samples` rows;
+#'   \item `rt_loc$values` / `cv_loc$values`, if present, match the
+#'     per-peak length.
+#' }
+#' Called at the top of [build_peak_catalog()] and at the end of every
+#' function that returns a transformed `peak_params`. Useful on saved
+#' objects too: a physical-mode `peak_params` written by
+#' [subset_peak_params()] before this check existed fails here (its
+#' `rt_seconds_raw` / `cv_volts_raw` were left unsubset).
+#'
+#' @param peak_params A `peak_params` list.
+#' @param context Label used in error messages.
+#' @return `peak_params`, invisibly. Errors on the first violation.
+#' @export
+validate_peak_params <- function(peak_params, context = "peak_params") {
+  fail <- function(...) stop(context, ": ", ..., call. = FALSE)
+  if (!is.list(peak_params)) fail("not a list.")
+  raw <- pp_per_peak_fields(peak_params)
+  if (!length(raw)) fail("has no per-peak (*_raw) vectors.")
+  lens <- vapply(peak_params[raw], length, integer(1))
+  if (length(unique(lens)) > 1L) {
+    fail("per-peak vectors have different lengths (",
+         paste(sprintf("%s = %d", raw, lens), collapse = ", "),
+         "). They must stay parallel; was this object produced by a ",
+         "subset/merge that skipped some fields?")
+  }
+  n_peaks <- lens[[1]]
+  if (xor(is.null(peak_params$rt_seconds_raw),
+          is.null(peak_params$cv_volts_raw))) {
+    fail("has only one of rt_seconds_raw / cv_volts_raw.")
+  }
+  g <- peak_params$grid
+  if (!is.null(g)) {
+    if (!inherits(g, "dms_grid")) fail("grid must be a dms_grid.")
+    dd <- peak_params$data_dims
+    if (!is.null(dd) && any(dd[, 1] != g$H | dd[, 2] != g$W))
+      fail("data_dims differ from the grid (", g$H, "x", g$W, "); every ",
+           "sample must be resampled onto the grid.")
+  }
+  for (nm in c("rt_loc", "cv_loc")) {
+    v <- peak_params[[nm]]$values
+    if (!is.null(v) && length(v) != n_peaks)
+      fail(nm, "$values has length ", length(v), ", expected ", n_peaks, ".")
+  }
+
+  n_s <- peak_params$n_samples
+  if (is.null(n_s)) return(invisible(peak_params))
+  if (length(n_s) != 1L || !is.finite(n_s) || n_s < 0 || n_s != round(n_s))
+    fail("n_samples must be a single non-negative integer.")
+  sidx <- peak_params$sample_idx_raw
+  if (!is.null(sidx)) {
+    if (anyNA(sidx) || any(sidx != round(sidx)) ||
+        any(sidx < 1) || any(sidx > n_s))
+      fail("sample_idx_raw must be integers in 1..n_samples (", n_s, ").")
+  }
+  check_len <- function(x, label) {
+    if (!is.null(x) && length(x) != n_s)
+      fail(label, " has length ", length(x), ", expected n_samples = ", n_s, ".")
+  }
+  for (nm in .pp_per_sample_vectors) check_len(peak_params[[nm]], nm)
+  check_len(peak_params[["n_peaks"]][["values"]], "n_peaks$values")
+  for (nm in .pp_alignment_per_sample)
+    check_len(peak_params$alignment[[nm]], paste0("alignment$", nm))
+  for (nm in .pp_per_sample_matrices) {
+    m <- peak_params[[nm]]
+    if (!is.null(m) && NROW(m) != n_s)
+      fail(nm, " has ", NROW(m), " rows, expected n_samples = ", n_s, ".")
+  }
+  invisible(peak_params)
+}
+
+# Keep peaks `keep` (logical or integer index) in every per-peak vector and
+# refresh the fields derived from them.
+.subset_peaks <- function(peak_params, keep) {
+  for (nm in pp_per_peak_fields(peak_params))
+    peak_params[[nm]] <- peak_params[[nm]][keep]
+  .refresh_location_summaries(peak_params)
+}
+
+.refresh_location_summaries <- function(peak_params) {
+  loc <- function(x) list(
+    values = x,
+    mean   = if (length(x)) mean(x, na.rm = TRUE) else NA_real_,
+    sd     = if (length(x) > 1L) stats::sd(x, na.rm = TRUE) else 0)
+  if (!is.null(peak_params$rt_loc_raw)) peak_params$rt_loc <- loc(peak_params$rt_loc_raw)
+  if (!is.null(peak_params$cv_loc_raw)) peak_params$cv_loc <- loc(peak_params$cv_loc_raw)
+  peak_params$n_peaks_detected <- length(peak_params$rt_loc_raw)
+  peak_params
+}
+
+# Keep samples `idx` (integer, in order) in every per-sample field.
+.subset_samples <- function(peak_params, idx) {
+  for (nm in .pp_per_sample_vectors)
+    if (!is.null(peak_params[[nm]])) peak_params[[nm]] <- peak_params[[nm]][idx]
+  for (nm in .pp_per_sample_matrices)
+    if (!is.null(peak_params[[nm]]))
+      peak_params[[nm]] <- peak_params[[nm]][idx, , drop = FALSE]
+  if (!is.null(peak_params$alignment)) {
+    for (nm in .pp_alignment_per_sample)
+      if (!is.null(peak_params$alignment[[nm]]))
+        peak_params$alignment[[nm]] <- peak_params$alignment[[nm]][idx]
+  }
+  if (!is.null(peak_params[["n_peaks"]][["values"]])) {
+    v <- peak_params[["n_peaks"]][["values"]][idx]
+    peak_params$n_peaks$values <- v
+    peak_params$n_peaks$mean <- if (length(v)) mean(v) else NA_real_
+    peak_params$n_peaks$sd   <- if (length(v) > 1L) stats::sd(v) else 0
+  }
+  peak_params$n_samples <- length(idx)
+  peak_params
+}
+
+.refit_lognormal_summaries <- function(peak_params) {
+  fit_lognormal <- function(x) {
+    x <- x[is.finite(x) & x > 0]
+    if (length(x) < 10L) return(list(meanlog = 0, sdlog = 1))
+    list(meanlog = mean(log(x)), sdlog = stats::sd(log(x)))
+  }
+  if (!is.null(peak_params$sigma_rt_raw)) {
+    peak_params$sigma_rt  <- fit_lognormal(peak_params$sigma_rt_raw)
+    peak_params$sigma_cv  <- fit_lognormal(peak_params$sigma_cv_raw)
+    peak_params$intensity <- fit_lognormal(peak_params$intensity_raw)
+  }
+  peak_params
+}
+
+# Default loose eps for the alignment pre-pass. Alignment always clusters in
+# fraction space, so in physical mode the catalog eps (seconds / volts) is
+# converted with the median per-sample axis span.
+.default_align_eps <- function(eps, axis_ranges, coord_mode, fn) {
+  if (coord_mode == "fraction") return(3 * eps)
+  if (is.null(axis_ranges))
+    stop(fn, ": align = TRUE with coord_mode = 'physical' needs ",
+         "time_ranges / cv_ranges on peak_params to convert eps to ",
+         "fractions; pass eps_rt_loose / eps_cv_loose explicitly.",
+         call. = FALSE)
+  3 * eps / stats::median(axis_ranges[, "max"] - axis_ranges[, "min"])
+}
+
 #' Backfill sample_idx_raw and sample_names on an older peak_params
 #'
 #' `sample_idx_raw` and `sample_names` were added to
@@ -33,7 +205,7 @@
 #'   (if provided) `sample_names` added.
 #' @export
 backfill_sample_idx_raw <- function(peak_params, sample_names = NULL) {
-  if (is.null(peak_params$n_peaks$values)) {
+  if (is.null(peak_params[["n_peaks"]][["values"]])) {
     stop("backfill_sample_idx_raw: peak_params is missing ",
          "n_peaks$values — cannot reconstruct sample indices. ",
          "Rerun estimate_peak_params from Z data.")
@@ -43,7 +215,7 @@ backfill_sample_idx_raw <- function(peak_params, sample_names = NULL) {
          "This object predates the empirical-location commit. ",
          "Rerun estimate_peak_params.")
   }
-  n_peaks_per_sample <- peak_params$n_peaks$values
+  n_peaks_per_sample <- peak_params[["n_peaks"]][["values"]]
   expected_total <- sum(n_peaks_per_sample)
   observed_total <- length(peak_params$rt_loc_raw)
   if (expected_total != observed_total) {
@@ -64,7 +236,7 @@ backfill_sample_idx_raw <- function(peak_params, sample_names = NULL) {
     }
     peak_params$sample_names <- sample_names
   }
-  peak_params
+  validate_peak_params(peak_params, "backfill_sample_idx_raw")
 }
 
 #' Subset a peak_params object to a chosen set of samples
@@ -79,7 +251,12 @@ backfill_sample_idx_raw <- function(peak_params, sample_names = NULL) {
 #'
 #' Sample indices in the returned object are remapped to `1:length(sample_indices)`
 #' so downstream tools that expect contiguous 1-based indexing work.
-#' `sample_names`, if present, are subset to match. Fitted summary
+#' Samples keep their original relative order (`sample_indices` is
+#' sorted). Every per-peak vector (every field ending in `_raw`,
+#' including `rt_seconds_raw` / `cv_volts_raw`) is subset with the same
+#' mask, and every per-sample field (`sample_names`, `sample_cohort`,
+#' `time_ranges`, `cv_ranges`, `n_peaks$values`, per-sample `alignment`
+#' vectors) is subset to the kept samples. Fitted summary
 #' statistics (`rt_loc$mean/sd`, `sigma_rt$meanlog/sdlog`, etc.) are
 #' recomputed from the subset; noise stats are kept as-is (pooled
 #' across samples in the original run, which is usually close enough
@@ -100,9 +277,13 @@ subset_peak_params <- function(peak_params, sample_indices) {
          "Call backfill_sample_idx_raw() first, or rerun ",
          "estimate_peak_params.")
   }
+  validate_peak_params(peak_params, "subset_peak_params (input)")
   sample_indices <- as.integer(sample_indices)
   if (any(is.na(sample_indices)) || any(sample_indices < 1L)) {
     stop("subset_peak_params: sample_indices must be positive integers.")
+  }
+  if (anyDuplicated(sample_indices)) {
+    stop("subset_peak_params: sample_indices contains duplicate values.")
   }
   n_orig <- if (!is.null(peak_params$n_samples)) peak_params$n_samples
             else max(peak_params$sample_idx_raw)
@@ -110,65 +291,17 @@ subset_peak_params <- function(peak_params, sample_indices) {
     stop("subset_peak_params: sample_indices contains values beyond ",
          "the original n_samples (", n_orig, ").")
   }
+  kept <- sort(sample_indices)
 
-  keep_mask <- peak_params$sample_idx_raw %in% sample_indices
-  out <- peak_params
-
-  # Subset the per-peak _raw vectors
-  raw_fields <- c("rt_loc_raw", "cv_loc_raw",
-                  "sigma_rt_raw", "sigma_cv_raw",
-                  "intensity_raw", "sample_idx_raw")
-  for (nm in raw_fields) {
-    if (!is.null(peak_params[[nm]])) {
-      out[[nm]] <- peak_params[[nm]][keep_mask]
-    }
-  }
-
+  out <- .subset_peaks(peak_params, peak_params$sample_idx_raw %in% kept)
   # Remap sample_idx_raw to contiguous 1..length(sample_indices)
-  out$sample_idx_raw <- match(out$sample_idx_raw, sort(sample_indices))
-  out$n_samples <- length(sample_indices)
-  out$n_peaks_detected <- sum(keep_mask)
-
-  # Sample names, if present
-  if (!is.null(peak_params$sample_names)) {
-    out$sample_names <- peak_params$sample_names[sort(sample_indices)]
-  }
-
-  # n_peaks$values (per-sample counts) — subset by kept samples
-  if (!is.null(peak_params$n_peaks$values)) {
-    out$n_peaks$values <- peak_params$n_peaks$values[sort(sample_indices)]
-    if (length(out$n_peaks$values) > 0L) {
-      out$n_peaks$mean <- mean(out$n_peaks$values)
-      out$n_peaks$sd   <- if (length(out$n_peaks$values) > 1L)
-                            stats::sd(out$n_peaks$values) else 0
-    }
-  }
-
-  # Recompute the fitted marginal summaries from the subset
-  safe_mean <- function(x) if (length(x) == 0L) NA_real_ else mean(x)
-  safe_sd   <- function(x) if (length(x) < 2L)  0         else stats::sd(x)
-  fit_lognormal <- function(x) {
-    x <- x[is.finite(x) & x > 0]
-    if (length(x) < 10L) return(list(meanlog = 0, sdlog = 1))
-    list(meanlog = mean(log(x)), sdlog = stats::sd(log(x)))
-  }
-  if (!is.null(out$rt_loc_raw)) {
-    out$rt_loc <- list(values = out$rt_loc_raw,
-                       mean = safe_mean(out$rt_loc_raw),
-                       sd   = safe_sd(out$rt_loc_raw))
-    out$cv_loc <- list(values = out$cv_loc_raw,
-                       mean = safe_mean(out$cv_loc_raw),
-                       sd   = safe_sd(out$cv_loc_raw))
-  }
-  if (!is.null(out$sigma_rt_raw)) {
-    out$sigma_rt  <- fit_lognormal(out$sigma_rt_raw)
-    out$sigma_cv  <- fit_lognormal(out$sigma_cv_raw)
-    out$intensity <- fit_lognormal(out$intensity_raw)
-  }
+  out$sample_idx_raw <- match(out$sample_idx_raw, kept)
+  out <- .subset_samples(out, kept)
+  out <- .refit_lognormal_summaries(out)
 
   # noise stays as-is (pooled from original run — usually close enough)
 
-  out
+  validate_peak_params(out, "subset_peak_params")
 }
 
 #' Build a peak catalog from a peak_params object
@@ -199,6 +332,14 @@ subset_peak_params <- function(peak_params, sample_indices) {
 #'   Defaults `(0.01, 0.05)` roughly match the peak-detector's
 #'   `min_sep_rt = 8, min_sep_cv = 2` on a 1400 x 40 native image.
 #'   Tighter → more, smaller clusters. Looser → fewer, larger clusters.
+#'   In `coord_mode = "physical"` they are in seconds and volts.
+#' @param coord_mode `"fraction"` (default) clusters on
+#'   `rt_loc_raw` / `cv_loc_raw`; `"physical"` clusters on
+#'   `rt_seconds_raw` / `cv_volts_raw` (requires [estimate_peak_params()]
+#'   to have been given `time_axes` / `cv_axes`). Either way the catalog
+#'   stores fraction positions (`rt_frac`, `cv_frac`, `*_frac_obs`) and,
+#'   when available, physical ones (`rt_seconds`, `cv_volts`,
+#'   `rt_seconds_obs`, `cv_volts_obs`), all from the same member peaks.
 #' @param min_support_frac Fraction of samples a cluster must span to
 #'   count as a compound. Default `0.10`: appear in at least 10% of
 #'   samples.
@@ -212,10 +353,20 @@ subset_peak_params <- function(peak_params, sample_indices) {
 #'     compound with columns `compound_id, rt_loc, cv_loc,
 #'     location_sd_rt, location_sd_cv, n_observations, n_samples,
 #'     prevalence`, and list-columns `sigma_rt_obs, sigma_cv_obs,
-#'     intensity_obs, member_indices`.}
+#'     intensity_obs, rt_frac_obs, cv_frac_obs, member_indices`, plus
+#'     `rt_seconds_obs, cv_volts_obs` when physical positions exist and
+#'     `sample_idx_obs` (source sample of each observation) when data
+#'     dims are known.}
 #'   \item{small_clusters}{same schema, for clusters below thresholds.}
 #'   \item{singletons}{same schema, for clusters of size 1.}
-#'   \item{parameters}{the settings used to build the catalog.}
+#'   \item{parameters}{the settings used to build the catalog, plus
+#'     `data_dims`: the `n_samples x 2` matrix of each sample's unpadded
+#'     `rows, cols` (from `peak_params$data_dims`, or the axis lengths
+#'     in `time_ranges` / `cv_ranges`), which generators use to place
+#'     observations on a centre-padded canvas
+#'     ([catalog_pixel_positions()]); and `grid`, the [dms_grid()] the
+#'     samples were resampled onto (if recorded), through which
+#'     generators map `rt_seconds_obs` / `cv_volts_obs` to pixels.}
 #' }
 #' @param align Optional per-sample drift correction applied to
 #'   `peak_params` before clustering. `FALSE` (default) skips
@@ -235,13 +386,18 @@ build_peak_catalog <- function(peak_params,
                                 coord_mode = c("fraction", "physical"),
                                 align = FALSE) {
   coord_mode <- match.arg(coord_mode)
+  validate_peak_params(peak_params, "build_peak_catalog")
   if (!isFALSE(align)) {
     align_args <- if (isTRUE(align)) list() else align
     if (!is.list(align_args))
       stop("build_peak_catalog: `align` must be FALSE, TRUE, or a ",
            "named list of align_via_catalog parameters.")
-    align_args$eps_rt_loose     <- align_args$eps_rt_loose     %||% (3 * eps_rt)
-    align_args$eps_cv_loose     <- align_args$eps_cv_loose     %||% (3 * eps_cv)
+    align_args$eps_rt_loose     <- align_args$eps_rt_loose     %||%
+      .default_align_eps(eps_rt, peak_params$time_ranges, coord_mode,
+                         "build_peak_catalog")
+    align_args$eps_cv_loose     <- align_args$eps_cv_loose     %||%
+      .default_align_eps(eps_cv, peak_params$cv_ranges, coord_mode,
+                         "build_peak_catalog")
     align_args$min_support_frac <- align_args$min_support_frac %||% min_support_frac
     align_args$iterate          <- align_args$iterate          %||% TRUE
     align_args$max_iter         <- align_args$max_iter         %||% 3L
@@ -289,6 +445,17 @@ build_peak_catalog <- function(peak_params,
   if (n_peaks == 0L) {
     stop("build_peak_catalog: peak_params$rt_loc_raw is empty.")
   }
+  # Every vector indexed by cluster members must share the clustering
+  # vector's length; validate_peak_params() guarantees this, but the
+  # members are applied to all of them, so assert it where it matters.
+  stopifnot(length(cv) == n_peaks, length(rt_frac_ref) == n_peaks,
+            length(cv_frac_ref) == n_peaks, length(intensity) == n_peaks,
+            length(sample_idx) == n_peaks)
+  rt_phys <- peak_params$rt_seconds_raw
+  cv_phys <- peak_params$cv_volts_raw
+  # Unpadded per-sample data dims, so generators can place each
+  # observation on a centre-padded canvas (see R/placement.R).
+  data_dims <- .pp_data_dims(peak_params)
 
   # Sort peaks by rt_loc for fast range lookup (findInterval).
   rt_order  <- order(rt)
@@ -371,6 +538,15 @@ build_peak_catalog <- function(peak_params,
       cv_frac_obs     = list(cv_frac_m[keep_obs]),
       member_indices  = list(members)
     )
+    # Per-observation physical positions (same keep_obs filter), so
+    # downstream code can map observations onto a target pixel grid via
+    # the instrument axes instead of per-sample fractions.
+    if (!is.null(data_dims))
+      row$sample_idx_obs <- list(as.integer(sample_idx[members][keep_obs]))
+    if (!is.null(rt_phys)) {
+      row$rt_seconds_obs <- list(rt_phys[members][keep_obs])
+      row$cv_volts_obs   <- list(cv_phys[members][keep_obs])
+    }
     # If both physical + fraction are available, also store the OTHER
     # representation as rt_seconds / cv_volts (or rt_frac / cv_frac).
     if (coord_mode == "physical") {
@@ -381,14 +557,24 @@ build_peak_catalog <- function(peak_params,
     } else if (!is.null(peak_params$rt_seconds_raw)) {
       row$rt_frac    <- row$rt_loc   # already in fraction
       row$cv_frac    <- row$cv_loc   # already in fraction
-      row$rt_seconds <- stats::median(peak_params$rt_seconds_raw[members],
-                                       na.rm = TRUE)
-      row$cv_volts   <- stats::median(peak_params$cv_volts_raw[members],
-                                       na.rm = TRUE)
+      row$rt_seconds <- stats::median(rt_phys[members], na.rm = TRUE)
+      row$cv_volts   <- stats::median(cv_phys[members], na.rm = TRUE)
     }
     row
   })
   clusters_df <- dplyr::bind_rows(cluster_rows)
+
+  # Members whose morphology / fraction position is unusable are left out
+  # of the *_obs list-columns (but still count toward n_observations and
+  # prevalence). Report how many, rather than dropping them silently.
+  n_obs_invalid <- sum(clusters_df$n_observations) -
+                   sum(lengths(clusters_df$intensity_obs))
+  if (n_obs_invalid > 0L) {
+    message("build_peak_catalog: ", n_obs_invalid, " of ", n_peaks,
+            " pool peaks have non-finite or non-positive sigma / ",
+            "intensity / fraction position and are excluded from the ",
+            "*_obs list-columns.")
+  }
 
   # Classify into compounds / small_clusters / singletons.
   # Reject any cluster with a non-finite coordinate OR no usable
@@ -435,9 +621,12 @@ build_peak_catalog <- function(peak_params,
         min_support_frac    = min_support_frac,
         min_cluster_size    = min_cluster_size,
         n_pool_peaks        = n_peaks,
+        n_obs_invalid       = n_obs_invalid,
         n_samples           = n_samples,
         n_total_clusters    = n_clusters,
-        coord_mode          = coord_mode
+        coord_mode          = coord_mode,
+        data_dims           = data_dims,
+        grid                = peak_params$grid
       )
     ),
     class = "peak_catalog"
@@ -632,32 +821,58 @@ merge_peak_params <- function(pp_list) {
     }
   }
 
-  cohort_n_samples <- vapply(pp_list, `[[`, integer(1), "n_samples")
+  for (i in seq_along(pp_list))
+    validate_peak_params(pp_list[[i]],
+                         paste0("merge_peak_params: pp_list$", names(pp_list)[i]))
+
+  cohort_n_samples <- vapply(pp_list, function(pp) as.integer(pp$n_samples),
+                             integer(1))
   cohort_offsets   <- c(0L, cumsum(cohort_n_samples)[-length(pp_list)])
   total_n_samples  <- sum(cohort_n_samples)
 
-  merged <- list(
-    rt_loc_raw    = unlist(lapply(pp_list, `[[`, "rt_loc_raw"),   use.names = FALSE),
-    cv_loc_raw    = unlist(lapply(pp_list, `[[`, "cv_loc_raw"),   use.names = FALSE),
-    sigma_rt_raw  = unlist(lapply(pp_list, `[[`, "sigma_rt_raw"), use.names = FALSE),
-    sigma_cv_raw  = unlist(lapply(pp_list, `[[`, "sigma_cv_raw"), use.names = FALSE),
-    intensity_raw = unlist(lapply(pp_list, `[[`, "intensity_raw"),use.names = FALSE),
-    n_samples     = total_n_samples,
-    noise         = pp_list[[1]]$noise
-  )
-  # Global sample indices
-  new_sidx <- integer(0)
-  for (i in seq_along(pp_list)) {
-    new_sidx <- c(new_sidx,
-                  pp_list[[i]]$sample_idx_raw + cohort_offsets[i])
+  # Concatenate every per-peak field that all inputs carry (including the
+  # physical rt_seconds_raw / cv_volts_raw). Fields only some inputs have
+  # cannot be kept parallel, so they are dropped with a message.
+  field_sets <- lapply(pp_list, pp_per_peak_fields)
+  common  <- Reduce(intersect, field_sets)
+  dropped <- setdiff(Reduce(union, field_sets), common)
+  if (length(dropped)) {
+    message("merge_peak_params: dropping per-peak field(s) not present in ",
+            "every input: ", paste(dropped, collapse = ", "), ".")
   }
-  merged$sample_idx_raw <- new_sidx
-  merged$n_peaks_detected <- length(merged$rt_loc_raw)
+  merged <- list(n_samples = total_n_samples, noise = pp_list[[1]]$noise)
+  for (nm in setdiff(common, "sample_idx_raw"))
+    merged[[nm]] <- unlist(lapply(pp_list, `[[`, nm), use.names = FALSE)
+  # Global sample indices
+  merged$sample_idx_raw <- unlist(lapply(seq_along(pp_list), function(i)
+    as.integer(pp_list[[i]]$sample_idx_raw) + cohort_offsets[i]))
+
+  # Per-sample fields that every input carries
+  all_have <- function(nm) all(vapply(pp_list, function(pp) !is.null(pp[[nm]]),
+                                      logical(1)))
+  if (all_have("sample_names"))
+    merged$sample_names <- unlist(lapply(pp_list, `[[`, "sample_names"),
+                                  use.names = FALSE)
+  for (nm in .pp_per_sample_matrices)
+    if (all_have(nm)) merged[[nm]] <- do.call(rbind, lapply(pp_list, `[[`, nm))
+  if (!is.null(merged$rt_seconds_raw)) merged$coord_mode <- "physical"
+  # A shared grid survives the merge only if every input is on the same one.
+  grids <- lapply(pp_list, `[[`, "grid")
+  if (!any(vapply(grids, is.null, logical(1))) &&
+      all(vapply(grids, identical, logical(1), grids[[1]]))) {
+    merged$grid <- grids[[1]]
+  } else if (!all(vapply(grids, is.null, logical(1)))) {
+    message("merge_peak_params: inputs are not all on the same dms_grid; ",
+            "the merged object carries no grid.")
+  }
+  merged <- .refresh_location_summaries(merged)
+  merged <- .refit_lognormal_summaries(merged)
 
   # Per-sample counts
   merged$n_peaks <- list(
     values = as.integer(unlist(lapply(pp_list, function(pp) {
-      if (!is.null(pp$n_peaks$values)) pp$n_peaks$values
+      v <- pp[["n_peaks"]][["values"]]
+      if (!is.null(v)) v
       else tabulate(pp$sample_idx_raw, nbins = pp$n_samples)
     })))
   )
@@ -672,7 +887,7 @@ merge_peak_params <- function(pp_list) {
     SIMPLIFY = FALSE), use.names = FALSE)
   merged$cohort_names <- names(pp_list)
 
-  merged
+  validate_peak_params(merged, "merge_peak_params")
 }
 
 #' Build a universal catalog by pooling all samples from multiple cohorts
@@ -721,8 +936,16 @@ build_universal_catalog <- function(pp_list,
     if (!is.list(align_args))
       stop("build_universal_catalog: `align` must be FALSE, TRUE, or ",
            "a named list of align_across_cohorts parameters.")
-    align_args$eps_rt_loose     <- align_args$eps_rt_loose     %||% (3 * eps_rt)
-    align_args$eps_cv_loose     <- align_args$eps_cv_loose     %||% (3 * eps_cv)
+    ranges <- function(nm) {
+      r <- lapply(pp_list, `[[`, nm)
+      if (any(vapply(r, is.null, logical(1)))) NULL else do.call(rbind, r)
+    }
+    align_args$eps_rt_loose     <- align_args$eps_rt_loose     %||%
+      .default_align_eps(eps_rt, ranges("time_ranges"), coord_mode,
+                         "build_universal_catalog")
+    align_args$eps_cv_loose     <- align_args$eps_cv_loose     %||%
+      .default_align_eps(eps_cv, ranges("cv_ranges"), coord_mode,
+                         "build_universal_catalog")
     align_args$min_support_frac <- align_args$min_support_frac %||% min_support_frac
     align_args$iterate          <- align_args$iterate          %||% TRUE
     align_args$max_iter         <- align_args$max_iter         %||% 3L
@@ -733,16 +956,9 @@ build_universal_catalog <- function(pp_list,
     pp_list <- do.call(align_across_cohorts,
                         c(list(pp_list = pp_list), align_args))
   }
+  # merge_peak_params validates every input and carries all per-peak
+  # fields (including rt_seconds_raw / cv_volts_raw) in lockstep.
   merged <- merge_peak_params(pp_list)
-  # Also merge physical fields if all sources have them
-  if (coord_mode == "physical" ||
-      all(vapply(pp_list, function(p) !is.null(p$rt_seconds_raw),
-                  logical(1)))) {
-    merged$rt_seconds_raw <- unlist(lapply(pp_list, `[[`, "rt_seconds_raw"),
-                                     use.names = FALSE)
-    merged$cv_volts_raw   <- unlist(lapply(pp_list, `[[`, "cv_volts_raw"),
-                                     use.names = FALSE)
-  }
   cat <- build_peak_catalog(merged,
     eps_rt = eps_rt, eps_cv = eps_cv,
     min_support_frac = min_support_frac,
@@ -752,11 +968,10 @@ build_universal_catalog <- function(pp_list,
   # Attach per-cohort prevalence for each compound
   n_cohorts <- length(pp_list)
   cohort_names <- merged$cohort_names
-  cohort_n_samples <- vapply(pp_list, `[[`, integer(1), "n_samples")
-  cohort_offsets   <- c(0L, cumsum(cohort_n_samples)[-length(pp_list)])
+  cohort_n_samples <- vapply(pp_list, function(pp) as.integer(pp$n_samples),
+                             integer(1))
   # For each sample_idx in merged, which cohort?
-  sample_to_cohort <- rep(cohort_names,
-                           cohort_n_samples)
+  sample_to_cohort <- merged$sample_cohort
 
   per_source_prev <- vector("list", nrow(cat$compounds))
   for (i in seq_len(nrow(cat$compounds))) {

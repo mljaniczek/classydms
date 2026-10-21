@@ -7,6 +7,10 @@
 make_stratified_folds(y, k = 5, seed = NULL)
 }
 \description{
-Stratified K-fold partition of binary labels
+Always pass \code{seed} when folds must be reproducible. torch's lazy
+first-use initialisation (e.g. the first \code{torch_load()} or tensor
+creation in a session) consumes draws from R's RNG, so calling
+\code{set.seed()} before torch work does not pin folds drawn afterwards
+from the global stream.
 }
 \keyword{internal}

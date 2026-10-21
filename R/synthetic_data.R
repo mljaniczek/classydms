@@ -21,6 +21,11 @@
 #' @param frac_height Fraction of peak height defining the width (default 0.25;
 #'   0.5 corresponds to FWHM).
 #' @param min_sep_rt,min_sep_cv Minimum pixel separation between peaks.
+#' @param grid Optional [dms_grid()] every matrix in `Z_list` was
+#'   resampled onto ([resample_to_grid()]). Supplies `time_axes` /
+#'   `cv_axes` for every sample, requires each matrix to be exactly
+#'   `grid$H x grid$W`, and is recorded on the result so catalogs and
+#'   generators place peaks from seconds / volts through it.
 #' @param verbose Whether to print diagnostic messages (default TRUE).
 #' @return A list of fitted distributions and raw observation vectors,
 #'   suitable for passing to [generate_one_synthetic()] or
@@ -28,7 +33,10 @@
 #'   `sigma_rt_raw`, `sigma_cv_raw`, and `intensity_raw` are parallel
 #'   per-peak vectors; `sample_idx_raw` gives the 1-based index of the
 #'   source sample for each peak (parallel to the other `*_raw` vectors),
-#'   and `sample_names` is `names(Z_list)` for lookup. These enable
+#'   and `sample_names` is `names(Z_list)` for lookup. `data_dims` is an
+#'   `n_samples x 2` matrix (`rows`, `cols`) of each sample's matrix
+#'   dims, which the generators use to place fraction positions on a
+#'   centre-padded canvas. These enable
 #'   per-sample analyses (e.g. sample-level shift/clustering) without
 #'   changing existing callers.
 #' @export
@@ -40,8 +48,21 @@ estimate_peak_params <- function(Z_list,
                                   frac_height = 0.25,
                                   min_sep_rt = 8,
                                   min_sep_cv = 2,
+                                  grid = NULL,
                                   verbose = TRUE) {
   stopifnot(length(Z_list) > 0)
+  if (!is.null(grid)) {
+    stopifnot(inherits(grid, "dms_grid"))
+    bad <- which(vapply(Z_list, function(Z)
+      NROW(Z) != grid$H || NCOL(Z) != grid$W, logical(1)))
+    if (length(bad))
+      stop("estimate_peak_params: Z_list[[", bad[1], "]] is ",
+           NROW(Z_list[[bad[1]]]), "x", NCOL(Z_list[[bad[1]]]),
+           " but grid is ", grid$H, "x", grid$W,
+           ". Resample samples with resample_to_grid() first.")
+    time_axes <- rep(list(grid$time), length(Z_list))
+    cv_axes   <- rep(list(grid$cv),   length(Z_list))
+  }
   use_pretrim <- !is.null(Z_pretrim_list) &&
     length(Z_pretrim_list) == length(Z_list)
 
@@ -262,7 +283,11 @@ estimate_peak_params <- function(Z_list,
     rt_loc_raw = all_rt_loc,
     cv_loc_raw = all_cv_loc,
     sample_idx_raw = all_sample_idx,
-    sample_names   = names(Z_list)
+    sample_names   = names(Z_list),
+    # Unpadded data dims per sample: fractions above are r0 / rows and
+    # c0 / cols, so placement on a padded canvas needs these.
+    data_dims = cbind(rows = vapply(Z_list, NROW, integer(1), USE.NAMES = FALSE),
+                      cols = vapply(Z_list, NCOL, integer(1), USE.NAMES = FALSE))
   )
   if (use_physical) {
     result$rt_seconds_raw <- all_rt_seconds
@@ -277,6 +302,7 @@ estimate_peak_params <- function(Z_list,
       c(min = min(c), max = max(c), n = length(c))
     }))
   }
+  if (!is.null(grid)) result$grid <- grid
   if (verbose && result$n_peaks_detected == 0) {
     warning("estimate_peak_params: 0 peaks detected.")
   }
@@ -394,18 +420,30 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
     else sample.int(n_obs, size = n_peaks, replace = TRUE)
   } else NULL
 
+  # Map fraction positions onto the centre-padded canvas using each
+  # peak's sample data dims (see R/placement.R).
+  if (location_mode == "empirical") {
+    loc_px <- .place_pp_peaks(params, loc_idx, H, W)
+  } else {
+    ref_r <- if (is.null(params$data_dims)) NA_real_
+             else stats::median(params$data_dims[, 1])
+    ref_c <- if (is.null(params$data_dims)) NA_real_
+             else stats::median(params$data_dims[, 2])
+    if (is.null(params$data_dims)) .warn_scaled_placement("generate_one_synthetic")
+    mean_rt_px <- .pad_frac_to_px(params$rt_loc$mean, ref_r, H)
+    mean_cv_px <- .pad_frac_to_px(params$cv_loc$mean, ref_c, W)
+    sd_rt_px <- params$rt_loc$sd * (if (is.na(ref_r) || H < ref_r) H else ref_r)
+    sd_cv_px <- params$cv_loc$sd * (if (is.na(ref_c) || W < ref_c) W else ref_c)
+  }
   for (k in seq_len(n_peaks)) {
     if (location_mode == "empirical") {
-      j <- loc_idx[k]
-      mu_rt <- params$rt_loc_raw[j] * H +
+      mu_rt <- loc_px[k, 1] +
                  stats::rnorm(1, mean = 0, sd = location_jitter_rt)
-      mu_cv <- params$cv_loc_raw[j] * W +
+      mu_cv <- loc_px[k, 2] +
                  stats::rnorm(1, mean = 0, sd = location_jitter_cv)
     } else {
-      mu_rt <- stats::rnorm(1, mean = params$rt_loc$mean * H,
-                                sd = params$rt_loc$sd * H)
-      mu_cv <- stats::rnorm(1, mean = params$cv_loc$mean * W,
-                                sd = params$cv_loc$sd * W)
+      mu_rt <- stats::rnorm(1, mean = mean_rt_px, sd = sd_rt_px)
+      mu_cv <- stats::rnorm(1, mean = mean_cv_px, sd = sd_cv_px)
     }
     mu_rt <- max(1, min(H, mu_rt))
     mu_cv <- max(1, min(W, mu_cv))

@@ -22,7 +22,8 @@ build_peak_catalog(
 \item{eps_rt, eps_cv}{Clustering radius in fraction-of-image units.
 Defaults \verb{(0.01, 0.05)} roughly match the peak-detector's
 \verb{min_sep_rt = 8, min_sep_cv = 2} on a 1400 x 40 native image.
-Tighter → more, smaller clusters. Looser → fewer, larger clusters.}
+Tighter → more, smaller clusters. Looser → fewer, larger clusters.
+In \code{coord_mode = "physical"} they are in seconds and volts.}
 
 \item{min_support_frac}{Fraction of samples a cluster must span to
 count as a compound. Default \code{0.10}: appear in at least 10\% of
@@ -31,6 +32,14 @@ samples.}
 \item{min_cluster_size}{Minimum number of pool peaks in a cluster
 for compound status. Default \code{2L} (excludes singletons from
 compounds regardless of support).}
+
+\item{coord_mode}{\code{"fraction"} (default) clusters on
+\code{rt_loc_raw} / \code{cv_loc_raw}; \code{"physical"} clusters on
+\code{rt_seconds_raw} / \code{cv_volts_raw} (requires \code{\link[=estimate_peak_params]{estimate_peak_params()}}
+to have been given \code{time_axes} / \code{cv_axes}). Either way the catalog
+stores fraction positions (\code{rt_frac}, \code{cv_frac}, \verb{*_frac_obs}) and,
+when available, physical ones (\code{rt_seconds}, \code{cv_volts},
+\code{rt_seconds_obs}, \code{cv_volts_obs}), all from the same member peaks.}
 
 \item{align}{Optional per-sample drift correction applied to
 \code{peak_params} before clustering. \code{FALSE} (default) skips
@@ -47,10 +56,20 @@ on your cohort.}
 An object of class \code{peak_catalog} with fields:
 \describe{
 \item{compounds}{tibble of compound entries — one row per
-compound with columns \verb{compound_id, rt_loc, cv_loc, location_sd_rt, location_sd_cv, n_observations, n_samples, prevalence}, and list-columns \verb{sigma_rt_obs, sigma_cv_obs, intensity_obs, member_indices}.}
+compound with columns \verb{compound_id, rt_loc, cv_loc, location_sd_rt, location_sd_cv, n_observations, n_samples, prevalence}, and list-columns \verb{sigma_rt_obs, sigma_cv_obs, intensity_obs, rt_frac_obs, cv_frac_obs, member_indices}, plus
+\verb{rt_seconds_obs, cv_volts_obs} when physical positions exist and
+\code{sample_idx_obs} (source sample of each observation) when data
+dims are known.}
 \item{small_clusters}{same schema, for clusters below thresholds.}
 \item{singletons}{same schema, for clusters of size 1.}
-\item{parameters}{the settings used to build the catalog.}
+\item{parameters}{the settings used to build the catalog, plus
+\code{data_dims}: the \verb{n_samples x 2} matrix of each sample's unpadded
+\verb{rows, cols} (from \code{peak_params$data_dims}, or the axis lengths
+in \code{time_ranges} / \code{cv_ranges}), which generators use to place
+observations on a centre-padded canvas
+(\code{\link[=catalog_pixel_positions]{catalog_pixel_positions()}}); and \code{grid}, the \code{\link[=dms_grid]{dms_grid()}} the
+samples were resampled onto (if recorded), through which
+generators map \code{rt_seconds_obs} / \code{cv_volts_obs} to pixels.}
 }
 }
 \description{

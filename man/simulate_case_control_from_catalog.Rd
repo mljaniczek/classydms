@@ -66,7 +66,10 @@ peaks NOT present in the catalog. Fields:
 \item \code{n_cases}, \code{n_controls}: integer peaks to inject per case /
 control sample.
 \item \code{rt_range}, \code{cv_range}: length-2 numerics in \link{0,1} giving the
-fractional (RT, CV) placement region.
+placement region as fractions of the padded \verb{H x W} canvas
+(position = fraction * H). On a centre-padded canvas the data
+block occupies only part of this range; see
+\code{\link[=catalog_pixel_positions]{catalog_pixel_positions()}}.
 \item \code{intensity_range}: length-2 numeric giving uniform bounds for
 the injected peak amplitude.
 \item \code{exclusion_eps_rt}, \code{exclusion_eps_cv}: fractional radius; a

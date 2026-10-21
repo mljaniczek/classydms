@@ -30,7 +30,12 @@ the expensive step.
 \details{
 Sample indices in the returned object are remapped to \code{1:length(sample_indices)}
 so downstream tools that expect contiguous 1-based indexing work.
-\code{sample_names}, if present, are subset to match. Fitted summary
+Samples keep their original relative order (\code{sample_indices} is
+sorted). Every per-peak vector (every field ending in \verb{_raw},
+including \code{rt_seconds_raw} / \code{cv_volts_raw}) is subset with the same
+mask, and every per-sample field (\code{sample_names}, \code{sample_cohort},
+\code{time_ranges}, \code{cv_ranges}, \code{n_peaks$values}, per-sample \code{alignment}
+vectors) is subset to the kept samples. Fitted summary
 statistics (\code{rt_loc$mean/sd}, \code{sigma_rt$meanlog/sdlog}, etc.) are
 recomputed from the subset; noise stats are kept as-is (pooled
 across samples in the original run, which is usually close enough
