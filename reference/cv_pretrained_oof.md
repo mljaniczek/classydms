@@ -25,7 +25,11 @@ cv_pretrained_oof(
   cv_shift = 5L,
   intensity_scale = c(0.9, 1.1),
   noise_sd = 0,
-  seed = 1L
+  readout = c("gap", "attention", "presence"),
+  presence_head = NULL,
+  n_queries = 4L,
+  seed = 1L,
+  device = if (torch::cuda_is_available()) "cuda" else "cpu"
 )
 ```
 
@@ -95,9 +99,23 @@ cv_pretrained_oof(
 
   SD of Gaussian noise added to augmented images (0 disables).
 
+- readout, presence_head, n_queries:
+
+  Readout replacing GAP; see
+  [`build_pretrained_classifier()`](https://mljaniczek.github.io/classydms/reference/build_pretrained_classifier.md).
+
 - seed:
 
-  RNG seed for fold assignment and training.
+  RNG seed for fold assignment and training. Folds are drawn with this
+  seed after the tensor dataset is built, so they do not depend on how
+  much of R's RNG stream torch consumed on its lazy first-use
+  initialisation. Fold `j` trains with seed `seed + 99 + j` (which is
+  `100 + j` at the default `seed = 1`).
+
+- device:
+
+  Torch device for fine-tuning, e.g. `"cpu"`, `"cuda"`, or `"mps"`.
+  Defaults to CUDA when available, else CPU (the previous behaviour).
 
 ## Value
 

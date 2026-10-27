@@ -22,6 +22,9 @@ train_one_fold_pretrained(
   cv_shift = 5L,
   intensity_scale = c(0.9, 1.1),
   noise_sd = 0,
+  readout = c("gap", "attention", "presence"),
+  presence_head = NULL,
+  n_queries = 4L,
   device = if (torch::cuda_is_available()) "cuda" else "cpu",
   seed = 1L
 )

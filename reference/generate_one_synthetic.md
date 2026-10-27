@@ -7,7 +7,21 @@ optional background noise.
 ## Usage
 
 ``` r
-generate_one_synthetic(params, H, W, add_noise = TRUE, size_jitter = 0.6)
+generate_one_synthetic(
+  params,
+  H,
+  W,
+  add_noise = TRUE,
+  size_jitter = 0.15,
+  location_mode = c("empirical", "marginal"),
+  location_jitter_rt = 2,
+  location_jitter_cv = 1,
+  attribute_mode = c("joint", "marginal"),
+  noise_scale = 1,
+  peak_shape = c("gaussian", "emg", "mix"),
+  emg_tau_range = c(0.2, 0.8),
+  emg_mix_prob = 0.3
+)
 ```
 
 ## Arguments
@@ -27,8 +41,55 @@ generate_one_synthetic(params, H, W, add_noise = TRUE, size_jitter = 0.6)
 
 - size_jitter:
 
-  Per-peak random log-normal scale factor SD for size diversity (default
-  0.6).
+  Per-peak random log-normal scale factor SD for size diversity. Default
+  `0.15` (multiplicative variation of roughly x1.16 / :1.16), which
+  matches typical GC-DMS peak-size variability and is the value used by
+  the getting-started vignette. Larger values regularize more but
+  produce peaks noticeably larger or smaller than any observed peak,
+  which is not biologically plausible; use only if pretraining stability
+  requires it.
+
+- location_mode:
+
+  How to sample peak (RT, CV) locations. `"empirical"` (default,
+  recommended) draws each peak's location by picking a random observed
+  peak location from the real cohort (from `params$rt_loc_raw` /
+  `params$cv_loc_raw`) and adding small per-peak jitter. This produces
+  synthetic images whose peaks cluster at cohort-typical hotspots rather
+  than scattering uniformly. `"marginal"` uses independent Normal draws
+  on each axis with mean/SD from `params$rt_loc$mean`/`sd` — the
+  previous behavior, kept for backward compatibility.
+
+- location_jitter_rt, location_jitter_cv:
+
+  SD of per-peak location jitter (in pixels) added on top of the
+  empirical draw. Represents instrument reproducibility. Default 2
+  pixels RT, 1 pixel CV.
+
+- attribute_mode:
+
+  How to sample per-peak morphology (sigma_rt, sigma_cv, intensity).
+  `"joint"` (default, recommended) draws an index `j` into
+  `params$rt_loc_raw` and reuses the observed
+  `(sigma_rt_raw[j], sigma_cv_raw[j], intensity_raw[j])` triple. This
+  preserves the empirical joint distribution: wider peaks are drawn with
+  correspondingly higher intensity, matching the physical coupling in
+  real GC-DMS data. When `location_mode == "empirical"` the same `j` is
+  used for location and morphology; otherwise an independent index is
+  drawn. `"marginal"` reverts to independent log-normal draws for each
+  attribute (the pre-`attribute_mode` behavior; wider peaks and higher
+  intensity are uncorrelated).
+
+- noise_scale:
+
+  Multiplier applied to `params$noise$sd` at generation time. Default
+  `1.0` uses the estimated real-cohort noise level. Larger values
+  corrupt the input more aggressively, which is a useful regularization
+  knob for the denoising autoencoder (Vincent et al. 2008): too little
+  corruption lets the encoder pass the input through with minimal
+  compression; too much destroys the signal. A typical sweep is
+  `noise_scale = c(1, 3, 5, 10)`, looking at real-validation MSE for the
+  sweet spot.
 
 ## Value
 

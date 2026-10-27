@@ -1,12 +1,12 @@
 pandoc: 3.8.3
-pkgdown: 2.2.0
+pkgdown: 2.2.1
 pkgdown_sha: ~
 articles:
   getting-started: getting-started.html
   interpretability: interpretability.html
   performance: performance.html
   pretraining: pretraining.html
-last_built: 2026-05-13T20:10Z
+last_built: 2026-10-27T19:23Z
 urls:
   reference: https://mljaniczek.github.io/classydms/reference
   article: https://mljaniczek.github.io/classydms/articles

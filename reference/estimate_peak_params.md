@@ -13,10 +13,13 @@ fitted to log-normal distributions.
 estimate_peak_params(
   Z_list,
   Z_pretrim_list = NULL,
+  time_axes = NULL,
+  cv_axes = NULL,
   top_k = 150,
   frac_height = 0.25,
   min_sep_rt = 8,
   min_sep_cv = 2,
+  grid = NULL,
   verbose = TRUE
 )
 ```
@@ -44,6 +47,17 @@ estimate_peak_params(
 
   Minimum pixel separation between peaks.
 
+- grid:
+
+  Optional
+  [`dms_grid()`](https://mljaniczek.github.io/classydms/reference/dms_grid.md)
+  every matrix in `Z_list` was resampled onto
+  ([`resample_to_grid()`](https://mljaniczek.github.io/classydms/reference/resample_to_grid.md)).
+  Supplies `time_axes` / `cv_axes` for every sample, requires each
+  matrix to be exactly `grid$H x grid$W`, and is recorded on the result
+  so catalogs and generators place peaks from seconds / volts through
+  it.
+
 - verbose:
 
   Whether to print diagnostic messages (default TRUE).
@@ -55,6 +69,14 @@ passing to
 [`generate_one_synthetic()`](https://mljaniczek.github.io/classydms/reference/generate_one_synthetic.md)
 or
 [`generate_synthetic_dataset()`](https://mljaniczek.github.io/classydms/reference/generate_synthetic_dataset.md).
+Fields `rt_loc_raw`, `cv_loc_raw`, `sigma_rt_raw`, `sigma_cv_raw`, and
+`intensity_raw` are parallel per-peak vectors; `sample_idx_raw` gives
+the 1-based index of the source sample for each peak (parallel to the
+other `*_raw` vectors), and `sample_names` is `names(Z_list)` for
+lookup. `data_dims` is an `n_samples x 2` matrix (`rows`, `cols`) of
+each sample's matrix dims, which the generators use to place fraction
+positions on a centre-padded canvas. These enable per-sample analyses
+(e.g. sample-level shift/clustering) without changing existing callers.
 
 ## Details
 

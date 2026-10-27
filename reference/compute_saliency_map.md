@@ -26,7 +26,8 @@ compute_saliency_map(encoder, Z, coefs, device = "cpu")
 
 - coefs:
 
-  Numeric vector of length 64 (elastic net coefficients).
+  Numeric vector of length equal to the encoder's latent dim (elastic
+  net coefficients on the GAP features).
 
 - device:
 

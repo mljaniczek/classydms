@@ -1,10 +1,10 @@
-# Elastic net classification on 64-dim encoder features
+# Elastic net classification on encoder features
 
 Performs stratified k-fold CV: extract features once via the frozen
 encoder, then fit `cv.glmnet` independently on each fold. Returns
 out-of-fold predictions, AUC, the feature matrix, and elastic net
-coefficients (which map directly to encoder channels and are the
-starting point for spatial saliency interpretation).
+coefficients. With `readout = "gap"` coefficients map to encoder
+channels; with `readout = "presence"` they map to catalog compounds.
 
 ## Usage
 
@@ -17,7 +17,9 @@ cv_encoder_elastic_net(
   alpha = 0.5,
   nlambda = 100L,
   seed = 1L,
-  device = "cpu"
+  device = "cpu",
+  readout = c("gap", "presence"),
+  presence_head = NULL
 )
 ```
 
@@ -54,6 +56,11 @@ cv_encoder_elastic_net(
 - device:
 
   "cpu" or "cuda".
+
+- readout, presence_head:
+
+  See
+  [`extract_encoder_features()`](https://mljaniczek.github.io/classydms/reference/extract_encoder_features.md).
 
 ## Value
 
