@@ -976,12 +976,47 @@ catalog_biomarkers_universal_backdrop <- function(
   spec
 }
 
+# Fill variable_config defaults and validate the draw mode. Shared by
+# generate_noisy_pretrain_sample() and pretrain_denoising_online() so a
+# bad config fails at the start of a run, not inside the first batch.
+# In "prevalence" mode n_per_sample stays NULL (no cap) unless given.
+.resolve_variable_config <- function(vc, compounds) {
+  draw <- vc$draw %||% "uniform"
+  if (!is.character(draw) || length(draw) != 1L ||
+      !draw %in% c("uniform", "prevalence"))
+    stop("variable_config$draw must be \"uniform\" or \"prevalence\", not ",
+         paste(deparse(draw), collapse = ""), ".", call. = FALSE)
+  scale <- vc$prevalence_scale %||% 1
+  if (!is.numeric(scale) || length(scale) != 1L || !is.finite(scale) ||
+      scale < 0)
+    stop("variable_config$prevalence_scale must be a single finite number ",
+         ">= 0.", call. = FALSE)
+  if (draw == "prevalence" && !"prevalence" %in% names(compounds))
+    stop("variable_config$draw = \"prevalence\" needs a `prevalence` ",
+         "column in catalog$compounds.", call. = FALSE)
+  if (draw == "uniform")
+    vc$n_per_sample <- vc$n_per_sample %||% c(30, 80)
+  vc$draw             <- draw
+  vc$prevalence_scale <- scale
+  vc$prevalence_range <- vc$prevalence_range %||% c(0.05, 0.5)
+  vc$intensity_scale  <- vc$intensity_scale  %||% c(0.3, 1.0)
+  vc$exclude_anchors  <- vc$exclude_anchors  %||% TRUE
+  vc
+}
+
+# Per-sample count from a scalar (fixed) or length-2 (uniform range) spec.
+.draw_count <- function(spec) {
+  if (length(spec) == 1L) as.integer(spec)
+  else as.integer(stats::runif(1, spec[1], spec[2] + 1))
+}
+
 #' Generate one three-layer synthetic sample for encoder pretraining
 #'
 #' Builds a synthetic GC-DMS image by stacking three layers of peaks:
 #'
 #' 1. **Anchor backbone.** Every compound in `anchor_ids` fires
-#'    unconditionally, with its own catalog morphology and normal
+#'    (subject to `anchor_dropout` / `anchor_draw`), with its own
+#'    catalog morphology and normal
 #'    per-peak location / size jitter. These are the stable ~100
 #'    highly-prevalent compounds you want the encoder to treat as the
 #'    baseline landscape.
@@ -990,7 +1025,10 @@ catalog_biomarkers_universal_backdrop <- function(
 #'    `variable_config$prevalence_range` and (optionally) excluding the
 #'    anchor pool. Simulates diet-related, host-genetics-related, and
 #'    other per-person volatiles. Intensity scaled by a per-peak factor
-#'    drawn from `variable_config$intensity_scale`.
+#'    drawn from `variable_config$intensity_scale`. The subset is drawn
+#'    uniformly (every eligible compound equally likely) or, with
+#'    `variable_config$draw = "prevalence"`, each compound fires at its
+#'    own catalog prevalence.
 #' 3. **Contamination** (optional). Uniform-random peaks placed at
 #'    positions NOT overlapping catalog compounds. Simulates sampling
 #'    apparatus contamination, environmental exposure, and truly
@@ -1004,9 +1042,25 @@ catalog_biomarkers_universal_backdrop <- function(
 #'   prevalence >= 0.9.
 #' @param variable_config Optional list controlling the variable layer.
 #'   Fields:
+#'   - `draw`: how compounds are chosen from the eligible pool.
+#'     `"uniform"` (default, the original behaviour) draws
+#'     `n_per_sample` of them uniformly without replacement, so every
+#'     eligible compound appears in about `n / length(eligible)` of
+#'     images whatever its own prevalence. `"prevalence"` fires each
+#'     eligible compound independently with probability
+#'     `min(1, prevalence * prevalence_scale)` (the same Bernoulli rule
+#'     as [generate_one_synthetic_from_catalog()]), so the expected
+#'     count is the sum of those probabilities and per-compound
+#'     frequencies match the catalog. Needs a `prevalence` column.
+#'   - `prevalence_scale`: non-negative multiplier on catalog
+#'     prevalence in `"prevalence"` mode. Default `1`. Ignored in
+#'     `"uniform"` mode.
 #'   - `n_per_sample`: scalar (fixed count) or length-2 numeric (uniform
-#'     range) for how many variable compounds to draw. Default
-#'     `c(30, 80)`.
+#'     range). In `"uniform"` mode, how many variable compounds to
+#'     draw; default `c(30, 80)`. In `"prevalence"` mode, an optional
+#'     per-sample cap: when more compounds fire than the cap, a uniform
+#'     subset of that size is kept. Default `NULL` (no cap); a cap
+#'     below the expected count biases frequencies back toward uniform.
 #'   - `prevalence_range`: length-2 numeric giving the catalog
 #'     prevalence range eligible for the variable pool. Default
 #'     `c(0.05, 0.5)`.
@@ -1025,7 +1079,18 @@ catalog_biomarkers_universal_backdrop <- function(
 #'   fractions (5-95% of the canvas for catalogs without data dims),
 #'   `intensity_range = c(0.1, 0.5)`,
 #'   `exclusion_eps_rt = 0.02`, `exclusion_eps_cv = 0.05`. Pass `NULL`
-#'   to skip this layer.
+#'   to skip this layer. The exclusion boxes surround every catalog
+#'   compound position, not only the compounds placed in this sample,
+#'   so they do not depend on the anchor / variable draw. Note that
+#'   these defaults are much brighter and more exclusive than real
+#'   off-catalog peaks: on a 606-sample universal catalog, real
+#'   off-catalog peaks had median normalised intensity about 0.014
+#'   (90th percentile about 0.042) against the default
+#'   `intensity_range = c(0.1, 0.5)`, and the default exclusion boxes
+#'   confine contamination to the gaps between compounds (only 61 of 96
+#'   CV columns reachable on a 1504 x 96 grid). For realistic clutter
+#'   consider `intensity_range` near `c(0.005, 0.05)` and smaller boxes
+#'   (e.g. `exclusion_eps_rt = 0.002`, `exclusion_eps_cv = 0.01`).
 #' @param add_noise Whether to add folded-Normal background noise on
 #'   top of the three layers.
 #' @param size_jitter,location_jitter_rt,location_jitter_cv Per-peak
@@ -1034,6 +1099,11 @@ catalog_biomarkers_universal_backdrop <- function(
 #' @param noise_scale Multiplier on catalog noise SD.
 #' @param anchor_dropout Per-sample Bernoulli probability of dropping
 #'   each anchor before rendering. `0` (default) fires all anchors.
+#' @param anchor_draw How anchors fire. `"all"` (default) fires every
+#'   anchor, minus `anchor_dropout`. `"prevalence"` fires each anchor
+#'   independently with probability `prevalence * (1 - anchor_dropout)`,
+#'   so anchors at prevalence 0.8 are absent from about 20% of images,
+#'   as in real samples. Needs a `prevalence` column.
 #' @param anchor_jitter_variability Optional length-2 range for a
 #'   per-sample scalar multiplier on `location_jitter_rt/cv`.
 #'   `NULL` (default) uses the fixed jitter values as-is.
@@ -1061,8 +1131,10 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
                                              variable_source_peak_params = NULL,
                                              peak_shape = c("gaussian", "emg", "mix"),
                                              emg_tau_range = c(0.2, 0.8),
-                                             emg_mix_prob = 0.3) {
+                                             emg_mix_prob = 0.3,
+                                             anchor_draw = c("all", "prevalence")) {
   peak_shape <- match.arg(peak_shape)
+  anchor_draw <- match.arg(anchor_draw)
   if (!is.null(variable_source_peak_params) && !is.null(variable_config)) {
     stop("variable_source_peak_params and variable_config are ",
          "mutually exclusive — pass one or the other, not both.")
@@ -1082,7 +1154,18 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
   # random 20% are silenced this sample.
   if (anchor_dropout < 0 || anchor_dropout >= 1)
     stop("anchor_dropout must be in [0, 1).")
-  if (anchor_dropout > 0 && length(anchor_ids) > 0L) {
+  if (anchor_draw == "prevalence") {
+    # Each anchor fires with its own catalog prevalence, thinned further
+    # by anchor_dropout when that is also set.
+    if (!"prevalence" %in% names(cmp))
+      stop("anchor_draw = \"prevalence\" needs a `prevalence` column in ",
+           "catalog$compounds.")
+    if (length(anchor_ids) > 0L) {
+      p_anchor <- pmin(1, cmp$prevalence[match(anchor_ids, cmp$compound_id)]) *
+                  (1 - anchor_dropout)
+      anchor_ids <- anchor_ids[stats::runif(length(anchor_ids)) < p_anchor]
+    }
+  } else if (anchor_dropout > 0 && length(anchor_ids) > 0L) {
     keep_mask <- stats::runif(length(anchor_ids)) >= anchor_dropout
     anchor_ids <- anchor_ids[keep_mask]
   }
@@ -1105,15 +1188,10 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
   variable_ids <- integer(0)
   variable_int_mult <- setNames(numeric(0), character(0))
   if (!is.null(variable_config)) {
-    vc <- variable_config
-    vc$n_per_sample     <- vc$n_per_sample     %||% c(30, 80)
-    vc$prevalence_range <- vc$prevalence_range %||% c(0.05, 0.5)
-    vc$intensity_scale  <- vc$intensity_scale  %||% c(0.3, 1.0)
-    vc$exclude_anchors  <- vc$exclude_anchors  %||% TRUE
-    n_var <- if (length(vc$n_per_sample) == 1L) as.integer(vc$n_per_sample)
-             else                                as.integer(stats::runif(1,
-                                                    vc$n_per_sample[1],
-                                                    vc$n_per_sample[2] + 1))
+    vc <- .resolve_variable_config(variable_config, cmp)
+    # Uniform mode draws the count first (RNG order is part of the
+    # bit-for-bit contract with earlier releases).
+    n_var <- if (vc$draw == "uniform") .draw_count(vc$n_per_sample)
     eligible_mask <- cmp$prevalence >= vc$prevalence_range[1] &
                      cmp$prevalence <= vc$prevalence_range[2]
     if (vc$exclude_anchors)
@@ -1123,8 +1201,23 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
       warning("generate_noisy_pretrain_sample: no compounds match ",
               "variable_config$prevalence_range; skipping variable layer.")
     } else {
-      n_take <- min(n_var, length(eligible))
-      variable_ids <- sample(eligible, size = n_take, replace = FALSE)
+      if (vc$draw == "uniform") {
+        n_take <- min(n_var, length(eligible))
+        # Index via sample.int: same RNG stream as sample(eligible, n)
+        # but safe when only one compound is eligible.
+        variable_ids <- eligible[sample.int(length(eligible), n_take)]
+      } else {
+        # Same Bernoulli rule as generate_one_synthetic_from_catalog():
+        # fire iff runif < p.
+        p_fire <- pmin(1, cmp$prevalence[eligible_mask] * vc$prevalence_scale)
+        variable_ids <- eligible[stats::runif(length(eligible)) < p_fire]
+        if (!is.null(vc$n_per_sample)) {
+          n_cap <- .draw_count(vc$n_per_sample)
+          if (length(variable_ids) > n_cap)
+            variable_ids <- variable_ids[sample.int(length(variable_ids),
+                                                    n_cap)]
+        }
+      }
       variable_int_mult <- stats::setNames(
         stats::runif(length(variable_ids),
                       vc$intensity_scale[1], vc$intensity_scale[2]),
