@@ -113,8 +113,12 @@ prevalence range eligible for the variable pool. Default
 <li><p><code>intensity_scale</code>: length-2 numeric giving amplitude multiplier
 bounds. Default <code>c(0.3, 1.0)</code> (variable compounds slightly
 dimmer than anchors on average).</p></li>
-<li><p><code>exclude_anchors</code>: <code>TRUE</code> (default) — remove anchor_ids from the
-variable pool so anchors don't get drawn twice.
+<li><p><code>exclude_anchors</code>: <code>TRUE</code> (default) — remove every compound in
+<code>anchor_ids</code> from the variable pool so anchors don't get drawn
+twice. This uses the full <code>anchor_ids</code>, including anchors that
+<code>anchor_draw = "prevalence"</code> or <code>anchor_dropout</code> silenced this
+sample, so a dropped anchor is not re-drawn as a variable
+compound.
 Pass <code>NULL</code> to skip this layer.</p></li>
 </ul></dd>
 
@@ -188,8 +192,9 @@ as in real samples. Needs a <code>prevalence</code> column.</p></dd>
     <div class="section level2">
     <h2 id="value">Value<a class="anchor" aria-label="anchor" href="#value"></a></h2>
     <p>List with <code>clean</code> (H x W), <code>noisy</code> (H x W), and per-layer
-composition metadata (<code>anchor_ids</code>, <code>variable_ids</code>,
-<code>contamination_positions</code>, and <code>rendered_ids</code> — the compound_ids
+composition metadata (<code>anchor_ids</code>: the anchors that fired this
+sample, after any <code>anchor_draw</code> / <code>anchor_dropout</code> thinning;
+<code>variable_ids</code>, <code>contamination_positions</code>, and <code>rendered_ids</code> — the compound_ids
 actually drawn in the anchors / variable layers, used as
 ground-truth presence labels).</p>
     </div>

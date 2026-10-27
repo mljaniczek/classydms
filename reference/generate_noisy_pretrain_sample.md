@@ -75,9 +75,12 @@ generate_noisy_pretrain_sample(
     bounds. Default `c(0.3, 1.0)` (variable compounds slightly dimmer
     than anchors on average).
 
-  - `exclude_anchors`: `TRUE` (default) — remove anchor_ids from the
-    variable pool so anchors don't get drawn twice. Pass `NULL` to skip
-    this layer.
+  - `exclude_anchors`: `TRUE` (default) — remove every compound in
+    `anchor_ids` from the variable pool so anchors don't get drawn
+    twice. This uses the full `anchor_ids`, including anchors that
+    `anchor_draw = "prevalence"` or `anchor_dropout` silenced this
+    sample, so a dropped anchor is not re-drawn as a variable compound.
+    Pass `NULL` to skip this layer.
 
 - contamination_config:
 
@@ -147,9 +150,11 @@ generate_noisy_pretrain_sample(
 ## Value
 
 List with `clean` (H x W), `noisy` (H x W), and per-layer composition
-metadata (`anchor_ids`, `variable_ids`, `contamination_positions`, and
-`rendered_ids` — the compound_ids actually drawn in the anchors /
-variable layers, used as ground-truth presence labels).
+metadata (`anchor_ids`: the anchors that fired this sample, after any
+`anchor_draw` / `anchor_dropout` thinning; `variable_ids`,
+`contamination_positions`, and `rendered_ids` — the compound_ids
+actually drawn in the anchors / variable layers, used as ground-truth
+presence labels).
 
 ## Details
 

@@ -56,7 +56,8 @@
 </ul></div>
 <div class="section level3">
 <h3 id="bug-fixes-development-version">Bug fixes<a class="anchor" aria-label="anchor" href="#bug-fixes-development-version"></a></h3>
-<ul><li>The uniform variable draw no longer misbehaves when exactly one compound is eligible (<code><a href="https://rdrr.io/r/base/sample.html" class="external-link">sample()</a></code> on a length-1 vector sampled from <code>1:id</code> instead of returning the id).</li>
+<ul><li><p><code><a href="../reference/generate_noisy_pretrain_sample.html">generate_noisy_pretrain_sample()</a></code>: <code>variable_config$exclude_anchors</code> now excludes every compound in <code>anchor_ids</code>, not just the anchors that survived <code>anchor_draw = "prevalence"</code> / <code>anchor_dropout</code> this sample. Before, a dropped anchor whose prevalence fell inside <code>variable_config$prevalence_range</code> got a second chance in the variable layer, so with both draws on <code>"prevalence"</code> an anchor of prevalence <code>p</code> fired with probability <code>1 - (1 - p)^2</code> instead of <code>p</code> (uniform mode with <code>anchor_dropout &gt; 0</code> leaked too, by less). <strong>Output changes</strong> for the same seed whenever anchors are thinned and the variable range covers them; output with no thinning, or with a variable range below every anchor, is bit-for-bit unchanged. The returned <code>anchor_ids</code> are still the anchors that fired.</p></li>
+<li><p>The uniform variable draw no longer misbehaves when exactly one compound is eligible (<code><a href="https://rdrr.io/r/base/sample.html" class="external-link">sample()</a></code> on a length-1 vector sampled from <code>1:id</code> instead of returning the id).</p></li>
 </ul></div>
 </div>
   </main><aside class="col-md-3"><nav id="toc" aria-label="Table of contents"><h2>On this page</h2>
