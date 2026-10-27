@@ -60,6 +60,19 @@ reference:
       - flag_junk_samples
       - plot_qc
 
+  - title: "Common physical grid"
+    desc: >
+      Put every cohort on one (seconds, volts) grid so position never
+      encodes cohort.
+    contents:
+      - dms_grid
+      - make_dms_grid
+      - choose_cv_window
+      - resample_to_grid
+      - resample_to_cv_grid
+      - resample_to_time_grid
+      - compute_common_time_grid
+
   - title: "Synthetic data generation"
     desc: >
       Estimate peak parameter distributions from real data
@@ -69,6 +82,52 @@ reference:
       - estimate_peak_params
       - generate_one_synthetic
       - generate_synthetic_dataset
+      - synthetic_quality_check
+      - plot_synthetic_quality
+
+  - title: "Peak parameters and alignment"
+    desc: >
+      Validate, subset, merge and align peak_params bundles across
+      samples and cohorts.
+    contents:
+      - validate_peak_params
+      - subset_peak_params
+      - merge_peak_params
+      - backfill_sample_idx_raw
+      - starts_with("align_")
+      - render_peak_params_report
+
+  - title: "Peak catalogs"
+    desc: >
+      Cluster peaks into shared compounds, inspect catalogs, and generate
+      synthetic samples from them.
+    contents:
+      - build_peak_catalog
+      - build_universal_catalog
+      - merge_catalogs
+      - split_catalog
+      - compare_catalogs
+      - catalog_summary
+      - catalog_compactness
+      - catalog_pixel_positions
+      - plot_catalog
+      - generate_one_synthetic_from_catalog
+      - generate_noisy_pretrain_sample
+
+  - title: "Case/control simulation"
+    desc: >
+      Simulate labelled cohorts with known injected biomarkers to test
+      whether the pipeline recovers them.
+    contents:
+      - simulate_case_control_cohort
+      - simulate_case_control_from_catalog
+      - holdout_biomarkers
+      - build_biomarker_spec
+      - build_biomarker_spec_catalog
+      - pick_catalog_biomarkers
+      - starts_with("biomarkers_")
+      - starts_with("catalog_biomarkers_")
+      - evaluate_biomarker_recovery
 
   - title: "Autoencoder architecture"
     desc: ResNet-style encoder, mirrored decoder, and composed autoencoder.
@@ -85,6 +144,18 @@ reference:
     contents:
       - pretrain_autoencoder
       - pretrain_denoising_online
+      - pretrain_autoencoder_from_catalog
+      - pretrain_autoencoder_from_catalog_noisy
+
+  - title: "Compound-presence head and readouts"
+    desc: >
+      Catalog-anchored attention pooling and the presence head trained
+      alongside the autoencoder.
+    contents:
+      - dms_presence_head
+      - compound_head_geometry
+      - compound_attention_pool
+      - attention_pool_readout
 
   - title: "Classification"
     desc: >
