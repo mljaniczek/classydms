@@ -1,7 +1,10 @@
 # Variable-layer (and anchor) draw modes in generate_noisy_pretrain_sample().
 
-# Reference captured on main (6d742aa) before the draw modes were added;
-# regenerate only if uniform-mode output is meant to change.
+# Reference captured on main (6d742aa) before the draw modes were added,
+# then regenerated for the exclude_anchors fix: draw 2 drops anchor 2
+# (prevalence 0.9, inside the variable range), which used to be re-drawn
+# as a variable compound. Draws 1, 3 and 4 are identical to the 6d742aa
+# capture. Regenerate only if uniform-mode output is meant to change.
 uniform_reference_draws <- function() {
   cat_ <- make_toy_catalog()
   set.seed(123)
@@ -135,6 +138,81 @@ test_that("anchor_draw = 'prevalence' fires anchors at prevalence * (1 - dropout
     q <- p * (1 - drop)
     expect_true(all(abs(colMeans(hits) - q) <= 4.5 * sqrt(q * (1 - q) / n)))
   }
+})
+
+# Configs the exclude_anchors fix must not change: no thinning, or
+# thinning with a variable range below every anchor's prevalence.
+# Reference captured on main (df9a782) before the fix.
+unchanged_case_draws <- function() {
+  cat_ <- make_toy_catalog()
+  keep <- c("clean", "noisy", "anchor_ids", "variable_ids", "rendered_ids")
+  one <- function(seed, ...) {
+    set.seed(seed)
+    lapply(1:3, function(i)
+      generate_noisy_pretrain_sample(cat_, H = 64, W = 16,
+                                     anchor_ids = c(1L, 2L, 8L), ...)[keep])
+  }
+  list(
+    none_uniform = one(1, variable_config = list(n_per_sample = c(2, 5),
+                                                 prevalence_range = c(0.05, 1))),
+    none_prev    = one(2, variable_config = list(draw = "prevalence",
+                                                 prevalence_range = c(0.05, 1))),
+    below_drop   = one(3, anchor_dropout = 0.4,
+                       variable_config = list(n_per_sample = c(2, 5),
+                                              prevalence_range = c(0.05, 0.6))),
+    below_prev   = one(4, anchor_draw = "prevalence",
+                       variable_config = list(draw = "prevalence",
+                                              prevalence_range = c(0.05, 0.6))))
+}
+
+test_that("exclude_anchors fix leaves unthinned / out-of-range configs unchanged", {
+  ref <- readRDS(test_path("fixtures", "unchanged_anchor_exclusion.rds"))
+  expect_identical(unchanged_case_draws(), ref)
+})
+
+# Run n draws with anchors whose prevalence sits inside the variable
+# range; return per-anchor firing indicators across both layers.
+anchor_leak_rates <- function(cat_, anchors, n, vc, ...) {
+  leaked <- 0L
+  hits <- t(vapply(seq_len(n), function(k) {
+    r <- generate_noisy_pretrain_sample(cat_, H = 64, W = 16,
+                                        anchor_ids = anchors,
+                                        variable_config = vc,
+                                        add_noise = FALSE, ...)
+    leaked <<- leaked + sum(r$variable_ids %in% anchors) +
+      sum(r$rendered_ids$variable %in% anchors)
+    stopifnot(setequal(r$rendered_ids$anchors, r$anchor_ids))
+    anchors %in% unlist(r$rendered_ids)
+  }, logical(length(anchors))))
+  expect_equal(leaked, 0L)
+  colMeans(hits)
+}
+
+test_that("anchors thinned by anchor_draw = 'prevalence' are not re-drawn", {
+  cat_ <- make_toy_catalog()
+  anchors <- c(1L, 2L, 8L)                   # prevalence 0.95, 0.9, 0.8
+  p <- cat_$compounds$prevalence[anchors]
+  n <- 2000
+  set.seed(21)
+  rate <- anchor_leak_rates(cat_, anchors, n, anchor_draw = "prevalence",
+                            vc = list(draw = "prevalence",
+                                      prevalence_range = c(0.05, 1),
+                                      intensity_scale = c(1, 1)))
+  # Before the fix these fired at 1 - (1 - p)^2 (0.9975, 0.99, 0.96).
+  expect_true(all(abs(rate - p) <= 4.5 * sqrt(p * (1 - p) / n)))
+})
+
+test_that("anchors silenced by anchor_dropout are not re-drawn (uniform)", {
+  cat_ <- make_toy_catalog()
+  anchors <- c(1L, 2L, 8L)
+  n <- 2000
+  q <- rep(1 - 0.3, length(anchors))
+  set.seed(22)
+  rate <- anchor_leak_rates(cat_, anchors, n, anchor_dropout = 0.3,
+                            vc = list(n_per_sample = c(3, 6),
+                                      prevalence_range = c(0.05, 1)))
+  # Before the fix these fired at ~0.855.
+  expect_true(all(abs(rate - q) <= 4.5 * sqrt(q * (1 - q) / n)))
 })
 
 test_that("bad draw settings fail clearly", {

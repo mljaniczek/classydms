@@ -1067,8 +1067,12 @@ catalog_biomarkers_universal_backdrop <- function(
 #'   - `intensity_scale`: length-2 numeric giving amplitude multiplier
 #'     bounds. Default `c(0.3, 1.0)` (variable compounds slightly
 #'     dimmer than anchors on average).
-#'   - `exclude_anchors`: `TRUE` (default) — remove anchor_ids from the
-#'     variable pool so anchors don't get drawn twice.
+#'   - `exclude_anchors`: `TRUE` (default) — remove every compound in
+#'     `anchor_ids` from the variable pool so anchors don't get drawn
+#'     twice. This uses the full `anchor_ids`, including anchors that
+#'     `anchor_draw = "prevalence"` or `anchor_dropout` silenced this
+#'     sample, so a dropped anchor is not re-drawn as a variable
+#'     compound.
 #'   Pass `NULL` to skip this layer.
 #' @param contamination_config Optional list controlling contamination
 #'   injection. Same fields as `off_catalog_peaks` in
@@ -1113,8 +1117,9 @@ catalog_biomarkers_universal_backdrop <- function(
 #'   locations, joint attributes) instead of the catalog-clustered
 #'   render. Mutually exclusive with `variable_config`.
 #' @return List with `clean` (H x W), `noisy` (H x W), and per-layer
-#'   composition metadata (`anchor_ids`, `variable_ids`,
-#'   `contamination_positions`, and `rendered_ids` — the compound_ids
+#'   composition metadata (`anchor_ids`: the anchors that fired this
+#'   sample, after any `anchor_draw` / `anchor_dropout` thinning;
+#'   `variable_ids`, `contamination_positions`, and `rendered_ids` — the compound_ids
 #'   actually drawn in the anchors / variable layers, used as
 #'   ground-truth presence labels).
 #' @export
@@ -1154,6 +1159,11 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
   # random 20% are silenced this sample.
   if (anchor_dropout < 0 || anchor_dropout >= 1)
     stop("anchor_dropout must be in [0, 1).")
+  # The draw / dropout below thin anchor_ids to the anchors that fire this
+  # sample (rendered and returned). exclude_anchors masks the variable
+  # pool with the caller's full list, so a dropped anchor stays dropped
+  # instead of getting a second draw in the variable layer.
+  all_anchor_ids <- anchor_ids
   if (anchor_draw == "prevalence") {
     # Each anchor fires with its own catalog prevalence, thinned further
     # by anchor_dropout when that is also set.
@@ -1195,7 +1205,7 @@ generate_noisy_pretrain_sample <- function(catalog, H, W, anchor_ids,
     eligible_mask <- cmp$prevalence >= vc$prevalence_range[1] &
                      cmp$prevalence <= vc$prevalence_range[2]
     if (vc$exclude_anchors)
-      eligible_mask <- eligible_mask & !(cmp$compound_id %in% anchor_ids)
+      eligible_mask <- eligible_mask & !(cmp$compound_id %in% all_anchor_ids)
     eligible <- cmp$compound_id[eligible_mask]
     if (length(eligible) == 0L) {
       warning("generate_noisy_pretrain_sample: no compounds match ",

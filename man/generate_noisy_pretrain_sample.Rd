@@ -62,8 +62,12 @@ prevalence range eligible for the variable pool. Default
 \item \code{intensity_scale}: length-2 numeric giving amplitude multiplier
 bounds. Default \code{c(0.3, 1.0)} (variable compounds slightly
 dimmer than anchors on average).
-\item \code{exclude_anchors}: \code{TRUE} (default) — remove anchor_ids from the
-variable pool so anchors don't get drawn twice.
+\item \code{exclude_anchors}: \code{TRUE} (default) — remove every compound in
+\code{anchor_ids} from the variable pool so anchors don't get drawn
+twice. This uses the full \code{anchor_ids}, including anchors that
+\code{anchor_draw = "prevalence"} or \code{anchor_dropout} silenced this
+sample, so a dropped anchor is not re-drawn as a variable
+compound.
 Pass \code{NULL} to skip this layer.
 }}
 
@@ -119,8 +123,9 @@ as in real samples. Needs a \code{prevalence} column.}
 }
 \value{
 List with \code{clean} (H x W), \code{noisy} (H x W), and per-layer
-composition metadata (\code{anchor_ids}, \code{variable_ids},
-\code{contamination_positions}, and \code{rendered_ids} — the compound_ids
+composition metadata (\code{anchor_ids}: the anchors that fired this
+sample, after any \code{anchor_draw} / \code{anchor_dropout} thinning;
+\code{variable_ids}, \code{contamination_positions}, and \code{rendered_ids} — the compound_ids
 actually drawn in the anchors / variable layers, used as
 ground-truth presence labels).
 }
