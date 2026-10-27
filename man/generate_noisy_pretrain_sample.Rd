@@ -21,7 +21,8 @@ generate_noisy_pretrain_sample(
   variable_source_peak_params = NULL,
   peak_shape = c("gaussian", "emg", "mix"),
   emg_tau_range = c(0.2, 0.8),
-  emg_mix_prob = 0.3
+  emg_mix_prob = 0.3,
+  anchor_draw = c("all", "prevalence")
 )
 }
 \arguments{
@@ -36,9 +37,25 @@ prevalence >= 0.9.}
 \item{variable_config}{Optional list controlling the variable layer.
 Fields:
 \itemize{
+\item \code{draw}: how compounds are chosen from the eligible pool.
+\code{"uniform"} (default, the original behaviour) draws
+\code{n_per_sample} of them uniformly without replacement, so every
+eligible compound appears in about \code{n / length(eligible)} of
+images whatever its own prevalence. \code{"prevalence"} fires each
+eligible compound independently with probability
+\code{min(1, prevalence * prevalence_scale)} (the same Bernoulli rule
+as \code{\link[=generate_one_synthetic_from_catalog]{generate_one_synthetic_from_catalog()}}), so the expected
+count is the sum of those probabilities and per-compound
+frequencies match the catalog. Needs a \code{prevalence} column.
+\item \code{prevalence_scale}: non-negative multiplier on catalog
+prevalence in \code{"prevalence"} mode. Default \code{1}. Ignored in
+\code{"uniform"} mode.
 \item \code{n_per_sample}: scalar (fixed count) or length-2 numeric (uniform
-range) for how many variable compounds to draw. Default
-\code{c(30, 80)}.
+range). In \code{"uniform"} mode, how many variable compounds to
+draw; default \code{c(30, 80)}. In \code{"prevalence"} mode, an optional
+per-sample cap: when more compounds fire than the cap, a uniform
+subset of that size is kept. Default \code{NULL} (no cap); a cap
+below the expected count biases frequencies back toward uniform.
 \item \code{prevalence_range}: length-2 numeric giving the catalog
 prevalence range eligible for the variable pool. Default
 \code{c(0.05, 0.5)}.
@@ -59,7 +76,18 @@ catalog's (median) unpadded data block expressed as canvas
 fractions (5-95\% of the canvas for catalogs without data dims),
 \code{intensity_range = c(0.1, 0.5)},
 \code{exclusion_eps_rt = 0.02}, \code{exclusion_eps_cv = 0.05}. Pass \code{NULL}
-to skip this layer.}
+to skip this layer. The exclusion boxes surround every catalog
+compound position, not only the compounds placed in this sample,
+so they do not depend on the anchor / variable draw. Note that
+these defaults are much brighter and more exclusive than real
+off-catalog peaks: on a 606-sample universal catalog, real
+off-catalog peaks had median normalised intensity about 0.014
+(90th percentile about 0.042) against the default
+\code{intensity_range = c(0.1, 0.5)}, and the default exclusion boxes
+confine contamination to the gaps between compounds (only 61 of 96
+CV columns reachable on a 1504 x 96 grid). For realistic clutter
+consider \code{intensity_range} near \code{c(0.005, 0.05)} and smaller boxes
+(e.g. \code{exclusion_eps_rt = 0.002}, \code{exclusion_eps_cv = 0.01}).}
 
 \item{add_noise}{Whether to add folded-Normal background noise on
 top of the three layers.}
@@ -82,6 +110,12 @@ When provided, the variable layer is rendered via
 \code{\link[=generate_one_synthetic]{generate_one_synthetic()}} on this bundle (real peaks, empirical
 locations, joint attributes) instead of the catalog-clustered
 render. Mutually exclusive with \code{variable_config}.}
+
+\item{anchor_draw}{How anchors fire. \code{"all"} (default) fires every
+anchor, minus \code{anchor_dropout}. \code{"prevalence"} fires each anchor
+independently with probability \code{prevalence * (1 - anchor_dropout)},
+so anchors at prevalence 0.8 are absent from about 20\% of images,
+as in real samples. Needs a \code{prevalence} column.}
 }
 \value{
 List with \code{clean} (H x W), \code{noisy} (H x W), and per-layer
@@ -96,7 +130,8 @@ Builds a synthetic GC-DMS image by stacking three layers of peaks:
 \details{
 \enumerate{
 \item \strong{Anchor backbone.} Every compound in \code{anchor_ids} fires
-unconditionally, with its own catalog morphology and normal
+(subject to \code{anchor_dropout} / \code{anchor_draw}), with its own
+catalog morphology and normal
 per-peak location / size jitter. These are the stable ~100
 highly-prevalent compounds you want the encoder to treat as the
 baseline landscape.
@@ -105,7 +140,10 @@ subset of the catalog's less-prevalent compounds — filtered by
 \code{variable_config$prevalence_range} and (optionally) excluding the
 anchor pool. Simulates diet-related, host-genetics-related, and
 other per-person volatiles. Intensity scaled by a per-peak factor
-drawn from \code{variable_config$intensity_scale}.
+drawn from \code{variable_config$intensity_scale}. The subset is drawn
+uniformly (every eligible compound equally likely) or, with
+\code{variable_config$draw = "prevalence"}, each compound fires at its
+own catalog prevalence.
 \item \strong{Contamination} (optional). Uniform-random peaks placed at
 positions NOT overlapping catalog compounds. Simulates sampling
 apparatus contamination, environmental exposure, and truly

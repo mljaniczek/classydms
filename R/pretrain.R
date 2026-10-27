@@ -277,10 +277,20 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #' @param variable_config Optional list; see
 #'   [generate_noisy_pretrain_sample()]. Requires `anchor_ids`. Adds
 #'   a per-sample random subset of low-prevalence catalog compounds.
+#'   `variable_config$draw` picks how: `"uniform"` (default) draws
+#'   `n_per_sample` compounds uniformly from the eligible pool;
+#'   `"prevalence"` fires each eligible compound with probability
+#'   `min(1, prevalence * prevalence_scale)` (`prevalence_scale`
+#'   default `1`), with `n_per_sample` then an optional cap (default
+#'   none). The resolved mode and scale are checked at entry and
+#'   recorded in the manifest as `hyperparams$variable_draw` /
+#'   `hyperparams$variable_prevalence_scale`.
 #' @param contamination_config Optional list; see
 #'   [generate_noisy_pretrain_sample()]. Requires `anchor_ids`. Adds
 #'   per-sample uniform-random peaks at positions outside catalog
-#'   compound exclusion boxes.
+#'   compound exclusion boxes. The default `intensity_range` and
+#'   exclusion boxes are much brighter / wider than real off-catalog
+#'   peaks; see that function's docs for measured values.
 #' @param clean_layers,noise_layers Optional character vectors naming
 #'   which of the three catalog layers (`"anchors"`, `"variable"`,
 #'   `"contamination"`) go into the CLEAN target vs. only into the
@@ -383,6 +393,10 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   surviving anchors fire as usual. Default `0.0` — all anchors
 #'   always fire (backward-compatible). Recommended `0.1`–`0.2` to
 #'   simulate real subject-to-subject compound absence.
+#' @param anchor_draw `"all"` (default) or `"prevalence"`; see
+#'   [generate_noisy_pretrain_sample()]. With `"prevalence"`, each
+#'   anchor fires with probability `prevalence * (1 - anchor_dropout)`.
+#'   Recorded in the manifest as `hyperparams$anchor_draw`.
 #' @param anchor_jitter_variability Optional length-2 numeric range
 #'   for a per-sample scalar multiplier applied to
 #'   `location_jitter_rt` and `location_jitter_cv`. When provided,
@@ -620,6 +634,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        encoder_channels = c(16L, 16L, 32L, 64L, 64L),
                                        encoder_dropout = 0.0,
                                        anchor_dropout = 0.0,
+                                       anchor_draw = c("all", "prevalence"),
                                        anchor_jitter_variability = NULL,
                                        affine_shift_prob = 1.0,
                                        stripe_noise_config = NULL,
@@ -663,6 +678,19 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
       !use_noisy) {
     stop("variable_config / contamination_config require anchor_ids.")
   }
+  # Validate the variable-layer draw mode up front (the per-sample
+  # generator would otherwise only fail inside the first batch).
+  anchor_draw <- match.arg(anchor_draw)
+  variable_draw <- NULL; variable_prevalence_scale <- NULL
+  if (!is.null(variable_config)) {
+    vc_res <- .resolve_variable_config(variable_config, catalog$compounds)
+    variable_draw <- vc_res$draw
+    variable_prevalence_scale <- vc_res$prevalence_scale
+  }
+  if (anchor_draw == "prevalence" &&
+      !(use_noisy && "prevalence" %in% names(catalog$compounds)))
+    stop("anchor_draw = \"prevalence\" requires anchor_ids and a catalog ",
+         "with a `prevalence` column.")
   # Split-layer denoising: when clean_layers or noise_layers is set,
   # compose the clean target and the noisy input from named layers of
   # the returned sample rather than using the default pair$clean /
@@ -1052,6 +1080,15 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
     message("  Anchor dropout: ", anchor_dropout,
             " (per-sample Bernoulli drop of anchor compounds)")
   }
+  if (anchor_draw == "prevalence")
+    message("  Anchor draw: prevalence (each anchor fires at its catalog ",
+            "prevalence)")
+  if (!is.null(variable_draw))
+    message("  Variable draw: ", variable_draw,
+            if (variable_draw == "prevalence")
+              paste0(" (Bernoulli(min(1, prevalence * ",
+                     variable_prevalence_scale, ")))")
+            else " (n_per_sample drawn uniformly from the eligible pool)")
   if (!is.null(anchor_jitter_variability)) {
     message("  Anchor jitter variability: [",
             anchor_jitter_variability[1], ", ",
@@ -1223,6 +1260,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
           shift_group_size = shift_group_size,
           baseline_drift_config = baseline_drift_config,
           anchor_dropout = anchor_dropout,
+          anchor_draw = anchor_draw,
+          variable_draw = variable_draw,
+          variable_prevalence_scale = variable_prevalence_scale,
           anchor_jitter_variability = anchor_jitter_variability,
           stripe_noise_config = stripe_noise_config,
           rt_warp_config = rt_warp_config,
@@ -1416,6 +1456,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
                                        location_jitter_cv = location_jitter_cv,
                                        noise_scale = ns,
                                        anchor_dropout = anchor_dropout,
+                                       anchor_draw = anchor_draw,
                                        anchor_jitter_variability = anchor_jitter_variability,
                                        variable_source_peak_params = variable_source_peak_params,
                                        peak_shape = peak_shape,
@@ -1743,6 +1784,11 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         encoder_channels = encoder_channels,
         encoder_dropout = encoder_dropout,
         anchor_dropout = anchor_dropout,
+        # Resolved draw modes, recorded explicitly so manifests show them
+        # even when variable_config left `draw` at its default.
+        anchor_draw = anchor_draw,
+        variable_draw = variable_draw,
+        variable_prevalence_scale = variable_prevalence_scale,
         anchor_jitter_variability = anchor_jitter_variability,
         affine_shift_prob = affine_shift_prob,
         shift_group_size = shift_group_size,

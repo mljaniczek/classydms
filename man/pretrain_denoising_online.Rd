@@ -45,6 +45,7 @@ pretrain_denoising_online(
   encoder_channels = c(16L, 16L, 32L, 64L, 64L),
   encoder_dropout = 0,
   anchor_dropout = 0,
+  anchor_draw = c("all", "prevalence"),
   anchor_jitter_variability = NULL,
   affine_shift_prob = 1,
   stripe_noise_config = NULL,
@@ -148,12 +149,22 @@ optionally add per-sample layers on top.}
 
 \item{variable_config}{Optional list; see
 \code{\link[=generate_noisy_pretrain_sample]{generate_noisy_pretrain_sample()}}. Requires \code{anchor_ids}. Adds
-a per-sample random subset of low-prevalence catalog compounds.}
+a per-sample random subset of low-prevalence catalog compounds.
+\code{variable_config$draw} picks how: \code{"uniform"} (default) draws
+\code{n_per_sample} compounds uniformly from the eligible pool;
+\code{"prevalence"} fires each eligible compound with probability
+\code{min(1, prevalence * prevalence_scale)} (\code{prevalence_scale}
+default \code{1}), with \code{n_per_sample} then an optional cap (default
+none). The resolved mode and scale are checked at entry and
+recorded in the manifest as \code{hyperparams$variable_draw} /
+\code{hyperparams$variable_prevalence_scale}.}
 
 \item{contamination_config}{Optional list; see
 \code{\link[=generate_noisy_pretrain_sample]{generate_noisy_pretrain_sample()}}. Requires \code{anchor_ids}. Adds
 per-sample uniform-random peaks at positions outside catalog
-compound exclusion boxes.}
+compound exclusion boxes. The default \code{intensity_range} and
+exclusion boxes are much brighter / wider than real off-catalog
+peaks; see that function's docs for measured values.}
 
 \item{clean_layers, noise_layers}{Optional character vectors naming
 which of the three catalog layers (\code{"anchors"}, \code{"variable"},
@@ -306,6 +317,11 @@ compound is independently dropped with this probability;
 surviving anchors fire as usual. Default \code{0.0} — all anchors
 always fire (backward-compatible). Recommended \code{0.1}–\code{0.2} to
 simulate real subject-to-subject compound absence.}
+
+\item{anchor_draw}{\code{"all"} (default) or \code{"prevalence"}; see
+\code{\link[=generate_noisy_pretrain_sample]{generate_noisy_pretrain_sample()}}. With \code{"prevalence"}, each
+anchor fires with probability \code{prevalence * (1 - anchor_dropout)}.
+Recorded in the manifest as \code{hyperparams$anchor_draw}.}
 
 \item{anchor_jitter_variability}{Optional length-2 numeric range
 for a per-sample scalar multiplier applied to
