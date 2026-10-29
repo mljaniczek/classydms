@@ -465,11 +465,11 @@ generate_one_synthetic <- function(params, H, W, add_noise = TRUE,
     sig_cv <- max(sig_cv * scale_factor, 0.8)
     amp <- base_amp * (0.5 + 0.5 * scale_factor)
     # Per-peak shape draw + local-window render (delegates to
-    # render_peak_local for the actual pixel math).
+    # .peak_patch for the actual pixel math; added in place).
     shp <- draw_peak_shape(peak_shape, emg_tau_range, emg_mix_prob)
-    clean <- render_peak_local(clean, H, W, mu_rt, mu_cv,
-                                 sig_rt, sig_cv, amp,
-                                 shape = shp$shape, tau = shp$tau)
+    p <- .peak_patch(H, W, mu_rt, mu_cv, sig_rt, sig_cv, amp,
+                     shape = shp$shape, tau = shp$tau)
+    clean[p$rr, p$cc] <- clean[p$rr, p$cc] + p$patch
   }
   if (!add_noise) return(list(clean = clean, noisy = clean))
   # Belt-and-suspenders: if noise stats are somehow still non-finite,

@@ -36,8 +36,10 @@ Imports:
     coro,
     purrr,
     future,
-    future.apply
+    parallel,
+    tools
 Suggests:
+    future.apply,
     piggyback,
     pheatmap,
     gridExtra,
