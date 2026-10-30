@@ -4,7 +4,13 @@
 # presence-label matrices), in order. Pure R values, so comparable
 # bit-for-bit across machines.
 capture_pretrain_batches <- function(num_workers = 1L, seed = 11L,
-                                     val_real = NULL, ...) {
+                                     val_real = NULL,
+                                     contamination_config = list(
+                                       n_per_sample = c(2L, 6L),
+                                       intensity_range = c(0.05, 0.2)),
+                                     contamination_schedule = list(
+                                       clean = 0.3, light = 0.4, heavy = 0.3),
+                                     ...) {
   got <- new.env()
   suppressMessages(trace(
     "torch_tensor", where = asNamespace("torch"), print = FALSE,
@@ -15,9 +21,8 @@ capture_pretrain_batches <- function(num_workers = 1L, seed = 11L,
   suppressMessages(pretrain_denoising_online(
     H = 128L, W = 32L, catalog = make_toy_catalog(), anchor_ids = c(1L, 2L),
     variable_config = list(draw = "prevalence", prevalence_range = c(0, 1)),
-    contamination_config = list(n_per_sample = c(2L, 6L),
-                                intensity_range = c(0.05, 0.2)),
-    contamination_schedule = list(clean = 0.3, light = 0.4, heavy = 0.3),
+    contamination_config = contamination_config,
+    contamination_schedule = contamination_schedule,
     noise_scale = c(1, 3), anchor_draw = "prevalence",
     mask_config = list(n_rects = c(1L, 2L), size_frac = c(0.02, 0.05)),
     affine_shift_rt = c(1L, 4L), affine_shift_cv = c(0L, 2L),

@@ -60,6 +60,11 @@
 
 ## Bug fixes
 
+* `pretrain_denoising_online()` with `contamination_schedule` no longer
+  fails ("non-finite pixels") when `contamination_config` omits
+  `n_per_sample` or `intensity_range`. The light regime scaled the
+  missing value (`NULL * 0.3` is `numeric(0)`), so the generator's
+  defaults never applied; they are now filled in before scaling.
 * `generate_noisy_pretrain_sample()`: `variable_config$exclude_anchors`
   now excludes every compound in `anchor_ids`, not just the anchors that
   survived `anchor_draw = "prevalence"` / `anchor_dropout` this sample.

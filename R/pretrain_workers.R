@@ -80,9 +80,12 @@
     if (scale == 0) {
       active_cc <- NULL
     } else if (scale < 1) {
+      # Fill generate_noisy_pretrain_sample()'s defaults before scaling:
+      # NULL * scale is numeric(0), which would slip past its `%||%`.
       active_cc$n_per_sample <-
-        pmax(0L, as.integer(active_cc$n_per_sample * scale))
-      active_cc$intensity_range <- active_cc$intensity_range * scale
+        pmax(0L, as.integer((active_cc$n_per_sample %||% c(5, 30)) * scale))
+      active_cc$intensity_range <-
+        (active_cc$intensity_range %||% c(0.1, 0.5)) * scale
     }
   }
   pair <- if (use_noisy) {

@@ -100,3 +100,15 @@ test_that("workers are stopped when the run errors", {
   expect_false(is.null(got$w))
   expect_error(parallel::clusterCall(got$w$cl, Sys.getpid))
 })
+
+test_that("light contamination regime fills config defaults before scaling", {
+  skip_on_cran()
+  # Without n_per_sample / intensity_range, NULL * 0.3 used to give
+  # numeric(0), so the generator's defaults never applied: NA intensities
+  # and a "non-finite pixels" error.
+  batches <- capture_pretrain_batches(
+    1L, contamination_config = list(),
+    contamination_schedule = list(light = 1))
+  expect_true(length(batches) > 0L)
+  for (x in batches) expect_true(all(is.finite(x)))
+})
