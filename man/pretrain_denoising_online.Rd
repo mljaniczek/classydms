@@ -450,20 +450,26 @@ cores contribute less per thread. Default \code{NULL} leaves torch's
 automatic choice in place.}
 
 \item{num_workers}{Number of parallel workers for R-side synthetic
-data generation (default \code{1L} = serial). When > 1, uses
-\code{future.apply::future_lapply} with a \code{future::multisession} plan
-— fresh R processes (not fork), so it side-steps the macOS
-libtorch fork crash where \code{mclapply} children inherit poisoned
-threadpool mutexes. Cross-platform (Linux, macOS, Windows) and
-handles global-variable discovery automatically. Most useful on
+data generation (default \code{1L} = serial). When > 1, starts
+\code{num_workers} persistent PSOCK R processes (fresh R processes, not
+fork, so it side-steps the macOS libtorch fork crash where
+\code{mclapply} children inherit poisoned threadpool mutexes) and
+dispatches batches to them with \code{\link[parallel:clusterApply]{parallel::clusterApply()}}. The
+caller's \code{future::plan()} is not changed.
+The catalog and layer settings are sent to each worker once per
+run; each batch sends only the per-sample augmentation specs.
+Workers run the \emph{installed} classydms (a warning says so when it
+differs from the code loaded in the session) and are stopped when
+the call returns, errors or is interrupted. Cross-platform (Linux,
+macOS, Windows). Most useful on
 GPU / MPS backends where the GPU is otherwise waiting on R
 between batches. A reasonable choice on a chip with N performance
 cores is \code{num_workers = N - 2} (leaving a couple cores for the
-GPU's communication threads, BLAS, and the OS). Each worker task
-gets an independent L'Ecuyer-CMRG substream via
-\code{future.seed = TRUE} for reproducibility. Requires the \code{future}
-and \code{future.apply} packages when > 1; falls back to serial with
-a message if either is missing.}
+GPU's communication threads, BLAS, and the OS). Each sample gets
+an independent L'Ecuyer-CMRG substream (the same streams
+\code{future.apply::future_lapply(future.seed = TRUE)} would assign), so
+output is reproducible for a fixed \code{seed} and does not depend on
+\code{num_workers} (any value > 1 gives the same batches).}
 
 \item{save_path}{If non-NULL, writes encoder, autoencoder, and manifest
 to disk after every epoch (so a mid-run crash leaves recoverable

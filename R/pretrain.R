@@ -533,20 +533,26 @@ pretrain_autoencoder_from_catalog <- function(catalog, H, W,
 #'   cores contribute less per thread. Default `NULL` leaves torch's
 #'   automatic choice in place.
 #' @param num_workers Number of parallel workers for R-side synthetic
-#'   data generation (default `1L` = serial). When > 1, uses
-#'   `future.apply::future_lapply` with a `future::multisession` plan
-#'   — fresh R processes (not fork), so it side-steps the macOS
-#'   libtorch fork crash where `mclapply` children inherit poisoned
-#'   threadpool mutexes. Cross-platform (Linux, macOS, Windows) and
-#'   handles global-variable discovery automatically. Most useful on
+#'   data generation (default `1L` = serial). When > 1, starts
+#'   `num_workers` persistent PSOCK R processes (fresh R processes, not
+#'   fork, so it side-steps the macOS libtorch fork crash where
+#'   `mclapply` children inherit poisoned threadpool mutexes) and
+#'   dispatches batches to them with [parallel::clusterApply()]. The
+#'   caller's `future::plan()` is not changed.
+#'   The catalog and layer settings are sent to each worker once per
+#'   run; each batch sends only the per-sample augmentation specs.
+#'   Workers run the *installed* classydms (a warning says so when it
+#'   differs from the code loaded in the session) and are stopped when
+#'   the call returns, errors or is interrupted. Cross-platform (Linux,
+#'   macOS, Windows). Most useful on
 #'   GPU / MPS backends where the GPU is otherwise waiting on R
 #'   between batches. A reasonable choice on a chip with N performance
 #'   cores is `num_workers = N - 2` (leaving a couple cores for the
-#'   GPU's communication threads, BLAS, and the OS). Each worker task
-#'   gets an independent L'Ecuyer-CMRG substream via
-#'   `future.seed = TRUE` for reproducibility. Requires the `future`
-#'   and `future.apply` packages when > 1; falls back to serial with
-#'   a message if either is missing.
+#'   GPU's communication threads, BLAS, and the OS). Each sample gets
+#'   an independent L'Ecuyer-CMRG substream (the same streams
+#'   `future.apply::future_lapply(future.seed = TRUE)` would assign), so
+#'   output is reproducible for a fixed `seed` and does not depend on
+#'   `num_workers` (any value > 1 gives the same batches).
 #' @param save_path If non-NULL, writes encoder, autoencoder, and manifest
 #'   to disk after every epoch (so a mid-run crash leaves recoverable
 #'   artifacts).
@@ -970,27 +976,24 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
   # Fork-based `parallel::mclapply` is unsafe here on macOS: libtorch's
   # internal threadpool mutexes don't survive fork(), and the child
   # processes hit `mutex lock failed: Invalid argument` on the first
-  # batch. Use `future.apply::future_lapply` with `future::multisession`
-  # instead — fresh R processes (not fork), globals resolved
-  # automatically, no shared libtorch state to poison. Slightly higher
-  # per-worker startup than fork on Linux but negligible over a
-  # multi-epoch pretraining run.
+  # batch. Workers are fresh PSOCK R processes (not fork) that keep the
+  # run's static inputs; batches go out via `future.apply::future_lapply`
+  # (see R/pretrain_workers.R). Slightly higher per-worker startup than
+  # fork on Linux but negligible over a multi-epoch pretraining run.
   num_workers <- as.integer(num_workers)
   use_parallel <- num_workers > 1L
   if (use_parallel) {
-    if (!requireNamespace("future", quietly = TRUE) ||
-        !requireNamespace("future.apply", quietly = TRUE)) {
-      message("num_workers > 1 requires the `future` and ",
-              "`future.apply` packages. Install with ",
-              "`install.packages(c('future', 'future.apply'))`. ",
-              "Falling back to serial.")
+    if (!requireNamespace("future", quietly = TRUE)) {
+      message("num_workers > 1 requires the `future` package. Install ",
+              "with `install.packages('future')`. Falling back to serial.")
       use_parallel <- FALSE
       num_workers <- 1L
     } else {
-      # Multisession = fresh R processes on any platform. Save the
-      # caller's plan so we don't clobber their outer future config.
-      old_plan <- future::plan(future::multisession, workers = num_workers)
-      on.exit(future::plan(old_plan), add = TRUE)
+      # Started before set.seed() below, so the main RNG stream is the
+      # same as a serial run's. Stopped on exit, including on error or
+      # interrupt. The caller's future plan is left alone.
+      workers <- .pretrain_start_workers(num_workers)
+      on.exit(.pretrain_stop_workers(workers), add = TRUE)
     }
   }
   location_mode  <- match.arg(location_mode)
@@ -1019,7 +1022,7 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
             " (nn_dropout2d between residual block groups)"
           else " (off)")
   message("  R-side data workers: ", num_workers,
-          if (use_parallel) " (parallel via future::multisession)" else " (serial)")
+          if (use_parallel) " (persistent PSOCK workers)" else " (serial)")
   message("  Source: ",
           if (use_noisy)
             paste0("peak_catalog three-layer (", nrow(catalog$compounds),
@@ -1342,10 +1345,9 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
 
   # generate_batch: builds clean + noisy synthetic batches. When
   # use_parallel = TRUE, the per-sample loop is dispatched to
-  # `num_workers` fresh R processes via future.apply::future_lapply
-  # backed by future::multisession. Each task gets an independent
-  # L'Ecuyer-CMRG substream (via future.seed = TRUE) so worker samples
-  # are independent and reproducible.
+  # `num_workers` persistent PSOCK workers (see R/pretrain_workers.R).
+  # Each sample gets an independent L'Ecuyer-CMRG substream so worker
+  # samples are independent and reproducible.
   # Draw one shift spec (per-sample or per-group depending on caller).
   # Encapsulates the stochastic-magnitude protocol: for each axis, if
   # the arg was length-2, first draw the per-sample max M, then draw
@@ -1422,171 +1424,15 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
         matrix(d_cv, nrow = H, ncol = W, byrow = TRUE)
     }
   }
-  generate_one_pair <- function(i, augment_spec) {
-    # Per-sample noise_scale draw (if range specified).
-    ns <- if (!is.null(noise_scale_range))
-            stats::runif(1, noise_scale_range[1], noise_scale_range[2])
-          else noise_scale
-    # Per-sample contamination-regime draw. NULL schedule -> config
-    # passed through unchanged. Otherwise resolve to a scaled config:
-    #   clean -> NULL (no contamination layer this sample)
-    #   light -> 0.3x n_per_sample and intensity_range
-    #   heavy -> full config as-is
-    active_cc <- contamination_config
-    if (!is.null(contamination_schedule)) {
-      regime <- sample(names(contamination_schedule), size = 1L,
-                        prob = unlist(contamination_schedule))
-      scale <- switch(regime, clean = 0, light = 0.3, heavy = 1.0)
-      if (scale == 0) {
-        active_cc <- NULL
-      } else if (scale < 1) {
-        active_cc$n_per_sample <-
-          pmax(0L, as.integer(active_cc$n_per_sample * scale))
-        active_cc$intensity_range <- active_cc$intensity_range * scale
-      }
-    }
-    pair <- if (use_noisy) {
-      generate_noisy_pretrain_sample(catalog, H, W,
-                                       anchor_ids = anchor_ids,
-                                       variable_config = variable_config,
-                                       contamination_config = active_cc,
-                                       add_noise = add_noise,
-                                       size_jitter = size_jitter,
-                                       location_jitter_rt = location_jitter_rt,
-                                       location_jitter_cv = location_jitter_cv,
-                                       noise_scale = ns,
-                                       anchor_dropout = anchor_dropout,
-                                       anchor_draw = anchor_draw,
-                                       anchor_jitter_variability = anchor_jitter_variability,
-                                       variable_source_peak_params = variable_source_peak_params,
-                                       peak_shape = peak_shape,
-                                       emg_tau_range = emg_tau_range,
-                                       emg_mix_prob = emg_mix_prob)
-    } else if (!is.null(catalog)) {
-      generate_one_synthetic_from_catalog(catalog, H, W,
-                                    add_noise = add_noise,
-                                    size_jitter = size_jitter,
-                                    location_jitter_rt = location_jitter_rt,
-                                    location_jitter_cv = location_jitter_cv,
-                                    noise_scale = ns)
-    } else {
-      generate_one_synthetic(peak_params, H, W,
-                                    add_noise = add_noise,
-                                    size_jitter = size_jitter,
-                                    location_mode = location_mode,
-                                    location_jitter_rt = location_jitter_rt,
-                                    location_jitter_cv = location_jitter_cv,
-                                    attribute_mode = attribute_mode,
-                                    noise_scale = ns)
-    }
-    # Split-layer denoising: compose Z_clean and Z_noisy from the
-    # per-layer matrices returned by generate_noisy_pretrain_sample.
-    # Sensor noise is always in Z_noisy only (i.e. always corruption)
-    # so the encoder can never learn to preserve it.
-    if (split_layers) {
-      zero <- matrix(0, nrow = H, ncol = W)
-      add_layers <- function(names_vec) {
-        Reduce(`+`, pair$layers[names_vec], init = zero)
-      }
-      Z_clean       <- add_layers(clean_layers)
-      Z_noise_add   <- add_layers(noise_layers)
-      Z_sensor      <- pair$layers$sensor_noise
-      pair$clean <- Z_clean
-      pair$noisy <- Z_clean + Z_noise_add + Z_sensor
-    }
-    # Coherent affine shift (data augmentation). Draw is precomputed
-    # in generate_batch so the same (dr, dc) can be shared across a
-    # shift group (shift_group_size > 1). Applied to BOTH clean and
-    # noisy so the encoder is not asked to correct the drift — it just
-    # sees peaks at different absolute row/col positions across samples.
-    if (isTRUE(augment_spec$shift$active) &&
-        (augment_spec$shift$dr != 0L || augment_spec$shift$dc != 0L)) {
-      dr <- augment_spec$shift$dr; dc <- augment_spec$shift$dc
-      shift_mat <- function(M, dr, dc) {
-        out <- matrix(0, nrow = nrow(M), ncol = ncol(M))
-        src_r <- max(1L, 1L - dr):min(nrow(M), nrow(M) - dr)
-        src_c <- max(1L, 1L - dc):min(ncol(M), ncol(M) - dc)
-        if (length(src_r) == 0L || length(src_c) == 0L) return(out)
-        out[src_r + dr, src_c + dc] <- M[src_r, src_c]
-        out
-      }
-      pair$clean <- shift_mat(pair$clean, dr, dc)
-      pair$noisy <- shift_mat(pair$noisy, dr, dc)
-    }
-    # Non-linear RT warp: linear-ramp warp along RT applied to BOTH
-    # clean and noisy identically. Simulates smooth column-condition
-    # drift (later peaks shift more than early peaks). Nearest-neighbor
-    # row indexing so it's O(H) per sample.
-    if (!is.null(rt_warp_config) &&
-        stats::runif(1) < rt_warp_config$prob) {
-      s <- rt_warp_config$strength
-      # Randomize sign per sample so warp can compress OR stretch
-      s <- s * sample(c(-1, 1), 1L)
-      r_in <- seq_len(H)
-      # Sample source row for each output row: linear ramp from 0
-      # (top) to s*H (bottom). Nearest-neighbor with clipping.
-      src <- as.integer(round(r_in + s * (r_in - 1)))
-      src <- pmax(1L, pmin(H, src))
-      pair$clean <- pair$clean[src, , drop = FALSE]
-      pair$noisy <- pair$noisy[src, , drop = FALSE]
-    }
-    # Mask augmentation: zero out random rectangles from the NOISY
-    # input only. Encoder reconstructs from surrounding context.
-    if (!is.null(mask_config)) {
-      n_rects <- if (mask_config$n_rects[1] == mask_config$n_rects[2])
-                   mask_config$n_rects[1]
-                 else
-                   as.integer(stats::runif(1,
-                     mask_config$n_rects[1],
-                     mask_config$n_rects[2] + 1))
-      for (k in seq_len(n_rects)) {
-        area_frac <- stats::runif(1, mask_config$size_frac[1],
-                                       mask_config$size_frac[2])
-        # Aspect ratio ~ uniform 0.5..2.0 so rectangles vary in shape
-        aspect <- exp(stats::runif(1, log(0.5), log(2.0)))
-        rect_h <- max(1L, as.integer(sqrt(area_frac * H * W * aspect)))
-        rect_w <- max(1L, as.integer(sqrt(area_frac * H * W / aspect)))
-        rect_h <- min(rect_h, H); rect_w <- min(rect_w, W)
-        r0 <- sample.int(H - rect_h + 1L, 1L)
-        c0 <- sample.int(W - rect_w + 1L, 1L)
-        pair$noisy[r0:(r0 + rect_h - 1L),
-                    c0:(c0 + rect_w - 1L)] <- 0
-      }
-    }
-    # Stripe noise: row- or column-correlated band-limited noise added
-    # to the NOISY input only. The stripe matrix is precomputed in
-    # generate_batch: per-sample by default, or once per shift group
-    # when stripe_noise_config$grouped = TRUE. Simulates thermal /
-    # electrical acquisition artifacts.
-    if (!is.null(augment_spec$stripe)) {
-      pair$noisy <- pair$noisy + augment_spec$stripe
-    }
-    # Baseline drift: smooth low-frequency baseline added to NOISY
-    # input only (clean target untouched). The encoder learns to strip
-    # residual baseline that AsLS didn't fully remove.
-    if (!is.null(augment_spec$baseline)) {
-      pair$noisy <- pair$noisy + augment_spec$baseline
-    }
-    # Dust thresholding matches real-data preprocessing (see
-    # baseline_basement) so synthetic samples have the same sparsity
-    # profile as real samples entering the encoder.
-    if (dust_threshold > 0) {
-      pair$clean[pair$clean < dust_threshold] <- 0
-    }
-    if (noisy_dust_threshold > 0) {
-      pair$noisy[pair$noisy < noisy_dust_threshold] <- 0
-    }
-    presence_vec <- NULL
-    if (presence_head) {
-      present_ids <- unlist(pair$rendered_ids[presence_layers],
-                            use.names = FALSE)
-      presence_vec <- as.numeric(presence_ids %in% present_ids)
-    }
-    list(
-      clean = pmin(normalize_sample(pair$clean), norm_clamp),
-      noisy = pmin(normalize_sample(pair$noisy), norm_clamp),
-      presence = presence_vec
-    )
+  # Inputs for .pretrain_pair(), final from here on. Workers get them once
+  # per run; each batch then ships only the augment specs (and seeds).
+  pair_cfg <- mget(.pretrain_pair_fields, envir = environment())
+  generate_one_pair <- function(i, augment_spec)
+    .pretrain_pair(augment_spec, pair_cfg)
+  if (use_parallel) {
+    run_id <- paste0("pretrain-", Sys.getpid(), "-",
+                     format(as.numeric(Sys.time()), digits = 16))
+    .pretrain_init_workers(workers, pair_cfg, run_id)
   }
 
   generate_batch <- function(n = batch_size) {
@@ -1625,11 +1471,10 @@ pretrain_denoising_online <- function(peak_params = NULL, H, W,
            baseline = draw_baseline_drift())
     })
     pairs <- if (use_parallel) {
-      # future.seed = TRUE gives each parallel task an independent
-      # L'Ecuyer-CMRG substream, so worker samples don't collide.
-      future.apply::future_lapply(seq_len(n),
-        function(i) generate_one_pair(i, augment_specs[[i]]),
-        future.seed = TRUE)
+      # Each sample gets an independent L'Ecuyer-CMRG substream, so
+      # worker samples don't collide; the seeds are the ones
+      # future_lapply(future.seed = TRUE) used to assign.
+      .pretrain_parallel_pairs(workers, augment_specs, run_id)
     } else {
       lapply(seq_len(n),
              function(i) generate_one_pair(i, augment_specs[[i]]))

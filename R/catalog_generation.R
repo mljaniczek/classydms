@@ -5,16 +5,22 @@
 # positions, with per-compound prevalence controlling how often each
 # compound fires.
 
-# Internal helper: render one peak with local-window Gaussian OR bi-Gaussian
+# Internal helper: one peak's local-window Gaussian OR bi-Gaussian
 # (EMG-like: symmetric on the left, tail-stretched on the right along RT).
-# Returns the modified Z. CV direction stays symmetric — GC peak asymmetry
-# is a time-domain phenomenon.
+# Returns the window's row / column indices and the values to add there.
+# CV direction stays symmetric — GC peak asymmetry is a time-domain
+# phenomenon.
 #
 # Bi-Gaussian model: sigma on the left of mu_rt equals sig_rt; sigma on the
 # right equals sig_rt * (1 + tau). tau = 0 recovers pure Gaussian. Typical
 # GC peaks have tau ~ 0.2-0.8 (right side 20-80% wider than left).
-render_peak_local <- function(Z, H, W, mu_rt, mu_cv, sig_rt, sig_cv, amp,
-                                shape = "gaussian", tau = 0) {
+#
+# Loops that render many peaks add the patch in their own scope
+# (`Z[p$rr, p$cc] <- Z[p$rr, p$cc] + p$patch`), which updates Z in place.
+# Passing Z through render_peak_local() instead copies the whole H x W
+# matrix once per peak.
+.peak_patch <- function(H, W, mu_rt, mu_cv, sig_rt, sig_cv, amp,
+                        shape = "gaussian", tau = 0) {
   # Widen the local window on the right when tau > 0 so we don't clip
   # the extended trailing edge.
   sig_right <- if (shape == "emg") sig_rt * (1 + tau) else sig_rt
@@ -31,7 +37,16 @@ render_peak_local <- function(Z, H, W, mu_rt, mu_cv, sig_rt, sig_cv, amp,
     g_rt <- exp(-0.5 * ((rr - mu_rt) / sig_rt)^2)
   }
   g_cv <- exp(-0.5 * ((cc - mu_cv) / sig_cv)^2)
-  Z[rr, cc] <- Z[rr, cc] + amp * outer(g_rt, g_cv)
+  list(rr = rr, cc = cc, patch = amp * outer(g_rt, g_cv))
+}
+
+# Internal helper: render one peak (see .peak_patch()) and return the
+# modified Z. Kept for one-off adds / subtracts (cofire post-processing).
+render_peak_local <- function(Z, H, W, mu_rt, mu_cv, sig_rt, sig_cv, amp,
+                                shape = "gaussian", tau = 0) {
+  p <- .peak_patch(H, W, mu_rt, mu_cv, sig_rt, sig_cv, amp,
+                   shape = shape, tau = tau)
+  Z[p$rr, p$cc] <- Z[p$rr, p$cc] + p$patch
   Z
 }
 
@@ -200,13 +215,13 @@ generate_one_synthetic_from_catalog <- function(catalog, H, W,
     amp <- base_amp * mult * (0.5 + 0.5 * scale_factor)
 
     # Per-peak shape draw + local-window render (delegates to
-    # render_peak_local for the actual pixel math). Records shape/tau
+    # .peak_patch for the actual pixel math). Records shape/tau
     # on placements so cofire's subtract_compound can undo the same
     # asymmetric peak later.
     shp <- draw_peak_shape(peak_shape, emg_tau_range, emg_mix_prob)
-    clean <- render_peak_local(clean, H, W, mu_rt, mu_cv,
-                                 sig_rt, sig_cv, amp,
-                                 shape = shp$shape, tau = shp$tau)
+    p <- .peak_patch(H, W, mu_rt, mu_cv, sig_rt, sig_cv, amp,
+                     shape = shp$shape, tau = shp$tau)
+    clean[p$rr, p$cc] <- clean[p$rr, p$cc] + p$patch   # in place
     placements_cid    <- c(placements_cid,    compounds$compound_id[i])
     placements_mu_rt  <- c(placements_mu_rt,  mu_rt)
     placements_mu_cv  <- c(placements_mu_cv,  mu_cv)

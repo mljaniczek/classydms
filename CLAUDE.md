@@ -51,6 +51,8 @@ classydms/
 │   │                               # dms_denoising_autoencoder
 │   ├── pretrain.R                  # pretrain_autoencoder (batch),
 │   │                               # pretrain_denoising_online (recommended)
+│   ├── pretrain_workers.R          # per-sample pair generation and the
+│   │                               # parallel workers (num_workers > 1)
 │   ├── classify.R                  # build_pretrained_classifier,
 │   │                               # cv_pretrained_oof,
 │   │                               # extract_encoder_features,
@@ -150,6 +152,19 @@ raw .xls -> read_dms_file -> load_dms_directory  (returns samples + y)
   Exposed as a function parameter (default 0.6).
 
 ### Pretraining
+
+- **Parallel generation ships inputs once** (`R/pretrain_workers.R`):
+  `num_workers > 1` starts persistent PSOCK workers (never fork: libtorch
+  threadpool mutexes don't survive fork() on macOS), sends the static
+  inputs (`pair_cfg`: catalog, layer configs, ...) to each worker once,
+  and per batch sends only the augment specs plus per-sample L'Ecuyer
+  seeds (the ones `future_lapply(future.seed = TRUE)` would assign).
+  Never dispatch a closure defined inside `pretrain_denoising_online()`:
+  it serialises the whole frame (catalog, val_real, model) with every
+  task -- that was ~0.5 GiB per worker per batch.
+- **Render peaks in place**: add `.peak_patch()` output to the canvas in
+  the rendering loop's own scope. `Z <- render_peak_local(Z, ...)` copies
+  the whole H x W matrix per peak (it was most of the generation time).
 
 - **Online generation via `pretrain_denoising_online`**: memory cost is
   constant (one batch at a time) regardless of total samples seen. Lets
@@ -255,26 +270,6 @@ raw .xls -> read_dms_file -> load_dms_directory  (returns samples + y)
   cohort instead of (or in addition to) parametric synthetic data.
 
 ## Potential optimizations (not yet implemented)
-
-### Parallel synthetic data generation
-
-The `generate_one_synthetic` loop inside `pretrain_denoising_online`'s
-`generate_batch()` is serial in R. On CPU runs this is ~30-40% of wall
-time. On MPS runs (where GPU forward/backward is fast) it becomes a
-larger relative fraction — possibly ~50% on M-series Pro/Max chips.
-
-A fork-based parallelization via `parallel::mclapply` would give a
-~2-4x speedup for the data-generation portion. Implementation: replace
-the `for` loop in `generate_batch()` with `parallel::mclapply` (Unix/
-macOS only; Windows would need `parallel::parLapply` and a cluster).
-Need to be careful about RNG seeding so each fork produces independent
-samples — `mc.set.seed = TRUE` handles this.
-
-Not implemented yet because: (a) on CPU the speedup is partial since
-torch already parallelizes the bigger chunk; (b) on MPS the run is
-already fast enough that wall-clock isn't a blocker; (c) adds
-platform-specific complexity. Worth revisiting if scaling to >5M
-synthetic samples or if users on Windows need it.
 
 ### Larger batch sizes on MPS
 
